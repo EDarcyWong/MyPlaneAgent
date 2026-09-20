@@ -1,0 +1,92 @@
+{
+  "name": "myplane-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent local AI and Agent desktop workspace.",
+  "main": "dist-electron/main/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"npm:dev:electron\"",
+    "dev:electron": "wait-on tcp:127.0.0.1:5174 && npm run build:electron && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5174 electron .",
+    "start": "npm run build:app && electron .",
+    "check": "vue-tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "build:renderer": "vue-tsc --noEmit && vite build",
+    "build:electron": "node -e \"require('node:fs').rmSync('dist-electron',{recursive:true,force:true})\" && tsc -p electron/tsconfig.json",
+    "build:app": "npm run build:renderer && npm run build:electron",
+    "build": "npm run build:app && electron-builder",
+    "test": "npm run build:electron && node --test tests/*.test.mjs",
+    "test:history": "npm run build:electron && electron tests/local-ai-history-recovery.electron.mjs",
+    "test:smoke": "npm run build:app && electron tests/standalone.electron.mjs"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "2.3.2",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@xmldom/xmldom": "0.8.15",
+    "ajv": "8.20.0",
+    "dompurify": "3.4.15",
+    "element-plus": "2.14.5",
+    "exceljs": "4.4.0",
+    "jszip": "3.10.2",
+    "marked": "18.0.12",
+    "pdfjs-dist": "6.3.289",
+    "tar": "7.5.22",
+    "vue": "3.5.42"
+  },
+  "devDependencies": {
+    "@types/node": "26.5.0",
+    "@vitejs/plugin-vue": "5.2.4",
+    "concurrently": "9.2.4",
+    "cross-env": "7.0.3",
+    "electron": "41.10.7",
+    "electron-builder": "26.15.3",
+    "typescript": "5.9.3",
+    "vite": "6.4.3",
+    "vue-tsc": "2.2.12",
+    "wait-on": "8.0.5"
+  },
+  "overrides": {
+    "nanoid@5.1.11": "^5.1.16",
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
+  },
+  "build": {
+    "appId": "com.myplane.agent",
+    "productName": "MyPlaneAgent",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "python",
+        "to": "python"
+      }
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "target": "dmg"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": "nsis"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "nsis": {
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

@@ -1,0 +1,1 @@
+html,body,#app{width:100%;height:100%;margin:0;overflow:hidden}#app{display:flex}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{cursor:default}*{scrollbar-width:thin;scrollbar-color:#bdc6d4 transparent}

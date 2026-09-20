@@ -1,0 +1,114 @@
+import {isDeepSeek,deepseekThinking} from '../../shared/local-ai-providers.js'
+import {readTokenUsage,mergeTokenUsage,type TokenUsage} from '../../shared/local-ai-usage.js'
+import {record,sseData} from '../local-ai-utils.js'
+import type {AgentModelProgress} from '../../shared/local-ai-agent.js'
+import type {ToolDefinition} from './registry.js'
+import {ModelOutputLimitError} from '../local-ai-model-error.js'
+export {ModelOutputLimitError} from '../local-ai-model-error.js'
+export type ToolCall={id:string;type:'function';function:{name:string;arguments:string}}
+export type AgentMessage={role:'system'|'user'|'assistant'|'tool';content:string|null|({type:'text';text:string}|{type:'image_url';image_url:{url:string}})[];reasoning_content?:string;tool_calls?:ToolCall[];tool_call_id?:string}
+export type AgentAnswer=Omit<AgentMessage,'content'>&{content:string|null;reasoning?:string}
+export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean}
+export class ModelFormatError extends Error {constructor(message:string){super(message);this.name='ModelFormatError'}}
+export const agentModelTiming={firstResponseMs:10*60*1000,idleMs:5*60*1000,totalMs:30*60*1000}
+type RequestOptions={tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
+const llamaGrammarOnlyKeywords=new Set(['minLength','maxLength','minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf','minItems','maxItems','minProperties','maxProperties','pattern'])
+function llamaSchema(value:unknown):unknown{
+ if(Array.isArray(value))return value.map(llamaSchema)
+ if(!value||typeof value!=='object')return value
+ return Object.fromEntries(Object.entries(value as Record<string,unknown>).filter(([key])=>!llamaGrammarOnlyKeywords.has(key)).map(([key,item])=>[key,llamaSchema(item)]))
+}
+export function llamaToolDefinitions(tools:ToolDefinition[]):ToolDefinition[]{
+ return tools.map(tool=>({...tool,function:{...tool.function,parameters:llamaSchema(tool.function.parameters) as Record<string,unknown>}}))
+}
+export async function requestAgentModel(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions={}):Promise<AgentAnswer>{
+ const timing={...agentModelTiming,...options.timing},timeout=new AbortController(),combined=AbortSignal.any([signal,timeout.signal])
+ const abort=(message:string)=>timeout.abort(new Error(message+' 本轮未执行工具，可检查模型状态后继续任务。'))
+ const minutes=(ms:number)=>`${Math.max(1,Math.round(ms/60000))} 分钟`
+ let idle=setTimeout(()=>abort(`等待模型首个输出超过 ${minutes(timing.firstResponseMs)}。`),timing.firstResponseMs)
+ const total=setTimeout(()=>abort(`模型单轮生成超过 ${minutes(timing.totalMs)} 上限。`),timing.totalMs)
+ let usage:TokenUsage|undefined
+ const acceptUsage=(data:unknown)=>{const next=readTokenUsage(data);if(next){usage=mergeTokenUsage(usage,next);options.onUsage?.(usage)}}
+ const activity=()=>{clearTimeout(idle);idle=setTimeout(()=>abort(`模型连续 ${minutes(timing.idleMs)} 没有返回新内容。`),timing.idleMs)}
+ try{
+  combined.throwIfAborted()
+  const requestTools=options.tools&&connection.localLlama?llamaToolDefinitions(options.tools):options.tools
+  const thinking=options.summary?false:options.thinking
+  const responseCharacterLimit=Math.min(8*1024*1024,Math.max(1024*1024,connection.maxTokens*8)),responseWireLimit=Math.min(32*1024*1024,responseCharacterLimit*3)
+  const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:`Bearer ${connection.key}`}:{})},body:JSON.stringify({model,messages:messages.map(({reasoning_content,...message})=>({...message,...(isDeepSeek(connection.endpoint)&&reasoning_content!==undefined?{reasoning_content}:{})})),...deepseekThinking(connection.endpoint,thinking!==false),...(!requestTools||!requestTools.length?{}:{tools:requestTools,tool_choice:'auto'}),...(connection.localLlama&&thinking!==undefined?{chat_template_kwargs:{enable_thinking:thinking}}:{}),stream:true,stream_options:{include_usage:true},temperature:0.2,max_tokens:connection.maxTokens}),signal:combined})
+  if(!response.body)throw new Error('模型响应为空')
+  let data:Record<string,unknown>
+  if(response.ok&&response.headers.get('content-type')?.includes('text/event-stream')){
+   let content='',reasoning='',characters=0,wireSize=0,finish=''
+   const calls=new Map<number,{id:string;type:string;function:{name:string;arguments:string}}>()
+   for await(const frame of sseData(response.body,combined)){
+    if(frame==='[DONE]')break
+    wireSize+=frame.length;if(wireSize>responseWireLimit)throw new Error('模型响应流过大，请缩小任务')
+    let chunk:Record<string,unknown>;try{chunk=record(JSON.parse(frame))}catch{throw new ModelFormatError('模型响应流格式错误，本轮未执行工具')}
+    acceptUsage(chunk)
+    if(chunk.error)throw new Error(String(record(chunk.error).message||'模型服务返回错误'))
+    const choice=record(Array.isArray(chunk.choices)?chunk.choices[0]:null),delta=record(choice.delta)
+    let added=0,phase:AgentModelProgress['phase']='responding'
+    if(typeof delta.reasoning_content==='string'||typeof delta.reasoning==='string'){const text=String(delta.reasoning_content||delta.reasoning||'');options.onReasoning?.(text);reasoning+=text;added+=text.length;phase='thinking'}
+    if(typeof delta.content==='string'){options.onContent?.(delta.content);content+=delta.content;added+=delta.content.length;if(delta.content)phase='responding'}
+    if(delta.tool_calls!=null){
+     if(!Array.isArray(delta.tool_calls)||delta.tool_calls.length>8)throw new ModelFormatError('模型工具调用格式错误或单轮超过 8 个')
+     for(const raw of delta.tool_calls){
+      const call=record(raw),fn=record(call.function),index=call.index
+      if(typeof index!=='number'||!Number.isInteger(index)||index<0||index>7)throw new ModelFormatError('模型返回了无效的工具调用序号')
+      const current=calls.get(index)||{id:'',type:'function',function:{name:'',arguments:''}}
+      for(const [target,key,value] of [[current,'id',call.id],[current.function,'name',fn.name],[current.function,'arguments',fn.arguments]] as const){
+       if(value!=null&&typeof value!=='string')throw new ModelFormatError('模型返回了无效的工具调用片段')
+       if(typeof value==='string'){(target as Record<string,string>)[key]+=value;added+=value.length}
+      }
+      if(current.id.length>200||current.function.name.length>200||current.function.arguments.length>150000)throw new Error('模型工具调用过长，请缩小任务')
+      calls.set(index,current)
+     }
+     phase='tools'
+    }
+    if(finish&&added)throw new Error('模型在结束后返回了额外内容，本轮未执行工具')
+    characters+=added;if(characters>responseCharacterLimit)throw new Error('模型响应超过应用单轮容量，请缩小任务')
+    if(added){activity();options.onProgress?.({phase,characters,toolNames:phase==='tools'?[...calls.values()].map(call=>call.function.name).filter(Boolean):undefined})}
+    if(typeof choice.finish_reason==='string'&&choice.finish_reason){finish=choice.finish_reason}
+   }
+   if(!finish)throw new Error('模型响应流意外中断，本轮未执行工具。请检查模型服务后继续任务。')
+   data={choices:[{finish_reason:finish,message:{content,...(reasoning?{reasoning_content:reasoning}:{}),...(calls.size?{tool_calls:[...calls.entries()].sort((a,b)=>a[0]-b[0]).map(([,call])=>call)}:{})}}]}
+  }else{
+   // Some compatible servers return one JSON response even when streaming was requested.
+   const reader=response.body.getReader(),parts:Uint8Array[]=[];let size=0
+   try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>responseWireLimit)throw new Error('模型响应超过应用单轮容量，请缩小任务');parts.push(value);if(value.length)activity()}}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+   const text=Buffer.concat(parts).toString('utf8')
+   if(!response.ok){
+    let code='';try{code=String(record(record(JSON.parse(text)).error).code||'')}catch{/* Preserve non-JSON errors below. */}
+    if(response.status===404&&code==='model_not_found')throw new Error(`模型不存在或实例已失效（${model}）。请刷新模型列表，重新选择已加载的模型后继续任务。`)
+    if(response.status===400&&/failed to (?:initialize samplers: failed to )?parse grammar/i.test(text))throw new Error('本地模型服务无法解析工具调用语法。已使用 llama.cpp 兼容 Schema；若重启应用后仍出现此错误，请更新本地运行时并重新测试模型的工具能力。')
+    throw new Error(`模型请求失败（HTTP ${response.status}）：${text.slice(0,600)}`)
+   }
+   try{data=record(JSON.parse(text))}catch{throw new ModelFormatError('模型未返回有效 JSON 响应，请检查 OpenAI 兼容接口')}
+   acceptUsage(data)
+  }
+  combined.throwIfAborted()
+  const answer=validateAnswer(data,connection.maxTokens)
+  if(isDeepSeek(connection.endpoint))answer.reasoning_content=answer.reasoning||''
+  if(options.tools===false&&answer.tool_calls?.length)throw new Error('摘要请求返回了工具调用，未执行，也未替换原摘要')
+  return answer
+ }catch(error){
+  if(signal.aborted)throw signal.reason
+  if(timeout.signal.aborted)throw timeout.signal.reason
+  if(record(error).name==='TimeoutError'||['UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(String(record(record(error).cause).code)))throw new Error('模型连接超时，本轮未执行工具。请检查模型服务或缩小上下文后继续任务。')
+  throw error
+ }finally{clearTimeout(idle);clearTimeout(total)}
+}
+function validateAnswer(data:Record<string,unknown>,maxTokens:number):AgentAnswer{
+ if(data.error)throw new Error(String(record(data.error).message||'模型服务返回错误'))
+ const choice=record(Array.isArray(data.choices)?data.choices[0]:null),message=record(choice.message)
+ if(choice.finish_reason==='length')throw new ModelOutputLimitError(maxTokens)
+ const calls:ToolCall[]=[]
+ if(message.tool_calls!=null){
+  if(!Array.isArray(message.tool_calls)||message.tool_calls.length>8)throw new ModelFormatError('模型工具调用格式错误或单轮超过 8 个')
+  for(const raw of message.tool_calls){const call=record(raw),fn=record(call.function);if(call.type!==undefined&&call.type!=='function'||typeof call.id!=='string'||!call.id||call.id.length>200||typeof fn.name!=='string'||typeof fn.arguments!=='string'||fn.arguments.length>150000||calls.some(c=>c.id===call.id))throw new ModelFormatError('模型返回了无效的工具调用');calls.push({id:call.id,type:'function',function:{name:fn.name,arguments:fn.arguments}})}
+ }
+ const content=typeof message.content==='string'?message.content:'',reasoning=typeof message.reasoning_content==='string'?message.reasoning_content:typeof message.reasoning==='string'?message.reasoning:''
+ if(!content.trim()&&!calls.length)throw new Error('模型没有返回答复或工具调用，请选择支持工具调用的模型')
+ return {role:'assistant',content:content||null,...(reasoning?{reasoning}:{}),...(calls.length?{tool_calls:calls}:{})}
+}

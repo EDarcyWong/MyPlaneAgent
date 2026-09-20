@@ -1,0 +1,3 @@
+import {inflateSync} from 'node:zlib'
+// The fake model reads pixels from the request; it cannot see the expected answer.
+export function recognizeProbe(dataUrl){const data=Buffer.from(dataUrl.split(',')[1],'base64'),chunks=[];let width=0;for(let pos=8;pos<data.length;){const size=data.readUInt32BE(pos),type=data.toString('ascii',pos+4,pos+8),bytes=data.subarray(pos+8,pos+8+size);if(type==='IHDR')width=bytes.readUInt32BE(0);if(type==='IDAT')chunks.push(bytes);pos+=size+12}const pixels=inflateSync(Buffer.concat(chunks));for(let row=0;row<4;row++)for(let col=0;col<4;col++){const pos=(34+52*row)*(width*3+1)+1+(34+52*col)*3;if(pixels[pos]>180&&pixels[pos+1]<80)return 'ABCD'[row]+String(col+1)}throw new Error('No red square')}
