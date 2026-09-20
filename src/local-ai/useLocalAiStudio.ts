@@ -84,7 +84,22 @@ export function useLocalAiStudio(){
  async function saveRemoteProfile(input:{id?:string;name:string;apiFormat:RemoteApiFormat;endpoint:string;model?:string;contextLength?:number;apiKey?:string;clearApiKey?:boolean},testConnection=true){let savedSuccessfully=false;await run('profile-save',async()=>{const result=await api('remoteProfileSave',input);Object.assign(settings,result.settings);remoteProfiles.value=result.profiles;apiKey.value='';connection.value=undefined;if(settings.source==='external'){model.value=settings.model;if(testConnection)await connect()}else if(runtime.value?.state==='running')model.value=runtime.value.modelName;ElMessage.success(settings.source==='external'?'远程服务配置已保存':'配置已保存，当前仍使用本地服务');savedSuccessfully=true});return savedSuccessfully}
  async function deleteRemoteProfile(id:string){await run('profile-delete',async()=>{await ElMessageBox.confirm('删除后将移除这条配置历史及其本机保存的密钥引用。当前服务不会停止。','删除远程配置',{type:'warning',confirmButtonText:'删除配置',cancelButtonText:'取消'});remoteProfiles.value=await api('remoteProfileDelete',{id});ElMessage.success('配置历史已删除')})}
  async function clearKey(kind:'api'|'hf'){await run('clear-key',async()=>{Object.assign(settings,await api('settings',kind==='api'?{clearApiKey:true}:{clearHfToken:true}));if(kind==='api')apiKey.value='';else hfToken.value='';ElMessage.success('已移除密钥')})}
- async function connect(silent:unknown=false){if(connecting.value)return;connecting.value=true;try{connection.value=await api('connect');if(connection.value.ok){if(!model.value)model.value=connection.value.models[0]?.id||''}else if(silent!==true)error.value=connection.value.error}catch(cause){if(silent!==true)report(cause)}finally{connecting.value=false}}
+ async function connect(silent:unknown=false){
+  if(connecting.value)return
+  const source=settings.source,configured=settings.model.trim(),selection=model.value
+  connecting.value=true
+  try{
+   const result=await api('connect');if(source!==settings.source)return
+   connection.value=result
+   if(result.ok&&model.value===selection){
+    const first=result.models[0]?.instanceId||result.models[0]?.id||''
+    if(source==='external'){
+     const selectionAvailable=result.models.some(item=>item.id===selection||item.instanceId===selection)
+     model.value=configured||selectionAvailable&&selection||first||selection
+    }else if(runtime.value?.state==='running')model.value=runtime.value.modelName
+   }else if(!result.ok&&silent!==true)error.value=result.error
+  }catch(cause){if(silent!==true)report(cause)}finally{connecting.value=false}
+ }
  async function switchSource(source:'managed'|'external'){await run('source',async()=>{Object.assign(settings,await api('settings',{source}));connection.value=undefined;if(source==='managed'&&runtime.value?.state==='running')model.value=runtime.value.modelName;await connect()})}
  function selectRemoteApiFormat(format:RemoteApiFormat){if(settings.apiFormat===format)return;connection.value=undefined;apiKey.value='';Object.assign(settings,{apiFormat:format,endpoint:format==='anthropic'?'https://api.anthropic.com/v1':'https://api.openai.com/v1',model:'',hasApiKey:false,contextLength:format==='anthropic'?131072:128000,maxTokens:format==='anthropic'?8192:4096})}
  async function usePreset(provider:'lmstudio'|'ollama'|'llamacpp'|'deepseek'|'anthropic'){connection.value=undefined;settings.apiFormat=provider==='anthropic'?'anthropic':'openai';apiKey.value='';settings.hasApiKey=false;if(provider==='anthropic'){Object.assign(settings,{endpoint:'https://api.anthropic.com/v1',model:'',contextLength:131072,maxTokens:8192});return}if(provider==='deepseek'){Object.assign(settings,deepseekPreset);return}Object.assign(settings,{model:'',contextLength:4096,maxTokens:2048});settings.endpoint=provider==='lmstudio'?'http://127.0.0.1:1234/v1':provider==='ollama'?'http://127.0.0.1:11434/v1':'http://127.0.0.1:8080/v1'}

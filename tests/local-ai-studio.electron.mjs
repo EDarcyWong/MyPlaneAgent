@@ -30,7 +30,7 @@ async function uiText(value){await waitFor(()=>js(`document.body.innerText.inclu
 async function main(){try{
  await app.whenReady()
  server=createServer(async(req,res)=>{
-  if(req.url==='/v1/models'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:[{id:'smoke-model'}]}));return}
+  if(req.url==='/v1/models'){await delay(250);res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:[{id:'smoke-model'}]}));return}
   if(req.url!=='/v1/chat/completions'){res.writeHead(404);res.end('not found');return}
   let text='';for await(const chunk of req)text+=chunk
   const payload=JSON.parse(text);assert.equal(payload.model,'smoke-model');assert.equal(payload.stream,true);assert.deepEqual(payload.stream_options,{include_usage:true})
@@ -38,7 +38,7 @@ async function main(){try{
   const stop=payload.messages.at(-1).content.includes('STOP'),chunks=stop?Array(100).fill('继续 '):['## 本地回复\n','你好，流式聊天工作正常。\n','```js\nconsole.log("local");\n```']
   let index=0;const timer=setInterval(()=>{if(index<chunks.length){res.write(`data: ${JSON.stringify({choices:[{delta:{content:chunks[index++]}}]})}\r\n\r\n`)}else{clearInterval(timer);res.end(`data: ${JSON.stringify({usage:{prompt_tokens:100,completion_tokens:24,total_tokens:124},choices:[]})}\n\ndata: [DONE]\n\n`)}},stop?150:50);res.once('close',()=>clearInterval(timer))
  });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
- service=new LocalAiStudioService(path.join(root,'data'));service.saveStudioSettings({endpoint:`http://127.0.0.1:${server.address().port}/v1`,model:'previous-model',theme:'light'});service.newSession();service.saveStudioSettings({model:'smoke-model'})
+ service=new LocalAiStudioService(path.join(root,'data'));service.saveStudioSettings({endpoint:`http://127.0.0.1:${server.address().port}/v1`,model:'previous-model',theme:'light'});service.newSession();service.saveStudioSettings({model:''})
  registerLocalAiStudio(()=>service,()=>service.dispose());ipcMain.handle('ai:open-link',()=>{})
  window=new BrowserWindow({width:1380,height:900,show:false,webPreferences:{preload:path.join(project,'dist-electron/preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:false,backgroundThrottling:false}})
  window.webContents.on('console-message',(_event,level,message)=>{if(level>=3)errors.push(message)})
@@ -50,7 +50,7 @@ async function main(){try{
  assert.equal(await js("[...document.querySelectorAll('.rail-button>span')].every(label=>label.getBoundingClientRect().height<18)"),true,'navigation labels stay on one line')
  assert.ok(await js("Math.abs(document.querySelector('.local-ai-studio').getBoundingClientRect().width-innerWidth)<2"),'studio fills its flex host')
  assert.equal(await js("document.querySelectorAll('.composer').length"),1)
- await waitFor(()=>js("!!document.querySelector('input[aria-label=\"会话模型\"]')"),'conversation model control');assert.equal(await js("document.querySelector('input[aria-label=\"会话模型\"]').value"),'smoke-model','active remote model overrides the restored session model')
+ await waitFor(()=>js("!!document.querySelector('select[aria-label=\"会话模型\"]')"),'conversation model control');assert.equal(await js("document.querySelector('select[aria-label=\"会话模型\"]').value"),'smoke-model','late remote validation refreshes the restored session model');assert.equal(await js("[...document.querySelectorAll('select[aria-label=\"会话模型\"] option')].some(option=>option.value==='smoke-model')"),true,'late remote validation refreshes model options')
  await js("document.querySelector('textarea[aria-label=消息]').value='请介绍本地模型';document.querySelector('textarea[aria-label=消息]').dispatchEvent(new Event('input',{bubbles:true}))")
  await js("document.querySelector('.composer').requestSubmit()")
  await uiText('流式聊天工作正常');await waitFor(()=>js("!document.querySelector('.stop-button')"),'stream completion')

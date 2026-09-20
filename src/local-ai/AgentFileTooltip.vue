@@ -8,7 +8,7 @@ defineEmits<{enter:[];leave:[]}>()
 const editor=ref<HTMLElement>()
 const lines=computed(()=>(props.preview?.content||'').replace(/\r\n?/g,'\n').split('\n').slice(0,5000))
 const position=computed(()=>{
- const width=Math.min(1120,Math.max(280,window.innerWidth-24)),height=Math.min(360,Math.max(220,window.innerHeight-24)),anchor=props.anchor
+ const width=Math.min(748,Math.max(280,Math.round((window.innerWidth-24)*2/3))),height=Math.min(360,Math.max(220,window.innerHeight-24)),anchor=props.anchor
  if(!anchor)return {left:'12px',top:'12px',width:`${width}px`,height:`${height}px`}
  const left=Math.max(12,Math.min(anchor.x-width/2,window.innerWidth-width-12)),spaceBelow=window.innerHeight-anchor.y,top=spaceBelow>=height+18?anchor.y+14:Math.max(12,anchor.y-height-14)
  return {left:`${left}px`,top:`${top}px`,width:`${width}px`,height:`${height}px`}
