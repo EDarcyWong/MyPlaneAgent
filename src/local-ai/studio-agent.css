@@ -197,3 +197,10 @@ h1,h3,h4,p{margin:0}small{font-size:12px}
 @media(max-width:620px){.agent-tool-name{display:none}.agent-plan>summary,.agent-event.tool>details>summary{padding-inline:10px}.agent-plan-current{max-width:none}.agent-event-path{max-width:none}.agent-process>summary>strong{display:none}}
 @keyframes agent-pulse{50%{opacity:.3}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.agent-error.agent-recovery{display:block;max-height:none;overflow:visible;color:var(--s-text);margin:0 0 18px;min-width:0;overflow-wrap:anywhere}
+.agent-recovery>strong{display:block;color:var(--s-danger)}
+.agent-recovery>p{line-height:1.7;color:var(--s-dim);margin:8px 0}
+.agent-recovery>div{margin-top:12px;padding-top:10px;border-top:1px solid var(--s-border)}
+.agent-recovery pre{max-height:140px;overflow:auto}
+.agent-recovery button{margin:10px 8px 0 0;max-width:100%}

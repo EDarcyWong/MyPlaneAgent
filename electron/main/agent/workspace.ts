@@ -5,6 +5,9 @@ import {spawn} from 'node:child_process'
 import type {AgentPreview} from '../../shared/local-ai-agent.js'
 import {fingerprint,ToolError} from './registry.js'
 import {extractDocument,makeDocument,makeSpreadsheet} from './documents.js'
+import type {FileExpectation} from '../../shared/agent-execution.js'
+import {executeProcess} from './execution-supervisor.js'
+import {inspectBuild,prepareBuild} from './build-profile.js'
 
 const ignored=new Set(['.git','node_modules','dist','dist-electron','release','vendor','.idea','.venv','venv','__pycache__'])
 const secret=(name:string)=>/^\.env(?:\.|$)/i.test(name)&&!/^\.env\.(example|sample|template)$/i.test(name)||/^(\.ssh|\.aws|\.gnupg|credentials(?:\.json)?|id_rsa|id_ed25519)$/i.test(name)||/\.(pem|key|p12|pfx)$/i.test(name)
@@ -14,7 +17,7 @@ export const bounded=(value:unknown,label:string,max=1000)=>{if(typeof value!=='
 export const object=(value:unknown):Record<string,unknown>=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('工具参数必须是对象');return value as Record<string,unknown>}
 export const integer=(value:unknown,fallback:number,min:number,max:number)=>{if(value===undefined)return fallback;if(typeof value!=='number'||!Number.isInteger(value)||value<min||value>max)throw new Error(`数字参数必须在 ${min}–${max} 之间`);return value}
 const digest=(data:Buffer)=>createHash('sha256').update(data).digest('hex')
-export type PreparedAction={preview:AgentPreview;execute:(signal:AbortSignal,onOutput?:(text:string)=>void)=>Promise<string>;artifact?:{path:string;kind:'file'|'document'|'spreadsheet'}}
+export type PreparedAction={expectedFiles?:FileExpectation[];preview:AgentPreview;execute:(signal:AbortSignal,onOutput?:(text:string)=>void)=>Promise<string>;artifact?:{path:string;kind:'file'|'document'|'spreadsheet'}}
 export class AgentWorkspace {
  readonly root:string
  constructor(root:string){this.root=fs.realpathSync(root);if(!fs.statSync(this.root).isDirectory())throw new Error('工作目录不可用')}
@@ -40,6 +43,7 @@ export class AgentWorkspace {
  read(relative:unknown){const file=this.resolve(relative),st=fs.statSync(file);if(!st.isFile()||st.size>maxFile)throw new Error('仅可读取 2 MB 以内的文本文件');const data=fs.readFileSync(file);if(data.includes(0))throw new Error('该文件不是文本，请使用文档读取工具');return data.toString('utf8')}
  async query(name:string,args:Record<string,unknown>,signal:AbortSignal){
   signal.throwIfAborted()
+  if(name==='inspect_build')return JSON.stringify(inspectBuild(this))
   if(['git_status','git_diff','git_log'].includes(name))return this.git(name,args,signal)
   if(name==='list_files')return JSON.stringify(this.files(typeof args.path==='string'?args.path:'.',integer(args.depth,4,0,8),500))
   if(name==='read_file'){
@@ -56,6 +60,7 @@ export class AgentWorkspace {
  }
  async prepare(name:string,args:Record<string,unknown>,signal:AbortSignal=new AbortController().signal):Promise<PreparedAction>{
   signal.throwIfAborted()
+  if(name==='build_project')return prepareBuild(this,args)
   if(name==='apply_patch')return this.patch(args,signal)
   if(name==='run_test'){
    const script=bounded(args.script,'测试脚本',100);if(!/^(test|check|lint|build)(:[a-zA-Z0-9_-]+)?$/.test(script))throw new Error('只支持 test/check/lint/build 及其子脚本')
@@ -92,7 +97,7 @@ export class AgentWorkspace {
   }else throw new Error(`未知修改工具：${name}`)
   signal.throwIfAborted()
   const expected=previous?digest(previous):null
-  return {preview,artifact:{path:relative,kind},execute:async(signal)=>{
+  return {expectedFiles:[{path:relative,beforeHash:expected,afterHash:digest(next)}],preview,artifact:{path:relative,kind},execute:async(signal)=>{
    signal.throwIfAborted();const file=this.resolve(relative,true)
    if(fs.existsSync(file)&&fs.statSync(file).size>20*1024*1024)throw new Error('文件在确认期间已变大，本次操作未执行')
    const current=fs.existsSync(file)?fs.readFileSync(file):undefined
@@ -126,13 +131,15 @@ export class AgentWorkspace {
   const seen=new Set<string>(),changes: {path:string;before?:string;after:string;expected:string|null;mode:number}[]=[]
   for(const value of args.changes){
    const change=object(value),name=bounded(change.path,'补丁路径',2000),file=this.resolve(name,true)
-   if(seen.has(file))throw new Error('同一文件只能出现一次');seen.add(file)
+   if(binaryDocument.test(name))throw new Error('文本补丁不能写入二进制文档')
+   const identity=process.platform==='win32'?file.toLowerCase():file
+   if(seen.has(identity))throw new Error('同一文件只能出现一次');seen.add(identity)
    const before=fs.existsSync(file)?this.read(name):undefined
    if(before===undefined&&change.before!==undefined||before!==undefined&&change.before!==before)throw new Error('补丁基线不匹配，请重新读取 '+name)
    if(typeof change.after!=='string'||change.after.length>100000)throw new Error('补丁内容过大或无效')
    changes.push({path:name,before,after:change.after,expected:before===undefined?null:digest(Buffer.from(before)),mode:fs.existsSync(file)?fs.statSync(file).mode&0o777:0o644})
   }
-  return {preview:{changes:changes.map(({path,before,after})=>({path,before,after})),note:'多文件补丁：写入前统一核对所有基线，失败时尝试回退本次写入。'},execute:async s=>{
+  return {expectedFiles:changes.map(change=>({path:change.path,beforeHash:change.expected,afterHash:digest(Buffer.from(change.after))})),preview:{changes:changes.map(({path,before,after})=>({path,before,after})),note:'多文件补丁：写入前统一核对所有基线，失败时尝试回退本次写入。'},execute:async s=>{
    signal.throwIfAborted();s.throwIfAborted()
    const valid=(change:typeof changes[number],after=false)=>{const file=this.resolve(change.path,true),value=fs.existsSync(file)?digest(Buffer.from(this.read(change.path))):null;if(value!==(after?digest(Buffer.from(change.after)):change.expected))throw new Error('文件已变化：'+change.path);return file}
    changes.forEach(change=>valid(change));const applied:typeof changes=[],pending:string[]=[]
@@ -158,20 +165,8 @@ export class AgentWorkspace {
   const names=(await execute(['diff',...staged,'--name-only','-z','--ignore-submodules=all'])).split('\0').filter(Boolean).filter(name=>{try{this.resolve(name,true);return true}catch{return false}}).slice(0,100)
   return JSON.stringify({output:names.length?await execute(['diff',...staged,'--no-ext-diff','--no-textconv','--ignore-submodules=all','--',...names]):'',note:'仅显示允许访问路径中的已跟踪文件差异。'})
  }
- private command(command:string,timeout:number,signal:AbortSignal,onOutput?:(text:string)=>void):Promise<string>{
+ private async command(command:string,timeout:number,signal:AbortSignal,onOutput?:(text:string)=>void):Promise<string>{
   signal.throwIfAborted();this.resolve('.')
-  return new Promise((resolve,reject)=>{
-   const env:NodeJS.ProcessEnv={};for(const key of ['PATH','HOME','USERPROFILE','SystemRoot','ComSpec','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL'])if(process.env[key])env[key]=process.env[key]
-   const started=Date.now()
-   const child=spawn(command,{cwd:this.root,shell:true,env,detached:process.platform!=='win32',windowsHide:true,stdio:['ignore','pipe','pipe']})
-   let output='',reason='',settled=false
-   const kill=()=>{try{if(process.platform==='win32'){if(child.pid)spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true}).on('error',()=>child.kill())}else if(child.pid)process.kill(-child.pid,'SIGKILL')}catch{child.kill('SIGKILL')}}
-   const abort=()=>{reason='任务已停止';kill()},timer=setTimeout(()=>{reason=`命令超过 ${timeout} 秒，已终止`;kill()},timeout*1000)
-   signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort()
-   const data=(chunk:Buffer)=>{if(output.length>=32000)return;output+=chunk.toString('utf8');if(output.length>32000){output=output.slice(0,32000);reason='命令输出超过 32000 字符，已终止';kill()}onOutput?.(output)}
-   child.stdout.on('data',data);child.stderr.on('data',data)
-   const finish=(error?:Error,code?:number|null)=>{if(settled)return;settled=true;clearTimeout(timer);signal.removeEventListener('abort',abort);kill();if(error)reject(error);else resolve(JSON.stringify({exitCode:code??null,durationMs:Date.now()-started,output,...(reason?{error:reason}:{})}))}
-   child.on('error',error=>finish(error));child.on('close',code=>finish(undefined,code))
-  })
+  return JSON.stringify(await executeProcess({executable:command,cwd:this.root,shell:true,timeoutMs:timeout*1000},signal,onOutput))
  }
 }

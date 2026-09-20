@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch,type UnwrapNestedRefs} from 'vue'
-import {FolderOpened,FolderAdd,EditPen,VideoPause,Check,Close,Document,Cpu,ArrowRight,ArrowDown,ArrowUp,Search,Tools,Grid,InfoFilled,ChatDotRound,Download,MoreFilled} from '@element-plus/icons-vue'
-import {ElMessageBox} from 'element-plus'
+import {FolderOpened,FolderAdd,EditPen,VideoPause,Check,Close,Document,Cpu,ArrowRight,ArrowDown,ArrowUp,Search,Tools,Grid,InfoFilled,ChatDotRound,Download,MoreFilled,Delete} from '@element-plus/icons-vue'
+import {ElMessageBox,ElDropdown,ElDropdownMenu,ElDropdownItem} from 'element-plus'
 import AgentProjectActions from './AgentProjectActions.vue'
 import ModelCapabilities from './ModelCapabilities.vue'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
@@ -9,12 +9,13 @@ import AgentProjectSettings from './AgentProjectSettings.vue'
 import TokenUsageDisplay from './TokenUsageDisplay.vue'
 import ContextUsageDisplay from './ContextUsageDisplay.vue'
 import AiMarkdown from '../AiMarkdown.vue'
+import {messageQueues} from './message-queue'
 import WorkspaceChatMessages from './WorkspaceChatMessages.vue'
 import AgentCodePreview from './AgentCodePreview.vue'
 import AgentFileTooltip from './AgentFileTooltip.vue'
 import type {useLocalAiStudio} from './useLocalAiStudio'
 import type {AgentTask,AgentTaskSummary,AgentMode,AgentEvent,AgentProject,AgentApprovalMode,AgentFilePreview} from '../../electron/shared/local-ai-agent'
-import type {StudioCommands,StudioServerModel} from '../../electron/shared/local-ai-studio'
+import type {StudioCommands,StudioServerModel,StudioImage} from '../../electron/shared/local-ai-studio'
 import {LOCAL_AI_MAX_OUTPUT_TOKENS} from '../../electron/shared/local-ai'
 const props=defineProps<{model:string;models:StudioServerModel[];online?:boolean;chat:UnwrapNestedRefs<ReturnType<typeof useLocalAiStudio>>}>()
 const ch=props.chat
@@ -70,11 +71,11 @@ async function removeEntry(item:HistoryItem){
 }
 async function renameChat(item:HistoryItem){const saved=ch.sessions.find(session=>session.id===item.id);if(saved)await ch.renameSession(saved)}
 function toggleGroup(id:string){if(collapsedGroups.value.has(id))collapsedGroups.value.delete(id);else collapsedGroups.value.add(id)}
-const locked=computed(()=>active.value||ch.sending||ch.sessionBusy||ch.attaching||busy.value||loading.value)
+const queueDispatching=ref(false),steeringItem=ref('')
+const locked=computed(()=>!!steeringItem.value||queueDispatching.value||active.value||ch.sending||ch.sessionBusy||ch.attaching||busy.value||loading.value)
 const projectPreference='myplane.local-ai.agent.project'
 const clock=ref(Date.now())
 let clockTimer:ReturnType<typeof setInterval>|undefined
-const modelWaiting=computed(()=>{const progress=task.value?.modelProgress,startedAt=task.value?.runStartedAt||progress?.startedAt;if(!startedAt)return '正在处理，请稍候…';const seconds=Math.max(0,Math.floor((clock.value-Date.parse(startedAt))/1000)),duration=seconds>=60?`${Math.floor(seconds/60)}分${seconds%60}秒`:`${seconds}秒`;if(!progress)return `已处理${duration}`;const names=progress.toolNames?.filter(Boolean).join('、');return `已处理${duration} · ${progress.phase==='tools'&&names?'模型正在调用工具：'+names:({waiting:'等待模型响应',thinking:'模型正在思考',responding:'模型正在生成答复',tools:'模型正在生成工具调用'})[progress.phase]}${progress.characters?' · 已接收 '+progress.characters.toLocaleString()+' 字符':''}`})
 const performanceWarning=computed(()=>{
  if(ch.settings.source!=='managed')return ''
  const issues:string[]=[]
@@ -93,7 +94,7 @@ const eventChanges=(event:AgentEvent)=>event.preview?.changes?.map(change=>({pat
 const compactElapsed=(milliseconds:number)=>{const seconds=Math.max(0,Math.round(milliseconds/1000));return seconds>=3600?`${Math.floor(seconds/3600)}小时${Math.floor(seconds%3600/60)}分钟`:seconds>=60?`${Math.floor(seconds/60)}分${seconds%60}秒`:`${seconds}秒`}
 const resultGroups=computed(()=>{
  const groups:{user:AgentEvent;events:AgentEvent[]}[]=[],artifacts=new Map((task.value?.artifacts||[]).map(item=>[item.path,item]))
- for(const event of task.value?.events||[]){if(event.kind==='user')groups.push({user:event,events:[]});else if(groups.length)groups.at(-1)!.events.push(event)}
+ for(const event of task.value?.events||[]){if(event.kind==='user'&&!event.steering)groups.push({user:event,events:[]});else if(groups.length)groups.at(-1)!.events.push(event)}
  return groups.map((group,index)=>{
   const mutations=group.events.filter(event=>event.status==='completed'&&['write_file','replace_text','apply_patch','create_document','create_spreadsheet'].includes(event.tool||'')),changedLines=new Map<string,number>()
   for(const event of mutations)for(const change of eventChanges(event))changedLines.set(change.path,Math.min(changedLines.get(change.path)??change.line,change.line))
@@ -102,16 +103,16 @@ const resultGroups=computed(()=>{
    for(const change of eventChanges(event))if(!editsByPath.has(change.path))editsByPath.set(change.path,{event,...change,undoable:!!(event.preview?.changes?.length||event.preview?.path&&event.preview.after!==undefined)})
   }
   const paths=new Set(mutations.flatMap(event=>eventPaths(event)))
-  const validations=group.events.filter(event=>['run_test','run_test_case','get_diagnostics','run_command'].includes(event.tool||'')).map(event=>{let exitCode=event.audit?.exitCode;try{if(exitCode===undefined&&event.output)exitCode=JSON.parse(event.output).exitCode}catch{}return {id:event.id,label:toolLabel(event.tool),detail:String(event.args?.script||event.args?.target||event.args?.checker||event.args?.command||''),passed:event.status==='completed'&&(exitCode===undefined||exitCode===0),exitCode,duration:event.audit?.durationMs}})
+  const validations=group.events.filter(event=>['build_project','run_test','run_test_case','get_diagnostics','run_command'].includes(event.tool||'')).map(event=>{let exitCode=event.audit?.exitCode;try{if(exitCode===undefined&&event.output)exitCode=JSON.parse(event.output).exitCode}catch{}return {id:event.id,label:toolLabel(event.tool),detail:String(event.args?.action||event.args?.script||event.args?.target||event.args?.checker||event.args?.command||''),passed:event.status==='completed'&&exitCode===0&&event.execution?.verification?.status!=='unverified',exitCode,duration:event.audit?.durationMs}})
   const last=group.events.at(-1),fallbackEnd=index===groups.length-1?Date.parse(task.value?.runCompletedAt||task.value?.updatedAt||group.user.createdAt):Date.parse(groups[index+1].user.createdAt),duration=group.user.durationMs??Math.max(0,(last?.audit?.endedAt?Date.parse(last.audit.endedAt):fallbackEnd)-Date.parse(group.user.createdAt))
   return {id:group.user.id,user:group.user,summary:[...group.events].reverse().find(event=>event.kind==='assistant'&&event.text.trim())?.text||'任务已完成。',artifacts:[...paths].map(path=>{const item=artifacts.get(path);return item?{...item,line:changedLines.get(path)||1}:undefined}).filter((item):item is NonNullable<typeof item>=>!!item),validations,edits:[...editsByPath.values()],duration}
  })
 })
 const settledGroups=computed(()=>task.value?.status==='completed'?resultGroups.value:resultGroups.value.slice(0,-1))
-const currentTurnEvents=computed(()=>{const events=task.value?.events||[];let start=-1;for(let index=events.length-1;index>=0;index--){if(events[index].kind==='user'){start=index;break}}return start<0?events:events.slice(start)})
+const currentTurnEvents=computed(()=>{const events=task.value?.events||[];let start=-1;for(let index=events.length-1;index>=0;index--){if(events[index].kind==='user'&&!events[index].steering){start=index;break}}return start<0?events:events.slice(start)})
 const currentTurnUser=computed(()=>currentTurnEvents.value.find(event=>event.kind==='user'))
 const currentTurnProgressEvents=computed(()=>currentTurnEvents.value.filter(event=>event.id!==currentTurnUser.value?.id))
-const currentPlanText=computed(()=>task.value?.plan.find(item=>item.status==='running')?.text||task.value?.plan.find(item=>item.status==='pending')?.text||task.value?.plan.at(-1)?.text||'')
+const currentPlanText=computed(()=>task.value?.plan.find(item=>item.status==='running')?.text||task.value?.plan.find(item=>item.status==='pending')?.text||'暂无进行中的步骤')
 const completedPlanSteps=computed(()=>task.value?.plan.filter(item=>item.status==='completed').length||0)
 const artifactLimit=(id:string)=>artifactLimits.value[id]||3
 function showMoreArtifacts(id:string){artifactLimits.value={...artifactLimits.value,[id]:artifactLimit(id)+3}}
@@ -129,15 +130,36 @@ function closeSettings(){if(settingsPanel.value){settingsPanel.value.open=false;
 function dismissSettings(event:PointerEvent){if(settingsPanel.value&&!settingsPanel.value.contains(event.target as Node))settingsPanel.value.open=false}
 const pending=computed(()=>task.value?.events.find(e=>e.status==='waiting'))
 const statusLabel=(status:string)=>({running:'正在执行',waiting:'等待确认',completed:'已完成',stopped:'已停止',failed:'执行失败'}[status]||status)
-const toolLabel=(name?:string)=>({restore_change:'恢复文件',git_status:'Git 状态',git_diff:'Git 差异',git_log:'Git 历史',apply_patch:'多文件补丁',run_test:'运行验证',read_history:'查阅任务历史',set_plan:'更新任务计划',list_files:'浏览文件',search_files:'检索项目',read_file:'读取代码 / 文本',read_document:'读取文档',write_file:'写入文件',replace_text:'修改文件',create_document:'生成文档',create_spreadsheet:'生成表格',run_command:'运行命令'}[name||'']||name)
+const toolLabel=(name?:string)=>({inspect_build:'检查构建配置',build_project:'构建 / 验证项目',reconcile_execution:'核对中断步骤',read_tool_result:'读取工具原文',restore_change:'恢复文件',git_status:'Git 状态',git_diff:'Git 差异',git_log:'Git 历史',apply_patch:'多文件补丁',run_test:'运行验证',read_history:'查阅任务历史',set_plan:'更新任务计划',list_files:'浏览文件',search_files:'检索项目',read_file:'读取代码 / 文本',read_document:'读取文档',write_file:'写入文件',replace_text:'修改文件',create_document:'生成文档',create_spreadsheet:'生成表格',run_command:'运行命令'}[name||'']||name)
+const eventCommand=(event:AgentEvent)=>{const command=event.preview?.command??event.args?.command;return typeof command==='string'?command.replace(/\s+/g,' ').trim():''}
+const toolProgressLabel=(event:AgentEvent)=>{const label=toolLabel(event.tool)||event.tool||'工具',command=eventCommand(event);return command?`${label}：${command}`:label}
 const compactProcessText=(value:string)=>{const text=value.replace(/[`#*_>\n\r]+/g,' ').replace(/\s+/g,' ').trim();return text.length>24?text.slice(0,24)+'…':text}
-const processSteps=computed(()=>currentTurnProgressEvents.value.map(event=>{
- const path=String(event.preview?.path||event.args?.path||'').split(/[\\/]/).filter(Boolean).at(-1)
- const label=event.kind==='tool'?[toolLabel(event.tool),path].filter(Boolean).join(' · '):(compactProcessText(event.text)||(event.reasoning?'思考与分析':'处理中'))
- return {id:event.id,label,status:event.status||'completed'}
-}))
-const processScroller=ref<HTMLElement>()
-watch(()=>processSteps.value.map(step=>`${step.id}:${step.status}:${step.label}`).join('|')+(task.value?.status==='running'?modelWaiting.value:''),async()=>{await nextTick();if(processScroller.value)processScroller.value.scrollLeft=processScroller.value.scrollWidth},{flush:'post',immediate:true})
+const processLabel=(event:AgentEvent)=>event.kind==='tool'?[toolLabel(event.tool),eventCommand(event)||String(event.preview?.path||event.args?.path||'').split(/[\\/]/).filter(Boolean).at(-1)].filter(Boolean).join(' · '):(compactProcessText(event.text)||(event.reasoning?'思考与分析':'处理中'))
+const currentProcessText=computed(()=>{
+ const currentEvent=[...currentTurnProgressEvents.value].reverse().find(event=>event.status==='running'||event.status==='waiting')
+ if(!active.value){
+  if(currentEvent)return processLabel(currentEvent)
+  return task.value?.status==='failed'?'执行失败':task.value?.status==='stopped'?'已停止':'暂无进行中的任务'
+ }
+ const progress=task.value?.modelProgress,startedAt=task.value?.runStartedAt||progress?.startedAt
+ const elapsed=startedAt?Math.max(0,Math.floor((clock.value-Date.parse(startedAt))/1000)):0
+ const seconds=Number.isFinite(elapsed)?elapsed:0
+ const duration=seconds>=3600?`${Math.floor(seconds/3600)}小时${Math.floor(seconds%3600/60)}分${seconds%60}秒`:seconds>=60?`${Math.floor(seconds/60)}分${seconds%60}秒`:`${seconds}秒`
+ const prefix=`已处理 ${duration} · `
+ if(task.value?.context?.state==='compacting')return prefix+'正在整理上下文…'
+ const tools=currentTurnProgressEvents.value.filter(event=>event.kind==='tool'&&(event.status==='running'||event.status==='waiting'))
+ if(tools.length)return prefix+(tools.some(event=>event.status==='waiting')?'等待确认工具：':'正在执行工具：')+tools.map(toolProgressLabel).filter(Boolean).join('、')
+ const names=progress?.toolNames?.filter(Boolean).join('、')
+ const stage=progress?.phase||'waiting'
+ return prefix+(stage==='tools'&&names?'模型正在调用工具：'+names:({waiting:'等待模型响应…',thinking:'模型正在思考…',responding:'模型正在生成答复…',tools:'模型正在生成工具调用…'})[stage])
+})
+const composerElement=ref<HTMLElement>(),composerHeight=ref(180)
+let composerObserver:ResizeObserver|undefined
+onMounted(()=>{
+ composerObserver=new ResizeObserver(()=>{if(composerElement.value){composerHeight.value=Math.ceil(composerElement.value.getBoundingClientRect().height);void scroll()}})
+ if(composerElement.value)composerObserver.observe(composerElement.value)
+})
+onBeforeUnmount(()=>composerObserver?.disconnect())
 const templates=[
  {icon:Search,mode:'coding' as const,title:'分析项目',description:'理解结构，定位关键逻辑',prompt:'请先阅读项目规范和目录结构，分析项目的技术栈、入口和核心模块，给出有文件依据的说明。暂时不要修改文件。'},
  {icon:Tools,mode:'coding' as const,title:'修复并验证',description:'定位问题、修改代码、运行测试',prompt:'请先分析项目并制定计划，定位和修复下面的问题，再运行相关测试验证：\n'},
@@ -148,6 +170,12 @@ function output(event:AgentEvent){if(!event.output)return '';try{const parsed=JS
 async function scroll(){await nextTick();if(engine.value==='chat')ch.scroller=scroller.value;if(follow.value&&scroller.value)scroller.value.scrollTop=scroller.value.scrollHeight}
 function trackScroll(){if(engine.value==='chat'){ch.trackScroll();return}const el=scroller.value;if(el)follow.value=el.scrollHeight-el.scrollTop-el.clientHeight<100}
 
+const unresolvedExecutions=computed(()=>task.value?.events.filter(event=>event.execution?.state==='unknown')||[])
+async function resolveExecution(eventId:string,outcome:'completed'|'not-applied'){
+ if(!task.value||locked.value)return
+ busy.value=true
+ try{receive(await api('agentResolveExecution',{id:task.value.id,eventId,outcome,note:outcome==='completed'?'用户已核对实际结果，确认完成':'用户已核对实际状态，确认未执行'}))}catch(e){error.value=String(e)}finally{busy.value=false}
+}
 async function restoreChange(eventId:string){if(!task.value||locked.value)return;busy.value=true;try{receive(await api('agentRestore',{id:task.value.id,eventId}))}catch(e){error.value=String(e)}finally{busy.value=false}}
 async function showAudit(){if(!task.value)return;try{auditLog.value=await api('agentAudit',{id:task.value.id})}catch(e){error.value=String(e)}}
 async function previewFile(path:string,line=1){if(!task.value)return;filePreviewOpen.value=true;filePreviewExpanded.value=false;filePreviewLine.value=Math.max(1,line);filePreviewLoading.value=true;filePreviewError.value='';filePreview.value=undefined;try{filePreview.value=await api('agentPreview',{id:task.value.id,path})}catch(e){filePreviewError.value=String(e).replace(/^Error:\s*(?:Error invoking remote method '[^']+':\s*)?(?:Error:\s*)?/,'')}finally{filePreviewLoading.value=false}}
@@ -205,27 +233,82 @@ async function newTask(){
  try{if(engine.value==='chat')await freshChat();rememberSelection()}catch(e){error.value=String(e)}finally{busy.value=false}
 }
 function useTemplate(item:typeof templates[number]){if(engine.value==='chat'&&ch.session?.messages.length)sourceSessionId.value=ch.session.id;engine.value='agent';mode.value='general';prompt.value=item.prompt;void nextTick(()=>document.querySelector<HTMLTextAreaElement>('.agent-prompt textarea')?.focus())}
-async function start(){
- if(locked.value)return
- if(engine.value==='chat'&&workspacePath.value){prompt.value=ch.input;sourceSessionId.value=ch.session?.messages.length?ch.session.id:undefined;model.value=ch.model;engine.value='agent';mode.value='general'}
+type Submission={text:string;images:StudioImage[]}
+const queueKey=computed(()=>engine.value==='agent'?(task.value?.id?'agent:'+task.value.id:''):(ch.session?.id?'chat:'+ch.session.id:''))
+const queued=computed(()=>queueKey.value?messageQueues[queueKey.value]:undefined)
+const inputBlocked=computed(()=>loading.value||ch.sessionBusy||ch.attaching||(!active.value&&!ch.sending&&(busy.value||queueDispatching.value)))
+const canSubmit=computed(()=>!inputBlocked.value&&(!!draft.value.trim()||ch.images.length>0)&&!!selectedModel.value.trim()&&(engine.value!=='agent'||!!workspacePath.value))
+async function submitDraft(){
+ if(!canSubmit.value)return
+ const submission={text:draft.value,images:ch.images.map(image=>({...image}))}
+ draft.value='';ch.images=[]
+ if(queueKey.value&&(active.value||ch.sending||queueDispatching.value||queued.value?.items.length)){
+  const queue=messageQueues[queueKey.value]??={items:[],paused:false}
+  queue.items.push({id:crypto.randomUUID(),...submission})
+  void drainQueue();return
+ }
+ if(!await start(submission)&&!draft.value&&!ch.images.length){draft.value=submission.text;ch.images=submission.images}
+}
+async function drainQueue(){
+ const key=queueKey.value,queue=messageQueues[key]
+ if(disposed||queueDispatching.value||locked.value||!queue?.items.length||queue.paused)return
+ if(engine.value==='agent'&&task.value?.status!=='completed'){queue.paused=true;return}
+ if(engine.value==='chat'&&ch.error){queue.paused=true;return}
+ await dispatchQueued(key)
+}
+async function dispatchQueued(key:string){
+ const queue=messageQueues[key],item=queue?.items[0]
+ if(!item||key!==queueKey.value||disposed||locked.value)return
+ queueDispatching.value=true
+ try{if(await start(item)){queue.items=queue.items.filter(entry=>entry.id!==item.id)}else queue.paused=true}
+ finally{queueDispatching.value=false}
+ void drainQueue()
+}
+async function resumeQueue(){if(locked.value||!queued.value)return;queued.value.paused=false;await dispatchQueued(queueKey.value)}
+function removeQueued(id:string){if(queued.value&&!queueDispatching.value&&!steeringItem.value)queued.value.items=queued.value.items.filter(item=>item.id!==id)}
+async function editQueued(id:string){
+ const key=queueKey.value,queue=messageQueues[key],item=queue?.items.find(entry=>entry.id===id)
+ if(!item||queueDispatching.value||steeringItem.value)return
+ const wasPaused=queue.paused;queue.paused=true
+ try{
+  const {value}=await ElMessageBox.prompt('修改后仍保留原来的排队位置。','编辑待执行消息',{inputType:'textarea',inputValue:item.text,confirmButtonText:'保存',cancelButtonText:'取消',inputValidator:value=>(!!value?.trim()||item.images.length>0)&&String(value||'').length<=(key.startsWith('agent:')?16000:100000)||'请输入有效内容，且不超过消息长度限制'})
+  item.text=value
+ }catch(e){if(e!=='cancel'&&e!=='close')error.value=String(e)}
+ finally{if(!wasPaused&&key===queueKey.value&&(engine.value==='agent'?!['failed','stopped'].includes(task.value?.status||''):!ch.error))queue.paused=false;void drainQueue()}
+}
+async function steerQueued(id:string){
+ const queue=queued.value,item=queue?.items.find(entry=>entry.id===id),target=task.value
+ if(!item||!target||engine.value!=='agent'||!active.value||steeringItem.value||queueDispatching.value)return
+ steeringItem.value=id
+ try{const updated=await api('agentSteer',{id:target.id,messageId:item.id,prompt:item.text,images:item.images.map(image=>({name:image.name,dataUrl:image.dataUrl}))});queue!.items=queue!.items.filter(entry=>entry.id!==id);receive(updated)}catch(e){error.value=String(e)}finally{steeringItem.value=''}
+}
+function toggleQueuePause(){if(!queued.value||queueDispatching.value)return;if(queued.value.paused)void resumeQueue();else queued.value.paused=true}
+async function start(submission:Submission){
+ if(active.value||ch.sending||busy.value||loading.value||ch.sessionBusy)return false
+ if(engine.value==='chat'&&workspacePath.value){sourceSessionId.value=ch.session?.messages.length?ch.session.id:undefined;model.value=ch.model;engine.value='agent';mode.value='general'}
  if(engine.value==='chat'){
   busy.value=true;error.value=''
-  try{if(ch.session&&ch.session.projectId!==(projectId.value||undefined)){ch.session=await api('updateSession',{id:ch.session.id,projectId:projectId.value});await ch.refreshSessions()}await ch.send();rememberSelection()}catch(e){error.value=String(e)}finally{busy.value=false}
-  return
+  try{if(ch.session&&ch.session.projectId!==(projectId.value||undefined)){ch.session=await api('updateSession',{id:ch.session.id,projectId:projectId.value});await ch.refreshSessions()}const accepted=await ch.send(false,submission);rememberSelection();return accepted===true}catch(e){error.value=String(e);return false}finally{busy.value=false}
  }
- if((!prompt.value.trim()&&!ch.images.length)||!model.value.trim())return
- if(!workspacePath.value){error.value='请先选择项目或文档目录';return}
+ if((!submission.text.trim()&&!submission.images.length)||!model.value.trim())return false
+ if(!workspacePath.value){error.value='请先选择项目或文档目录';return false}
  mode.value='general'
  busy.value=true;error.value='';follow.value=true;if(settingsPanel.value)settingsPanel.value.open=false
- try{const next=await api('agentStart',{approvalMode:approvalMode.value,fastMode:fastMode.value,sessionId:sourceSessionId.value,images:ch.images.map(image=>({name:image.name,dataUrl:image.dataUrl})),projectId:projectId.value||undefined,taskId:task.value?.id,workspaceToken:workspace.value?.token,mode:mode.value,model:model.value,prompt:prompt.value,maxSteps:maxSteps.value,tokenBudget:tokenBudget.value});task.value=next;sourceSessionId.value=undefined;ch.images=[];ch.input='';rememberSelection();collapsedGroups.value.delete(next.projectId||'');prompt.value='';receive(next)}catch(e){error.value=String(e)}finally{busy.value=false}
+ try{const next=await api('agentStart',{approvalMode:approvalMode.value,fastMode:fastMode.value,sessionId:sourceSessionId.value,images:submission.images.map(image=>({name:image.name,dataUrl:image.dataUrl})),projectId:projectId.value||undefined,taskId:task.value?.id,workspaceToken:workspace.value?.token,mode:mode.value,model:model.value,prompt:submission.text,maxSteps:maxSteps.value,tokenBudget:tokenBudget.value});task.value=next;sourceSessionId.value=undefined;rememberSelection();collapsedGroups.value.delete(next.projectId||'');receive(next);return true}catch(e){error.value=String(e);return false}finally{busy.value=false}
 }
+watch([()=>task.value?.status,()=>ch.sending],([status,sending],[previousStatus,previousSending])=>{
+ if(queued.value&&((engine.value==='agent'&&status!==previousStatus&&['failed','stopped'].includes(status||''))||(engine.value==='chat'&&previousSending&&!sending&&!!ch.error)))queued.value.paused=true
+},{flush:'post'})
+watch([active,()=>ch.sending,busy,loading,steeringItem,()=>task.value?.status,queueKey],()=>{void drainQueue()},{flush:'post'})
 async function compact(){if(engine.value==='chat'){await ch.compactSession();return}if(!task.value||locked.value)return;busy.value=true;error.value='';try{receive(await api('agentCompact',{id:task.value.id}))}catch(e){error.value=String(e)}finally{busy.value=false}}
-async function stop(){if(engine.value==='chat'){await ch.stop();return}if(!task.value)return;try{await api('agentStop',{id:task.value.id})}catch(e){error.value=String(e)}}
+async function stop(){if(queueKey.value)(messageQueues[queueKey.value]??={items:[],paused:false}).paused=true;if(engine.value==='chat'){await ch.stop();return}if(!task.value)return;try{await api('agentStop',{id:task.value.id})}catch(e){error.value=String(e)}}
 async function approve(approved:boolean){if(!task.value||!pending.value||busy.value)return;busy.value=true;try{await api('agentApprove',{id:task.value.id,eventId:pending.value.id,approved})}catch(e){error.value=String(e)}finally{busy.value=false}}
 async function reveal(path:string){if(!task.value)return;try{await api('agentReveal',{id:task.value.id,path})}catch(e){error.value=String(e)}}
 watch(scroller,value=>{ch.scroller=value})
 watch(()=>ch.sending,()=>{void scroll()})
-watch(()=>props.model,value=>{if(!task.value&&value)model.value=value})
+watch([()=>props.model,locked],([value])=>{
+ if(!locked.value&&value)model.value=value
+},{flush:'post'})
 watch(performanceWarning,()=>{performanceWarningDismissed.value=false})
 watch([()=>task.value?.id,()=>task.value?.status],()=>{artifactLimits.value={}})
 watch(()=>task.value?.id,()=>{filePreviewOpen.value=false;filePreviewExpanded.value=false;filePreviewLine.value=1;filePreview.value=undefined;filePreviewError.value='';hideFileTooltip()})
@@ -263,7 +346,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
    </nav>
    <footer><Check/><span>记录保存在本机</span></footer>
   </aside>
-  <section class="agent-main" :class="{'is-welcome':!hasConversation,'preview-expanded':filePreviewOpen&&filePreviewExpanded}">
+  <section class="agent-main" :style="{'--composer-height':composerHeight+'px'}" :class="{'is-welcome':!hasConversation,'preview-expanded':filePreviewOpen&&filePreviewExpanded}">
    <header class="agent-toolbar">
     <button class="agent-icon agent-history-toggle" aria-label="项目与会话" title="项目与会话" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/></button>
     <div class="workspace-heading"><strong :title="currentConversation?.title">{{hasConversation?currentConversation?.title:'新会话'}}</strong><button class="agent-workspace-picker" :disabled="locked" :title="workspacePath||'可选：选择项目文件夹'" @click="chooseWorkspace"><FolderOpened/><span>{{workspaceName}}</span><ArrowDown/></button></div>
@@ -284,6 +367,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
     </section>
     <WorkspaceChatMessages v-else-if="chatVisible" :messages="ch.messages" :sending="ch.sending" @copy="ch.copy" @regenerate="ch.send(true)"/>
     <div v-else-if="task" class="agent-events">
+     <section v-if="unresolvedExecutions.length" class="agent-error agent-recovery" role="status"><strong>这些步骤的执行结果需要核对</strong><p>可继续只读检查。确认实际结果后，再恢复写入或命令执行。</p><div v-for="operation in unresolvedExecutions" :key="operation.id"><p>{{toolLabel(operation.tool)}} · {{operation.execution?.failure?.message}}</p><pre>{{JSON.stringify(operation.args,null,2)}}</pre><button class="agent-secondary" :disabled="locked" @click="resolveExecution(operation.id,'completed')">已核对完成</button><button class="agent-secondary" :disabled="locked" @click="resolveExecution(operation.id,'not-applied')">确认未执行</button></div></section>
      <template v-if="settledGroups.length"><article v-for="group in settledGroups" :key="group.id" class="agent-turn-group"><section class="agent-turn-user"><div v-if="group.user.images?.length" class="message-images"><img v-for="image in group.user.images" :key="image.dataUrl" :src="image.dataUrl" :alt="image.name"/></div><AiMarkdown v-if="group.user.text" :text="group.user.text"/></section><section class="agent-result"><header><strong>用时{{compactElapsed(group.duration)}}</strong></header><section><h3>问题总结</h3><AiMarkdown :text="group.summary"/></section><section v-if="group.artifacts.length"><h3>修改文件</h3><div class="agent-result-files"><button v-for="artifact in group.artifacts.slice(0,artifactLimit(group.id))" :key="artifact.path" @mouseenter="showFileTooltip(artifact.path,artifact.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(artifact.path,artifact.line)"><Document/><span><strong>{{artifact.path}}</strong><small>第 {{artifact.line}} 行 · 点击预览</small></span><ArrowRight/></button></div><button v-if="artifactLimit(group.id)<group.artifacts.length" class="agent-artifacts-more" @click="showMoreArtifacts(group.id)">再显示 3 个文件</button></section><section><h3>验证结果</h3><div v-if="group.validations.length" class="agent-validation-list"><div v-for="result in group.validations" :key="result.id" :class="{failed:!result.passed}"><Check v-if="result.passed"/><Close v-else/><span><strong>{{result.label}}</strong><small>{{result.detail||'已执行'}}<template v-if="result.exitCode!==undefined"> · 退出码 {{result.exitCode}}</template><template v-if="result.duration!==undefined"> · {{(result.duration/1000).toFixed(1)}} 秒</template></small></span></div></div><p v-else class="agent-result-empty">未运行自动验证。</p></section><section v-if="group.edits.length"><h3>已编辑文件</h3><div class="agent-edit-list"><div v-for="operation in group.edits" :key="operation.event.id+operation.path"><button class="agent-edit-file" @mouseenter="showFileTooltip(operation.path,operation.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(operation.path,operation.line)"><span><strong>{{operation.path}}</strong><small>第 {{operation.line}} 行 · {{toolLabel(operation.event.tool)}} · {{new Date(operation.event.createdAt).toLocaleTimeString()}}</small></span></button><button :disabled="busy||!operation.undoable" :title="operation.undoable?'撤销本次修改':'缺少可撤销快照'" @click="restoreChange(operation.event.id)">撤销</button></div></div></section></section></article><footer v-if="task.status==='completed'" class="agent-result-audit"><button class="agent-secondary" @click="showAudit">查看审计记录</button><pre v-if="auditLog" class="agent-tool-output">{{auditLog}}</pre></footer></template>
      <template v-if="task.status!=='completed'">
       <header class="agent-task-heading"><span class="agent-status" :class="task.status" role="status">{{statusLabel(task.status)}}<template v-if="task.mode!=='chat'"> · {{task.steps}} / {{task.maxSteps||'按预算'}} 轮</template></span></header>
@@ -296,26 +380,44 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
        <div class="agent-plan-items"><div v-for="(item,index) in task.plan" :key="index" :class="item.status"><Check v-if="item.status==='completed'"/><span v-else class="agent-step-number">{{index+1}}</span><span>{{item.text}}</span><small>{{item.status==='completed'?'完成':item.status==='running'?'进行中':'待处理'}}</small></div></div>
       </details>
       <details v-if="currentTurnProgressEvents.length||task.status==='running'" class="agent-process">
-       <summary aria-label="展开或收起执行过程"><ArrowRight class="agent-process-toggle"/><strong>执行过程</strong><span ref="processScroller" class="agent-process-stream" aria-live="polite"><span v-for="(step,index) in processSteps" :key="step.id" :class="step.status"><i>{{index?' › ':'$ '}}</i>{{step.label}}</span><span v-if="task.status==='running'" class="running"><i> › </i>{{modelWaiting}}</span></span></summary>
+       <summary aria-label="展开或收起执行过程"><ArrowRight class="agent-process-toggle"/><strong>执行过程</strong><span class="agent-process-stream" :title="currentProcessText" aria-live="polite">{{currentProcessText}}</span></summary>
        <div class="agent-process-details">
         <article v-for="event in currentTurnProgressEvents" :key="event.id" class="agent-event" :class="[event.kind,event.status]">
-         <template v-if="event.kind!=='tool'"><div v-if="event.images?.length" class="message-images"><img v-for="image in event.images" :key="image.dataUrl" :src="image.dataUrl" :alt="image.name"/></div><details v-if="event.reasoning" class="agent-reasoning"><summary><span class="reasoning-spark"></span><strong>{{event.status==='running'?'正在思考':'查看思考内容'}}</strong><small>{{event.reasoning.length.toLocaleString()}} 字符</small></summary><pre>{{event.reasoning}}</pre></details><AiMarkdown v-if="event.text" :text="event.text"/></template>
-         <template v-else><details><summary><span class="agent-tool-dot" :class="event.status"></span><strong>{{event.audit?.source.startsWith('mcp:')?event.text:toolLabel(event.tool)}}</strong><code class="agent-tool-name">{{event.tool}}</code><span class="agent-event-path">{{event.preview?.path||event.args?.path||''}}</span><small>{{event.status==='waiting'?'待确认':event.status==='running'?'执行中':event.status==='rejected'?'已拒绝':event.status==='failed'?'未成功':'已执行'}}</small></summary><p v-if="event.audit" class="tool-audit">{{event.audit.source.startsWith('mcp:')?'MCP 外部工具':'内置工具'}} · {{event.audit.authorization==='automatic'?'自动允许':event.audit.authorization==='confirmed'?'已确认':'待确认 / 未授权'}}<template v-if="event.audit.durationMs!==undefined"> · {{(event.audit.durationMs/1000).toFixed(1)}} 秒</template><template v-if="event.audit.errorCode"> · {{event.audit.errorCode}}</template></p><pre v-if="event.args&&!event.preview" class="agent-tool-args">{{JSON.stringify(event.args,null,2)}}</pre><div v-if="event.preview" class="agent-preview"><p>{{event.preview.note}}</p><template v-if="event.preview.changes"><details v-for="change in event.preview.changes" :key="change.path" open><summary>{{change.path}}</summary><div class="agent-diff"><section><h4>修改前</h4><pre>{{change.before??'新文件'}}</pre></section><section><h4>修改后</h4><pre>{{change.after}}</pre></section></div></details></template><template v-else-if="event.preview.command"><span class="agent-preview-label">{{event.preview.cwd}}</span><pre>{{event.preview.command}}</pre></template><div v-else class="agent-diff" :class="{creation:event.preview.before===undefined}"><section v-if="event.preview.before!==undefined"><h4>修改前</h4><pre>{{event.preview.before}}</pre></section><section><h4>{{event.audit?.source.startsWith('mcp:')?'调用参数':event.preview.before===undefined?'待写入内容':'修改后'}}</h4><pre>{{event.preview.after}}</pre></section></div></div><button v-if="event.status==='completed'&&['write_file','replace_text','apply_patch'].includes(event.tool||'')" class="agent-secondary" :disabled="locked" @click="restoreChange(event.id)">恢复本次修改</button><pre v-if="event.output" class="agent-tool-output">{{output(event)}}</pre></details></template>
+         <template v-if="event.kind!=='tool'"><details><summary><Check v-if="event.steering!=='pending'&&(!event.status||event.status==='completed')" class="agent-step-check"/><span v-else class="agent-tool-dot" :class="event.status"></span><strong>{{processLabel(event)}}</strong></summary><div v-if="event.images?.length" class="message-images"><img v-for="image in event.images" :key="image.dataUrl" :src="image.dataUrl" :alt="image.name"/></div><details v-if="event.reasoning" class="agent-reasoning"><summary><span class="reasoning-spark"></span><strong>{{event.status==='running'?'正在思考':'查看思考内容'}}</strong><small>{{event.reasoning.length.toLocaleString()}} 字符</small></summary><pre>{{event.reasoning}}</pre></details><AiMarkdown v-if="event.text" :text="event.text"/></details></template>
+         <template v-else><details><summary><Check v-if="event.status==='completed'" class="agent-step-check"/><span v-else class="agent-tool-dot" :class="event.status"></span><strong>{{event.audit?.source.startsWith('mcp:')?event.text:toolLabel(event.tool)}}</strong><code class="agent-tool-name">{{event.tool}}</code><span v-if="eventCommand(event)" class="agent-event-command" :title="eventCommand(event)">{{eventCommand(event)}}</span><span v-else class="agent-event-path">{{event.preview?.path||event.args?.path||''}}</span><small>{{event.status==='waiting'?'待确认':event.status==='running'?'执行中':event.status==='rejected'?'已拒绝':event.status==='failed'?'未成功':'已执行'}}</small></summary><p v-if="event.audit" class="tool-audit">{{event.audit.source.startsWith('mcp:')?'MCP 外部工具':'内置工具'}} · {{event.audit.authorization==='automatic'?'自动允许':event.audit.authorization==='confirmed'?'已确认':'待确认 / 未授权'}}<template v-if="event.audit.durationMs!==undefined"> · {{(event.audit.durationMs/1000).toFixed(1)}} 秒</template><template v-if="event.audit.errorCode"> · {{event.audit.errorCode}}</template></p><pre v-if="event.args&&!event.preview" class="agent-tool-args">{{JSON.stringify(event.args,null,2)}}</pre><div v-if="event.preview" class="agent-preview"><p>{{event.preview.note}}</p><template v-if="event.preview.changes"><details v-for="change in event.preview.changes" :key="change.path" open><summary>{{change.path}}</summary><div class="agent-diff"><section><h4>修改前</h4><pre>{{change.before??'新文件'}}</pre></section><section><h4>修改后</h4><pre>{{change.after}}</pre></section></div></details></template><template v-else-if="event.preview.command"><span class="agent-preview-label">{{event.preview.cwd}}</span><pre>{{event.preview.command}}</pre></template><div v-else class="agent-diff" :class="{creation:event.preview.before===undefined}"><section v-if="event.preview.before!==undefined"><h4>修改前</h4><pre>{{event.preview.before}}</pre></section><section><h4>{{event.audit?.source.startsWith('mcp:')?'调用参数':event.preview.before===undefined?'待写入内容':'修改后'}}</h4><pre>{{event.preview.after}}</pre></section></div></div><button v-if="event.status==='completed'&&['write_file','replace_text','apply_patch'].includes(event.tool||'')" class="agent-secondary" :disabled="locked" @click="restoreChange(event.id)">恢复本次修改</button><p v-if="event.execution?.verification" class="tool-audit">核验：{{event.execution.verification.summary}}</p><p v-if="event.execution?.failure" class="tool-audit">建议：{{event.execution.failure.nextAction}}</p><pre v-if="event.output" class="agent-tool-output">{{output(event)}}</pre></details></template>
         </article>
-        <div v-if="task.status==='running'" class="agent-working" role="status"><span></span>{{modelWaiting}}</div>
+        <div v-if="task.status==='running'" class="agent-working" role="status"><span></span>{{currentProcessText}}</div>
        </div>
       </details>
       <p v-if="task.error" class="agent-task-error" role="status">{{task.error}}</p>
      </template>
     </div>
    </div>
+   <div ref="composerElement" class="agent-composer-wrap">
    <div v-if="pending" class="agent-approval" role="region" aria-label="Agent 操作确认"><div><strong>{{pending.audit?.source.startsWith('mcp:')?'确认调用外部工具':pending.preview?.command?'确认执行命令':'确认文件修改'}}</strong><span :title="pending.preview?.command||pending.preview?.path">{{pending.audit?.source.startsWith('mcp:')?pending.text:pending.preview?.command||pending.preview?.path}}</span><small>{{pending.audit?.source.startsWith('mcp:')?'参数将发送给该服务，请查看上方服务名称和完整参数。':pending.preview?.command?'命令可访问目录外文件及网络，请查看上方完整命令。':'请查看上方待写入内容，批准后写入工作目录。'}}</small></div><button class="agent-secondary" :disabled="busy" @click="approve(false)"><Close/>拒绝</button><button class="agent-primary" :disabled="busy" @click="approve(true)"><Check/>批准执行</button></div>
-   <div class="agent-composer-wrap">
+    <p v-if="task?.events.some(event=>event.steering==='pending')" class="queue-steering-note" role="status">调整要求已加入，等待当前步骤结束后处理…</p>
     <ContextUsageDisplay v-if="hasConversation" :context="currentConversation?.context" :checkpoint="currentConversation?.checkpoint" :has-history="hasConversation" :disabled="locked" :shortcut="`Enter 发送 · Shift + Enter 换行${ch.attaching?' · 正在读取图片…':''}`" @compact="compact"/>
     <div v-if="engine==='agent'&&performanceWarning&&!performanceWarningDismissed" class="agent-performance-warning"><Cpu/><span><strong>当前推理配置较慢</strong>{{performanceWarning}}</span><button type="button" @click="ch.tab='settings'">调整加载参数</button><button type="button" class="agent-performance-dismiss" aria-label="关闭加载参数提示" title="关闭" @click="performanceWarningDismissed=true"><Close/></button></div>
-    <form class="agent-prompt composer" @submit.prevent="start">
-     <div v-if="ch.images.length" class="composer-images"><figure v-for="(image,index) in ch.images" :key="index"><img :src="image.dataUrl" :alt="image.name"/><figcaption>{{image.name}}</figcaption><button type="button" :aria-label="'移除图片 '+(index+1)" :disabled="locked" @click="ch.removeImage(index)">×</button></figure></div>
-     <textarea v-model="draft" aria-label="消息" :disabled="active||ch.sending||loading" :maxlength="engine==='chat'?100000:16000" :placeholder="hasConversation?'补充要求，继续这段对话…':'询问任何问题，或描述你想完成的工作…'" @paste="pasteImages" @keydown="!$event.isComposing&&$event.key==='Enter'&&!$event.shiftKey&&($event.preventDefault(),start())"></textarea>
+    <section v-if="queued?.items.length" class="agent-message-queue" aria-label="待执行任务">
+     <header v-if="queued.paused"><span>排队已暂停</span><button type="button" :disabled="locked" @click="resumeQueue">继续排队</button></header>
+     <ol><li v-for="(item,index) in queued.items" :key="item.id">
+      <svg class="queue-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 4v12a3 3 0 0 0 3 3h11M15 15l4 4-4 4M10 5h9M10 10h6"/></svg>
+      <span class="queue-message" :title="item.text">{{item.text||'图片任务'}}<small v-if="item.images.length"> · {{item.images.length}} 张图片</small></span>
+      <button v-if="engine==='agent'&&active" type="button" class="queue-steer" :disabled="!!steeringItem||queueDispatching" title="加入当前任务，调整执行方向" @click="steerQueued(item.id)"><span aria-hidden="true">↪</span>调整方向</button>
+      <button type="button" class="queue-remove" :disabled="queueDispatching" title="移除" :aria-label="'移除待执行任务 '+(index+1)" @click="removeQueued(item.id)"><Delete/></button>
+      <ElDropdown class="queue-menu" trigger="click" placement="top-end" @command="command=>command==='edit'?editQueued(item.id):command==='steer'?steerQueued(item.id):toggleQueuePause()">
+       <button type="button" :aria-label="'待执行任务 '+(index+1)+' 的更多操作'" title="更多操作"><MoreFilled/></button>
+       <template #dropdown><ElDropdownMenu>
+        <ElDropdownItem v-if="engine==='agent'&&active" command="steer" :icon="ArrowRight" :disabled="!!steeringItem||queueDispatching">调整当前任务方向</ElDropdownItem>
+        <ElDropdownItem command="edit" :icon="EditPen" :disabled="queueDispatching">编辑消息</ElDropdownItem>
+        <ElDropdownItem command="pause" :icon="VideoPause" :disabled="queueDispatching||queued.paused&&locked">{{queued.paused?'继续排队':'暂停排队'}}</ElDropdownItem>
+       </ElDropdownMenu></template>
+      </ElDropdown>
+     </li></ol>
+    </section>
+    <form class="agent-prompt composer" @submit.prevent="submitDraft">
+     <div v-if="ch.images.length" class="composer-images"><figure v-for="(image,index) in ch.images" :key="index"><img :src="image.dataUrl" :alt="image.name"/><figcaption>{{image.name}}</figcaption><button type="button" :aria-label="'移除图片 '+(index+1)" :disabled="ch.attaching" @click="ch.removeImage(index)">×</button></figure></div>
+     <textarea v-model="draft" aria-label="消息" :disabled="loading||ch.sessionBusy" :maxlength="engine==='chat'?100000:16000" :placeholder="active||ch.sending?'输入下一项任务，发送后排队执行…':hasConversation?'补充要求，继续这段对话…':'询问任何问题，或描述你想完成的工作…'" @paste="pasteImages" @keydown="!$event.isComposing&&$event.key==='Enter'&&!$event.shiftKey&&($event.preventDefault(),submitDraft())"></textarea>
      <footer>
       <div class="agent-prompt-options">
         <label v-if="engine==='agent'" class="agent-mode agent-approval-mode" :title="approvalHint"><select v-model="approvalMode" :disabled="locked" aria-label="任务权限"><option value="ask">请求选择</option><option value="auto">帮我批准</option><option value="full">完全访问</option></select></label>
@@ -333,7 +435,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
         </div>
        </details>
       </div>
-      <button v-if="active||ch.sending" type="button" class="agent-primary stop-button" title="停止" aria-label="停止生成" @click="stop"><VideoPause/></button><button v-else class="agent-primary send-button" title="发送" aria-label="发送消息" :disabled="locked||ch.attaching||(!draft.trim()&&!ch.images.length)||!selectedModel.trim()||(engine==='agent'&&!workspacePath)"><ArrowUp/></button>
+      <button v-if="active||ch.sending" type="button" class="agent-primary stop-button" title="停止" aria-label="停止生成" @click="stop"><VideoPause/></button><button class="agent-primary send-button" :title="active||ch.sending?'加入待执行队列':'发送'" :aria-label="active||ch.sending?'加入待执行队列':'发送消息'" :disabled="!canSubmit"><ArrowUp/></button>
      </footer>
     </form>
    </div>

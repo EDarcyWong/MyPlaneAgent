@@ -13,7 +13,9 @@ const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))
 async function until(check){const deadline=Date.now()+10000;while(!check()){if(Date.now()>deadline)throw new Error('timeout');await sleep(10)}}
 const call=(name,args)=>({id:randomUUID(),type:'function',function:{name,arguments:JSON.stringify(args)}})
 const reply=calls=>({choices:[{finish_reason:calls?.length?'tool_calls':'stop',message:{role:'assistant',content:calls?.length?null:'完成',tool_calls:calls}}],usage:{prompt_tokens:10,completion_tokens:2,total_tokens:12}})
-function fixture(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-reliability-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));return root}
+const fixtureDisposals=new WeakMap()
+function disposeFixture(t,resource){const list=fixtureDisposals.get(t)||[];list.push(()=>resource.dispose());fixtureDisposals.set(t,list)}
+function fixture(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-reliability-'));t.after(async()=>{for(const dispose of fixtureDisposals.get(t)||[])await dispose();fs.rmSync(root,{recursive:true,force:true,maxRetries:5,retryDelay:100})});return root}
 async function harness(t,model,external){const root=fixture(t),workspace=path.join(root,'project');fs.mkdirSync(workspace);let requests=0;const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;try{res.end(JSON.stringify(await model(JSON.parse(raw),requests++)))}catch(e){res.statusCode=500;res.end(String(e))}});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.closeAllConnections();server.close()});const service=new LocalAgentService(path.join(root,'tasks'),()=>({endpoint:`http://127.0.0.1:${server.address().port}`,key:'',maxTokens:1024,contextLength:32768}),external);t.after(()=>service.dispose());const start=extra=>service.start({workspace,mode:'coding',model:'test',prompt:'执行测试',maxSteps:20,...extra},1,()=>{});return {root,workspace,service,start,requests:()=>requests}}
 
 test('registry rejects malformed JSON, extra fields, nested fields and unknown tools without coercion',()=>{
@@ -56,11 +58,12 @@ test('cooperative tool timeouts settle the operation and token budgets stop befo
 })
 test('MCP stdio is discovered but never enabled implicitly; schema changes, disconnect and tool errors fail closed',async t=>{
  const root=fixture(t),log=path.join(root,'calls.jsonl'),manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),text=>Buffer.from(text).toString('base64'),text=>Buffer.from(text,'base64').toString())
- t.after(()=>manager.dispose())
+ disposeFixture(t,manager)
  let config=manager.save({projectId:'project',name:'fixture',transport:'stdio',command:process.execPath,args:[path.resolve('tests/fixtures/agent-mcp-server.mjs')],env:{CALL_LOG:log,SECRET_VALUE:'private-value'},enabledTools:[]})
  assert.ok(!JSON.stringify(manager.list()).includes('private-value'));assert.ok(!fs.readFileSync(path.join(root,'mcp.json'),'utf8').includes('private-value'))
  await manager.connect(config.id);assert.equal(manager.list()[0].tools.length,1);assert.equal(manager.specs('project').length,0);assert.equal(manager.specs('other').length,0)
  config=manager.save({...config,enabledTools:['echo']});let [spec]=manager.specs('project');assert.equal(spec.risk,'high');new ToolRegistry([spec]);assert.match(await spec.execute({text:'hello'},new AbortController().signal),/echo: hello/)
+ const longText='中文日志'.repeat(12000)+'FINAL-ERROR';assert.equal(JSON.parse(await spec.execute({text:longText},new AbortController().signal)).content[0].text,'echo: '+longText)
  await assert.rejects(spec.execute({text:'fail'},new AbortController().signal),error=>error.code==='MCP_TOOL_ERROR')
  await spec.execute({text:'changed'},new AbortController().signal);await sleep(40);assert.equal(manager.specs('project').length,0);await assert.rejects(spec.execute({text:'hello'},new AbortController().signal),/变化/)
  await manager.disconnect(config.id);await manager.connect(config.id);[spec]=manager.specs('project');assert.ok(spec)
@@ -112,13 +115,13 @@ test('MCP Streamable HTTP uses explicit credentials and rejects redirects and ch
   let result=body.method==='initialize'?{protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'http-fixture',version:'1'}}:body.method==='tools/list'?{tools:[tool()]}:body.method==='tools/call'?(executed++,{content:[{type:'text',text:body.params.arguments.text}]}):{}
   res.setHeader('Content-Type','application/json');res.end(JSON.stringify({jsonrpc:'2.0',id:body.id,result}))
  });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.closeAllConnections();server.close()})
- const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>Buffer.from(value).toString('base64'),value=>Buffer.from(value,'base64').toString());t.after(()=>manager.dispose())
+ const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>Buffer.from(value).toString('base64'),value=>Buffer.from(value,'base64').toString());disposeFixture(t,manager)
  let config=manager.save({projectId:'p',name:'http',transport:'http',url:`http://127.0.0.1:${server.address().port}/mcp`,token:'fixture-secret',enabledTools:[]});await manager.connect(config.id);config=manager.save({...config,enabledTools:['echo']});const [spec]=manager.specs('p');assert.match(await spec.execute({text:'ok'},new AbortController().signal),/ok/);assert.equal(executed,1);assert.ok(requests.every(request=>request.auth==='Bearer fixture-secret'));changed=true;await assert.rejects(spec.execute({text:'no'},new AbortController().signal),error=>error.code==='MCP_CHANGED');assert.equal(executed,1)
  const redirect=manager.save({projectId:'p',name:'redirect',transport:'http',url:`http://127.0.0.1:${server.address().port}/redirect`,enabledTools:[]});await assert.rejects(manager.connect(redirect.id),/连接或工具发现失败/)
 })
 test('MCP disconnect terminates its owned server and child process',async t=>{
  const root=fixture(t),pidFile=path.join(root,'child.pid'),fixtureFile=path.join(root,'server.mjs');fs.writeFileSync(fixtureFile,`import {spawn} from 'node:child_process';import fs from 'node:fs';const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));await import(${JSON.stringify(new URL('./fixtures/agent-mcp-server.mjs',import.meta.url).href)});`)
- const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);t.after(()=>manager.dispose());const config=manager.save({projectId:'p',name:'process',transport:'stdio',command:process.execPath,args:[fixtureFile],enabledTools:[]});await manager.connect(config.id);const pid=Number(fs.readFileSync(pidFile,'utf8'));assert.doesNotThrow(()=>process.kill(pid,0));await manager.dispose();await until(()=>{try{process.kill(pid,0);return false}catch{return true}})
+ const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);disposeFixture(t,manager);const config=manager.save({projectId:'p',name:'process',transport:'stdio',command:process.execPath,args:[fixtureFile],enabledTools:[]});await manager.connect(config.id);const pid=Number(fs.readFileSync(pidFile,'utf8'));assert.doesNotThrow(()=>process.kill(pid,0));await manager.dispose();await until(()=>{try{process.kill(pid,0);return false}catch{return true}})
 })
 
 test('malformed model call envelopes are corrected once without executing partial calls',async t=>{
@@ -127,14 +130,14 @@ test('malformed model call envelopes are corrected once without executing partia
 })
 
 test('pinned modern MCP protocol discovers and invokes tools without legacy initialization',async t=>{
- const root=fixture(t),manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);t.after(()=>manager.dispose())
+ const root=fixture(t),manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);disposeFixture(t,manager)
  let config=manager.save({projectId:'p',name:'modern',transport:'stdio',command:process.execPath,args:[path.resolve('tests/fixtures/agent-mcp-server.mjs')],protocol:'modern',enabledTools:[]});await manager.connect(config.id);assert.match(manager.list()[0].identity,/fixture/);config=manager.save({...config,enabledTools:['echo']});assert.match(await manager.specs('p')[0].execute({text:'modern'},new AbortController().signal),/echo: modern/)
 })
 
 test('audit excludes file contents and arbitrary external values; concurrent connects cannot spawn duplicate servers',async t=>{
  const {appendAudit}=await import('../dist-electron/main/agent/registry.js');const root=fixture(t)
  appendAudit(root,{taskId:'fixture',source:'builtin',args:{changes:[{path:'a',before:'PRIVATE-BEFORE',after:'PRIVATE-AFTER'}]}});appendAudit(root,{taskId:'fixture',source:'mcp:test',args:{arbitrary:'PRIVATE-EXTERNAL'}});const log=fs.readFileSync(path.join(root,'audit','fixture.jsonl'),'utf8');assert.ok(!log.includes('PRIVATE-'));assert.match(log,/arbitrary/)
- const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);t.after(()=>manager.dispose());const config=manager.save({projectId:'p',name:'concurrent',transport:'stdio',command:process.execPath,args:[path.resolve('tests/fixtures/agent-mcp-server.mjs')],enabledTools:[]});const results=await Promise.allSettled([manager.connect(config.id),manager.connect(config.id)]);assert.equal(results.filter(result=>result.status==='fulfilled').length,1);assert.equal(results.filter(result=>result.status==='rejected').length,1)
+ const manager=new AgentMcpManager(path.join(root,'mcp.json'),()=>({workspace:root}),value=>value,value=>value);disposeFixture(t,manager);const config=manager.save({projectId:'p',name:'concurrent',transport:'stdio',command:process.execPath,args:[path.resolve('tests/fixtures/agent-mcp-server.mjs')],enabledTools:[]});const results=await Promise.allSettled([manager.connect(config.id),manager.connect(config.id)]);assert.equal(results.filter(result=>result.status==='fulfilled').length,1);assert.equal(results.filter(result=>result.status==='rejected').length,1)
 })
 
 test('MCP JSON Schema 2020-12 tuple constraints are enforced rather than silently ignored',()=>{

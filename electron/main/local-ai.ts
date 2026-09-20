@@ -12,9 +12,11 @@ import type {
   LocalAiModelFile,
   LocalAiDownloadEntry,
   LocalAiChatPayload
+  ,LocalAiRemoteProfile, LocalAiRemoteProfileInput, RemoteApiFormat
 } from '../shared/local-ai.js'
 
 type StoredConfig = {
+  apiFormat: RemoteApiFormat
   endpoint: string
   encryptedApiKey: string
   encryptedHfToken: string
@@ -24,6 +26,11 @@ type StoredConfig = {
 }
 
 type StoredDownload = Omit<LocalAiDownloadEntry, 'id'> & {id?: string}
+type StoredRemoteProfile = LocalAiRemoteProfile & {encryptedApiKey: string}
+
+function apiFormat(value: unknown): RemoteApiFormat {
+  return value === 'anthropic' ? 'anthropic' : 'openai'
+}
 
 function cleanText(value: unknown, name: string, max = 3000) {
   if (typeof value !== 'string') throw new Error(`${name} 无效`)
@@ -125,9 +132,11 @@ function normalizePath(value: string) {
 export class LocalAiService {
   private configFile: string
   private downloadsFile: string
+  private profilesFile: string
   constructor(private directory: string) {
     this.configFile = path.join(directory, 'local-ai-settings.json')
     this.downloadsFile = path.join(directory, 'local-ai-downloads.json')
+    this.profilesFile = path.join(directory, 'local-ai-remote-profiles.json')
   }
 
   private canStoreSecure() {
@@ -148,6 +157,7 @@ export class LocalAiService {
   protected config() {
     const fallbackDirectory = path.join(this.directory, 'local-ai-models')
     const loaded = readIntegrationJson<StoredConfig>(this.configFile, {
+      apiFormat: 'openai',
       endpoint: 'http://127.0.0.1:1234/v1',
       encryptedApiKey: '',
       encryptedHfToken: '',
@@ -160,6 +170,7 @@ export class LocalAiService {
     if (typeof loaded.downloadDirectory !== 'string' || !loaded.downloadDirectory.trim()) loaded.downloadDirectory = fallbackDirectory
     loaded.maxTokens = clampInteger(loaded.maxTokens, 128, LOCAL_AI_MAX_OUTPUT_TOKENS, 2048)
     return {
+      apiFormat: apiFormat(loaded.apiFormat),
       endpoint: cleanEndpoint(loaded.endpoint),
       model: loaded.model.trim(),
       maxTokens: loaded.maxTokens,
@@ -172,6 +183,7 @@ export class LocalAiService {
   settings(): LocalAiSettings {
     const current = this.config()
     return {
+      apiFormat: current.apiFormat,
       endpoint: current.endpoint,
       model: current.model,
       maxTokens: current.maxTokens,
@@ -181,9 +193,82 @@ export class LocalAiService {
     }
   }
 
+  private storedProfiles(): StoredRemoteProfile[] {
+    const rows = readIntegrationJson<StoredRemoteProfile[]>(this.profilesFile, [])
+    return rows.filter(row => row && typeof row.id === 'string' && typeof row.name === 'string' && typeof row.endpoint === 'string' && typeof row.model === 'string' && typeof row.encryptedApiKey === 'string').map(row => ({...row, apiFormat: apiFormat(row.apiFormat), contextLength: clampInteger(row.contextLength, 512, 1_000_000, 4096)}))
+  }
+
+  remoteProfiles(): LocalAiRemoteProfile[] {
+    let rows = this.storedProfiles()
+    // Migrate the existing single remote configuration into the profile list.
+    if (!rows.length) {
+      const current = this.config()
+      rows = [{id: randomUUID(), name: '当前远程服务', apiFormat: current.apiFormat, endpoint: current.endpoint, model: current.model, contextLength: 4096, encryptedApiKey: current.encryptedApiKey, hasApiKey: Boolean(current.encryptedApiKey), updatedAt: new Date().toISOString(), lastUsedAt: new Date().toISOString()}]
+      writeIntegrationJson(this.profilesFile, rows)
+    }
+    return rows.map(({encryptedApiKey, ...profile}) => ({...profile, hasApiKey: Boolean(encryptedApiKey)}))
+  }
+
+  private writeRemoteProfiles(rows: StoredRemoteProfile[]) {
+    writeIntegrationJson(this.profilesFile, rows.map(row => ({...row, hasApiKey: Boolean(row.encryptedApiKey)})))
+  }
+
+  private saveConfig(current: ReturnType<LocalAiService['config']>) {
+    writeIntegrationJson(this.configFile, {
+      apiFormat: current.apiFormat, endpoint: current.endpoint, encryptedApiKey: current.encryptedApiKey, encryptedHfToken: current.encryptedHfToken,
+      model: current.model, maxTokens: current.maxTokens, downloadDirectory: current.downloadDirectory
+    })
+  }
+
+  remoteProfileSave(value: unknown): {settings: LocalAiSettings; profiles: LocalAiRemoteProfile[]} {
+    const payload = object(value) as unknown as LocalAiRemoteProfileInput
+    const name = cleanText(payload.name, '配置名称', 80)
+    const format = apiFormat(payload.apiFormat)
+    const endpoint = cleanEndpoint(payload.endpoint)
+    const model = typeof payload.model === 'string' ? payload.model.trim() : ''
+    let rows = this.storedProfiles()
+    if (!rows.length) this.remoteProfiles(), rows = this.storedProfiles()
+    const existing = payload.id ? rows.find(row => row.id === payload.id) : undefined
+    if (payload.id && !existing) throw new Error('远程配置不存在')
+    let encryptedApiKey = existing?.encryptedApiKey || ''
+    if (payload.clearApiKey === true) encryptedApiKey = ''
+    if (typeof payload.apiKey === 'string') {
+      const key = payload.apiKey.trim()
+      if (!key) encryptedApiKey = ''
+      else { if (!this.canStoreSecure()) throw new Error('当前系统安全存储不可用，无法保存 API Key'); encryptedApiKey = safeStorage.encryptString(key).toString('base64') }
+    }
+    const timestamp = new Date().toISOString()
+    const contextLength = clampInteger(payload.contextLength, 512, 1_000_000, existing?.contextLength || 4096)
+    const row: StoredRemoteProfile = {id: existing?.id || randomUUID(), name, apiFormat: format, endpoint, model, contextLength, encryptedApiKey, hasApiKey: Boolean(encryptedApiKey), updatedAt: timestamp, lastUsedAt: timestamp}
+    rows = existing ? rows.map(item => item.id === row.id ? row : item) : [row, ...rows]
+    this.writeRemoteProfiles(rows)
+    const current = this.config()
+    current.apiFormat = format; current.endpoint = endpoint; current.model = model; current.encryptedApiKey = encryptedApiKey
+    this.saveConfig(current)
+    return {settings: this.settings(), profiles: this.remoteProfiles()}
+  }
+
+  remoteProfileUse(id: string): {settings: LocalAiSettings; profiles: LocalAiRemoteProfile[]} {
+    const rows = this.storedProfiles(), selected = rows.find(row => row.id === id)
+    if (!selected) throw new Error('远程配置不存在')
+    const timestamp = new Date().toISOString()
+    this.writeRemoteProfiles(rows.map(row => row.id === id ? {...row, lastUsedAt: timestamp} : row))
+    const current = this.config(); current.apiFormat = apiFormat(selected.apiFormat); current.endpoint = selected.endpoint; current.model = selected.model; current.encryptedApiKey = selected.encryptedApiKey; this.saveConfig(current)
+    return {settings: this.settings(), profiles: this.remoteProfiles()}
+  }
+
+  remoteProfileDelete(id: string): LocalAiRemoteProfile[] {
+    const rows = this.storedProfiles()
+    if (!rows.some(row => row.id === id)) throw new Error('远程配置不存在')
+    const remaining = rows.filter(row => row.id !== id)
+    this.writeRemoteProfiles(remaining)
+    return remaining.map(({encryptedApiKey, ...profile}) => ({...profile, hasApiKey: Boolean(encryptedApiKey)}))
+  }
+
   saveSettings(value: unknown): LocalAiSettings {
     const payload = object(value)
     const current = this.config()
+    if (payload.apiFormat !== undefined) current.apiFormat = apiFormat(payload.apiFormat)
     if (payload.endpoint !== undefined) {
       const next = cleanEndpoint(payload.endpoint)
       if (next !== current.endpoint) current.encryptedApiKey = ''
@@ -214,14 +299,16 @@ export class LocalAiService {
       if (!directory) throw new Error('下载目录不能为空')
       current.downloadDirectory = directory
     }
-    writeIntegrationJson(this.configFile, {
-      endpoint: current.endpoint,
-      encryptedApiKey: current.encryptedApiKey,
-      encryptedHfToken: current.encryptedHfToken,
-      model: current.model,
-      maxTokens: current.maxTokens,
-      downloadDirectory: current.downloadDirectory
-    })
+    this.saveConfig(current)
+    if (payload.apiFormat !== undefined || payload.endpoint !== undefined || payload.model !== undefined || payload.contextLength !== undefined || payload.apiKey !== undefined || payload.clearApiKey === true) {
+      const rows = this.storedProfiles()
+      if (rows.length) {
+        const timestamp = new Date().toISOString()
+        const active = rows.find(row => row.apiFormat === current.apiFormat && row.endpoint === current.endpoint) || rows[0]
+        const contextLength = clampInteger(payload.contextLength, 512, 1_000_000, active.contextLength)
+        this.writeRemoteProfiles(rows.map(row => row.id === active.id ? {...row, apiFormat: current.apiFormat, endpoint: current.endpoint, model: current.model, contextLength, encryptedApiKey: current.encryptedApiKey, hasApiKey: Boolean(current.encryptedApiKey), updatedAt: timestamp, lastUsedAt: timestamp} : row))
+      }
+    }
     return this.settings()
   }
 

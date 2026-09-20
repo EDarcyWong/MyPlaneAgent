@@ -1,6 +1,6 @@
 import type {ContextCheckpoint,ContextStatus} from './local-ai-context.js'
 import type {TokenUsage,TokenUsageTotals} from './local-ai-usage.js'
-import type {LocalAiSettings,LocalAiSettingsInput,LocalAiSearchResult,LocalAiModelFile,LocalAiDownloadEntry} from './local-ai.js'
+import type {LocalAiSettings,LocalAiSettingsInput,LocalAiSearchResult,LocalAiModelFile,LocalAiDownloadEntry,LocalAiRemoteProfile,LocalAiRemoteProfileInput} from './local-ai.js'
 import type {StudioCatalog,StudioDiscoveryModel} from './local-ai-catalog.js'
 import type {McpCommands} from './local-ai-mcp.js'
 import type {AgentCommands} from './local-ai-agent.js'
@@ -34,7 +34,7 @@ export type StudioRuntime = {
   endpoint:string;pid?:number;error:string;logs:string[];startedAt?:number;host?:string;parallel?:number;contextLength?:number;embedding?:boolean;vision?:boolean
 }
 export type StudioServerModel = {id:string;name:string;loaded?:boolean;instanceId?:string;contextLength?:number}
-export type StudioConnection = {ok:boolean;endpoint:string;latencyMs:number;models:StudioServerModel[];error:string;provider:'lmstudio'|'openai'|'deepseek'}
+export type StudioConnection = {ok:boolean;endpoint:string;latencyMs:number;models:StudioServerModel[];error:string;provider:'lmstudio'|'openai'|'deepseek'|'anthropic'}
 export type StudioImage = {name:string;dataUrl:string}
 export type StudioMessage = {usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
 export type StudioSession = {projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
@@ -47,6 +47,10 @@ export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:S
 export type StudioCommands = {
   bootstrap:{input:undefined;output:StudioBootstrap}
   settings:{input:StudioSettingsInput;output:StudioSettings}
+  remoteProfiles:{input:undefined;output:LocalAiRemoteProfile[]}
+  remoteProfileSave:{input:LocalAiRemoteProfileInput;output:{settings:StudioSettings;profiles:LocalAiRemoteProfile[]}}
+  remoteProfileUse:{input:{id:string};output:{settings:StudioSettings;profiles:LocalAiRemoteProfile[]}}
+  remoteProfileDelete:{input:{id:string};output:LocalAiRemoteProfile[]}
   snapshot:{input:undefined;output:StudioSnapshot}
   connect:{input:undefined;output:StudioConnection}
   search:{input:{query:string;format:'gguf'|'all';sort:'downloads'|'likes'|'lastModified'};output:LocalAiSearchResult[]}

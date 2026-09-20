@@ -2,7 +2,10 @@
 // bounded by their effective context window in inferenceBudget().
 export const LOCAL_AI_MAX_OUTPUT_TOKENS = 393216
 
+export type RemoteApiFormat = 'openai' | 'anthropic'
+
 export type LocalAiSettings = {
+  apiFormat: RemoteApiFormat
   endpoint: string
   model: string
   maxTokens: number
@@ -12,6 +15,7 @@ export type LocalAiSettings = {
 }
 
 export type LocalAiSettingsInput = {
+  apiFormat?: RemoteApiFormat
   endpoint?: string
   model?: string
   maxTokens?: number
@@ -19,6 +23,29 @@ export type LocalAiSettingsInput = {
   clearApiKey?: boolean
   hfToken?: string
   clearHfToken?: boolean
+}
+
+export type LocalAiRemoteProfile = {
+  id: string
+  name: string
+  apiFormat: RemoteApiFormat
+  endpoint: string
+  model: string
+  contextLength: number
+  hasApiKey: boolean
+  updatedAt: string
+  lastUsedAt?: string
+}
+
+export type LocalAiRemoteProfileInput = {
+  id?: string
+  name: string
+  apiFormat: RemoteApiFormat
+  endpoint: string
+  model?: string
+  contextLength?: number
+  apiKey?: string
+  clearApiKey?: boolean
 }
 
 export type LocalAiSearchResult = {

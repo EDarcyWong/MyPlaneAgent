@@ -11,6 +11,7 @@ import {LocalAiService} from './local-ai.js'
 import {LocalAiDownloads} from './local-ai-downloads.js'
 import {LocalAiRuntime} from './local-ai-runtime.js'
 import {LocalAiModelIcons} from './local-ai-model-icons.js'
+import {scanModelDirectory,mergeScannedModels} from './local-ai-model-library.js'
 import {LocalAiInstaller} from './local-ai-installer.js'
 import {LocalAiDeveloper} from './local-ai-developer.js'
 import {LocalAiGateway} from './local-ai-gateway.js'
@@ -94,7 +95,7 @@ export class LocalAiStudioService extends LocalAiService {
   if(value.endpoint!==undefined)endpoint(required(value.endpoint,'服务地址',1000))
   if(value.downloadDirectory!==undefined&&!path.isAbsolute(value.downloadDirectory))throw new Error('模型目录必须是绝对路径')
   const runtime=this.runtime.snapshot()
-  if(this.gateway?.active&&(value.runtimePort!==undefined&&value.runtimePort!==previous.runtimePort||value.source!==undefined&&value.source!==previous.source))throw new Error('请先停止 API 服务再修改端口或运行方式')
+  if(this.gateway?.active&&value.runtimePort!==undefined&&value.runtimePort!==previous.runtimePort)throw new Error('请先停止 API 服务再修改端口')
   if(['starting','running','stopping'].includes(runtime.state)&&(value.runtimePort!==undefined&&value.runtimePort!==previous.runtimePort||value.runtimePath!==undefined&&value.runtimePath!==previous.runtimePath))throw new Error('请先卸载模型再修改运行文件或端口')
   super.saveSettings(value)
   const keys=['source','runtimePath','runtimePort','contextLength','gpuLayers','threads','temperature','topP','repeatPenalty','systemPrompt','theme'] as const
@@ -104,20 +105,21 @@ export class LocalAiStudioService extends LocalAiService {
  }
  snapshot(){return {downloads:this.downloads.list(),runtime:this.runtimeSnapshot(),hardware:{platform:os.platform(),arch:os.arch(),cpu:os.cpus()[0]?.model||'CPU',threads:os.cpus().length,totalMemory:os.totalmem(),freeMemory:os.freemem()}}}
  bootstrap():StudioBootstrap{return {chatImagesSupported:true,...this.snapshot(),settings:this.studioSettings(),models:this.models(),sessions:this.sessions()}}
- private service(){const settings=this.studioSettings();if(settings.source==='managed'){return {endpoint:this.gateway.endpoint||`http://127.0.0.1:${settings.runtimePort}/v1`,key:this.gateway.apiKey}}const config=this.config();return {endpoint:endpoint(config.endpoint),key:config.encryptedApiKey?this.decrypt(config.encryptedApiKey):''}}
- private async request(url:string,body?:unknown,timeout=15_000){const service=this.service();return jsonResponse(await fetch(url,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(service.key?{Authorization:`Bearer ${service.key}`}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(timeout)}))}
+ private service(){const settings=this.studioSettings();if(settings.source==='managed'){return {apiFormat:'openai' as const,endpoint:this.gateway.endpoint||`http://127.0.0.1:${settings.runtimePort}/v1`,key:this.gateway.apiKey}}const config=this.config();return {apiFormat:config.apiFormat,endpoint:endpoint(config.endpoint),key:config.encryptedApiKey?this.decrypt(config.encryptedApiKey):''}}
+ private async request(url:string,body?:unknown,timeout=15_000){const service=this.service();return jsonResponse(await fetch(url,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(service.apiFormat==='anthropic'?{'anthropic-version':'2023-06-01',...(service.key?{'x-api-key':service.key}:{})}:service.key?{Authorization:`Bearer ${service.key}`}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(timeout)}))}
  async connect():Promise<StudioConnection>{
   const service=this.service(),start=Date.now()
   try{
-   if(isDeepSeek(service.endpoint)&&!service.key)throw new Error('请先填写并保存 DeepSeek API Key')
+   if(service.apiFormat==='anthropic'&&!service.key)throw new Error('请先填写并保存 Anthropic API Key')
+   if(service.apiFormat==='openai'&&isDeepSeek(service.endpoint)&&!service.key)throw new Error('请先填写并保存 DeepSeek API Key')
    const data=record(await this.request(`${service.endpoint}/models`,undefined,7000))
-   if(!Array.isArray(data.data))throw new Error('服务未返回有效的 OpenAI 模型列表')
-   let models=data.data.map(item=>record(item)).filter(item=>typeof item.id==='string').map(item=>({id:String(item.id),name:String(item.id),loaded:undefined as boolean|undefined,instanceId:undefined as string|undefined,contextLength:undefined as number|undefined})),provider:StudioConnection['provider']=isDeepSeek(service.endpoint)?'deepseek':'openai'
-   if(this.studioSettings().source==='external'&&!isDeepSeek(service.endpoint)){
+   if(!Array.isArray(data.data))throw new Error(`服务未返回有效的 ${service.apiFormat==='anthropic'?'Anthropic':'OpenAI'} 模型列表`)
+   let models=data.data.map(item=>record(item)).filter(item=>typeof item.id==='string').map(item=>({id:String(item.id),name:String(item.display_name||item.id),loaded:undefined as boolean|undefined,instanceId:undefined as string|undefined,contextLength:undefined as number|undefined})),provider:StudioConnection['provider']=service.apiFormat==='anthropic'?'anthropic':isDeepSeek(service.endpoint)?'deepseek':'openai'
+   if(service.apiFormat==='openai'&&this.studioSettings().source==='external'&&!isDeepSeek(service.endpoint)){
     try{const native=record(await this.request(`${service.endpoint.replace(/\/v1$/,'')}/api/v1/models`,undefined,2500));if(Array.isArray(native.models)){provider='lmstudio';models=native.models.map(record).filter(item=>item.type==='llm').map(item=>{const instances=Array.isArray(item.loaded_instances)?item.loaded_instances.map(record):[];const first=instances[0];return {id:textValue(item.key)||textValue(item.id),name:textValue(item.display_name)||textValue(item.key),loaded:instances.length>0,instanceId:first?textValue(first.id):undefined,contextLength:Number(record(first?.config).context_length)||undefined}}).filter(item=>item.id)}}catch{}
    }
    return {ok:true,endpoint:service.endpoint,latencyMs:Date.now()-start,models,provider,error:''}
-  }catch(error){return {ok:false,endpoint:service.endpoint,latencyMs:Date.now()-start,models:[],provider:'openai',error:String(error)}}
+  }catch(error){return {ok:false,endpoint:service.endpoint,latencyMs:Date.now()-start,models:[],provider:service.apiFormat==='anthropic'?'anthropic':'openai',error:String(error)}}
  }
  private discoveryModel(value:unknown):StudioDiscoveryModel{
   const item=record(value),card=record(item.cardData),config=record(item.config),gguf=record(item.gguf),id=textValue(item.id)||textValue(item.modelId)
@@ -184,6 +186,13 @@ export class LocalAiStudioService extends LocalAiService {
   return this.downloads.enqueue(repo,selected)
  }
  models():StudioLocalModel[]{return this.readDownloads().map(entry=>({...entry,...formatModel(entry.file),exists:existsSync(entry.localPath)&&statSync(entry.localPath).isFile()}))}
+ async refreshModels():Promise<StudioLocalModel[]>{
+  const directory=this.studioSettings().downloadDirectory,found=await scanModelDirectory(directory)
+  // Settings or downloads may change while the asynchronous traversal is running.
+  if(this.studioSettings().downloadDirectory!==directory)return this.refreshModels()
+  this.saveDownloads(mergeScannedModels(this.readDownloads(),found))
+  return this.models()
+ }
  importFiles(files:string[]){
   const entries=this.readDownloads()
   for(const file of files){const localPath=realpathSync(file),info=statSync(localPath);if(!info.isFile()||!localPath.toLowerCase().endsWith('.gguf'))throw new Error('请选择 GGUF 模型文件');if(entries.some(entry=>entry.localPath===localPath))continue;entries.push({id:stableId(localPath),repoId:'本地导入',file:path.basename(localPath),localPath,size:info.size,downloadedAt:new Date().toISOString(),...{imported:true}})}
@@ -208,7 +217,7 @@ export class LocalAiStudioService extends LocalAiService {
    const state=this.runtime.snapshot();if(state.pid||['starting','running','stopping'].includes(state.state))throw new Error('请先卸载当前模型，再加载其他模型')
    let runtimePath=this.studioSettings().runtimePath
    if(!this.installer.valid(runtimePath))runtimePath=this.installer.detect(runtimePath)[0]?.path||''
-   if(!runtimePath)throw new Error('未找到 llama-server。请打开开发者 > 运行时，安装官方运行包，或手动选择解压后的 llama-server（Windows 为 llama-server.exe）')
+   if(!runtimePath)throw new Error('未找到 llama-server。请打开“模型服务 > 本地服务 > 运行时”，安装官方运行包，或手动选择解压后的 llama-server（Windows 为 llama-server.exe）')
    this.saveStudioSettings({source:'managed',runtimePath})
    const settings=this.studioSettings(),preferences=this.developer.preferences()
    if(options.context_length!==undefined){const total=options.context_length*preferences.parallel;if(!Number.isInteger(total)||total<512||total>131072)throw new Error('上下文长度乘以并发槽数不能超过 131072');settings.contextLength=total}
@@ -257,7 +266,7 @@ export class LocalAiStudioService extends LocalAiService {
  private chatHistory(session:StudioSession):ContextMessage[]{return session.messages.map(item=>({role:item.role,content:chatMessageContent(item)}))}
  private chatSystem(session:StudioSession):ContextMessage[]{return session.systemPrompt?[{role:'system',content:session.systemPrompt}]:[]}
  private chatContextStatus(session:StudioSession,settings=this.inferenceSettings()){return contextStatus(this.chatHistory(session),this.chatSystem(session),session.checkpoint,settings)}
- private async prepareChatContext(session:StudioSession,service:{endpoint:string;key:string},settings:StudioSettings,signal:AbortSignal,emit:(event:StudioEvent)=>void,requestId:string,force=false,aggressive=false){
+ private async prepareChatContext(session:StudioSession,service:{apiFormat:'openai'|'anthropic';endpoint:string;key:string},settings:StudioSettings,signal:AbortSignal,emit:(event:StudioEvent)=>void,requestId:string,force=false,aggressive=false){
   const history=this.chatHistory(session),system=this.chatSystem(session),before=this.chatContextStatus(session,settings)
   session.context=before
   const publish=()=>emit({type:'context',requestId,context:session.context!,sessionUsage:session.usage})
@@ -278,7 +287,7 @@ export class LocalAiStudioService extends LocalAiService {
   assertContextFits(session.context);publish()
   return contextMessages(history,system,session.checkpoint)
  }
- private async generate(session:StudioSession,service:{endpoint:string;key:string},settings:StudioSettings,signal:AbortSignal,emit:(event:StudioEvent)=>void,requestId:string,compactOnly=false){
+ private async generate(session:StudioSession,service:{apiFormat:'openai'|'anthropic';endpoint:string;key:string},settings:StudioSettings,signal:AbortSignal,emit:(event:StudioEvent)=>void,requestId:string,compactOnly=false){
   const started=Date.now(),answer:StudioMessage={id:randomUUID(),role:'assistant',content:'',reasoning:'',createdAt:new Date().toISOString(),model:session.model,status:'complete'};let error='';let lastSave=Date.now()
   const responseCharacterLimit=Math.min(8*1024*1024,Math.max(500000,settings.maxTokens*8))
   session.usage??=emptyTokenUsageTotals()
@@ -287,6 +296,14 @@ export class LocalAiStudioService extends LocalAiService {
    this.saveSession(session)
    let messages=await this.prepareChatContext(session,service,settings,signal,emit,requestId,compactOnly)
    if(compactOnly)return
+   if(service.apiFormat==='anthropic'){
+    let previous:TokenUsage|undefined
+    const request=()=>{session.usage!.requests++;return requestAgentModel({...service,contextLength:settings.contextLength,maxTokens:settings.maxTokens},session.model,messages as AgentMessage[],signal,{tools:false,onContent:content=>{answer.content+=content;if(answer.content.length+(answer.reasoning?.length||0)>responseCharacterLimit)throw new Error('输出已达到应用单轮容量');emit({type:'delta',requestId,content,reasoning:''});if(Date.now()-lastSave>2000){lastSave=Date.now();this.saveSession(session)}},onReasoning:reasoning=>{answer.reasoning=(answer.reasoning||'')+reasoning;if(answer.content.length+(answer.reasoning?.length||0)>responseCharacterLimit)throw new Error('输出已达到应用单轮容量');emit({type:'delta',requestId,content:'',reasoning})},onUsage:usage=>{updateTokenUsageTotals(session.usage!,previous,usage);previous=usage;answer.usage=usage;answer.tokens=usage.outputTokens;emit({type:'delta',requestId,content:'',reasoning:'',usage,sessionUsage:session.usage})}})}
+    try{await request()}catch(cause){if(signal.aborted||!isContextOverflow(cause))throw cause;const checkpoint=session.checkpoint;messages=await this.prepareChatContext(session,service,settings,signal,emit,requestId,true,true);if(checkpoint===session.checkpoint)throw cause;previous=undefined;await request()}
+    if(!answer.content&&!answer.reasoning)throw new Error('模型没有返回内容')
+    session.messages.push(answer)
+    return
+   }
    const request=async()=>{session.usage!.requests++;const response=await fetch(`${service.endpoint}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(service.key?{Authorization:`Bearer ${service.key}`}:{})},body:JSON.stringify({model:session.model,messages,stream:true,stream_options:{include_usage:true},max_tokens:settings.maxTokens,temperature:settings.temperature,top_p:settings.topP,...(isDeepSeek(service.endpoint)?deepseekThinking(service.endpoint):{repeat_penalty:settings.repeatPenalty})}),signal:AbortSignal.any([signal,AbortSignal.timeout(30*60*1000)])})
    if(!response.ok)await jsonResponse(response);return response}
    let response:Response
@@ -334,6 +351,13 @@ export class LocalAiStudioService extends LocalAiService {
     if(value.policy==='project-auto'){const result=await dialog.showMessageBox(owner,{type:'warning',title:'项目自动修改',message:'允许在选定范围内自动修改普通文本文件？',detail:'范围：'+JSON.stringify(value.autoWritePaths)+'。命令、测试脚本、敏感配置和 MCP 工具仍逐次确认。',buttons:['取消','允许'],defaultId:0,cancelId:0});if(result.response!==1)throw new Error('已取消权限变更')}
     return this.agent.updateProject(value as Parameters<LocalAgentService['updateProject']>[0])
    }
+   case 'agentResolveExecution':{
+    const id=required(value.id,'任务 ID'),eventId=required(value.eventId,'步骤 ID'),task=this.agent.get(id),operation=task.events.find(item=>item.id===eventId)
+    if(operation?.execution?.state!=='unknown'||!['completed','not-applied'].includes(String(value.outcome)))throw new Error('核对步骤或结果无效')
+    const result=await dialog.showMessageBox(owner,{type:'warning',title:'核对中断操作',message:value.outcome==='completed'?'确认此操作已经执行完成？':'确认此操作尚未执行？',detail:`工具：${operation.tool}。${JSON.stringify(operation.args)}。此确认只记录你核对的结果，不会重新执行操作。`,buttons:['取消','确认核对结果'],defaultId:0,cancelId:0})
+    if(result.response!==1)return task
+    return this.agent.resolveExecution(id,eventId,value.outcome as 'completed'|'not-applied',required(value.note,'核对说明',1000))
+   }
    case 'agentRestore':{
     const id=required(value.id,'任务 ID'),eventId=required(value.eventId,'修改 ID'),task=this.agent.get(id),change=task.events.find(event=>event.id===eventId)
     if(!change?.preview)throw new Error('修改记录不存在')
@@ -365,6 +389,11 @@ export class LocalAiStudioService extends LocalAiService {
     if(found.version.risk!=='read'){const answer=await dialog.showMessageBox(owner,{type:'warning',title:'测试 Python 工具',message:`运行 ${found.tool.key} v${found.version.version}？`,detail:'Python 工具以当前用户权限运行，可能修改文件、启动程序或访问网络。',buttons:['取消','运行'],defaultId:0,cancelId:0});if(answer.response!==1)throw new Error('已取消工具测试')}
     return this.pythonTools.execute({tool:found.tool.key,args,workspace:project.workspace,code:found.version.python},new AbortController().signal,found.version.timeoutMs)
    }
+   case 'agentSteer':{
+    const images=chatImages(value.images)
+    if(this.studioSettings().source==='managed'&&!this.runtime.snapshot().vision&&images.length)throw new Error('当前模型未加载视觉组件，无法接收图片')
+    return this.agent.steer(required(value.id,'任务 ID'),required(value.messageId,'消息 ID'),images.length?textValue(value.prompt,16000):required(value.prompt,'调整要求',16000),images,event.sender.id)
+   }
    case 'agentStart':{
     const grant=this.agentWorkspaces.get(textValue(value.workspaceToken)),taskId=textValue(value.taskId),projectId=textValue(value.projectId)
     if(!taskId&&!projectId&&(!grant||grant.owner!==event.sender.id))throw new Error('请通过选择目录按钮授权 Agent 工作目录')
@@ -395,6 +424,10 @@ export class LocalAiStudioService extends LocalAiService {
    }
    case 'bootstrap':return this.bootstrap()
    case 'settings':return this.saveStudioSettings(input)
+   case 'remoteProfiles':return this.remoteProfiles()
+   case 'remoteProfileSave':{const result=this.remoteProfileSave(input),profile=(value.id?result.profiles.find(item=>item.id===value.id):result.profiles.find(item=>item.apiFormat===result.settings.apiFormat&&item.endpoint===result.settings.endpoint&&item.model===result.settings.model));this.saveStudioSettings({apiFormat:result.settings.apiFormat,endpoint:result.settings.endpoint,model:result.settings.model,...(profile?{contextLength:profile.contextLength}:{})});return {settings:this.studioSettings(),profiles:result.profiles}}
+   case 'remoteProfileUse':{const id=required(value.id,'配置 ID'),result=this.remoteProfileUse(id),profile=result.profiles.find(item=>item.id===id);this.saveStudioSettings({apiFormat:result.settings.apiFormat,endpoint:result.settings.endpoint,model:result.settings.model,...(profile?{contextLength:profile.contextLength}:{})});return {settings:this.studioSettings(),profiles:result.profiles}}
+   case 'remoteProfileDelete':return this.remoteProfileDelete(required(value.id,'配置 ID'))
    case 'snapshot':return this.snapshot()
    case 'connect':return this.connect()
    case 'search':return this.search(input)
@@ -405,7 +438,7 @@ export class LocalAiStudioService extends LocalAiService {
    case 'files':return this.files(required(value.repoId,'模型仓库'))
    case 'enqueue':return this.enqueue(input)
    case 'downloadAction':return this.downloads.action(required(value.id,'下载 ID'),required(value.action,'操作'))
-   case 'models':return this.models()
+   case 'models':return this.refreshModels()
    case 'importModels':{const pick=await dialog.showOpenDialog(owner,{title:'导入 GGUF 模型（保留原文件位置）',properties:['openFile','multiSelections'],filters:[{name:'GGUF 模型',extensions:['gguf']}]});return pick.canceled?this.models():this.importFiles(pick.filePaths)}
    case 'removeModel':return this.removeModel(input)
    case 'revealModel':return this.revealModel(required(value.id,'模型 ID'))
@@ -421,7 +454,7 @@ export class LocalAiStudioService extends LocalAiService {
    case 'developerRequest':return this.developer.request(input,this.service(),event.sender)
    case 'developerCancelRequest':return this.developer.cancel(event.sender.id)
    case 'developerClearLogs':this.runtime.clearLogs();this.developer.clearLogs();this.gateway.clearLogs();return
-   case 'developerExportLogs':{const pick=await dialog.showSaveDialog(owner,{title:'导出开发者日志（不包含 API Key）',defaultPath:'myplane-local-ai.log',filters:[{name:'Log',extensions:['log','txt']}]});if(pick.canceled||!pick.filePath)return false;writeFileSync(pick.filePath,[...this.runtime.snapshot().logs,...this.developer.requestLogs(),...this.gateway.requestLogs()].join('\n'),'utf8');return true}
+   case 'developerExportLogs':{const pick=await dialog.showSaveDialog(owner,{title:'导出本地服务日志（不包含 API Key）',defaultPath:'myplane-local-ai.log',filters:[{name:'Log',extensions:['log','txt']}]});if(pick.canceled||!pick.filePath)return false;writeFileSync(pick.filePath,[...this.runtime.snapshot().logs,...this.developer.requestLogs(),...this.gateway.requestLogs()].join('\n'),'utf8');return true}
    case 'startApiServer':return this.startApiServer()
    case 'unloadRuntime':await this.gateway.unload();return this.runtimeSnapshot()
    case 'startRuntime':return this.startRuntime(required(value.id,'模型 ID'))

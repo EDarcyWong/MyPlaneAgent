@@ -1,12 +1,13 @@
+import type {PreparedAction} from './workspace.js'
 import {Ajv,type ValidateFunction} from 'ajv'
 import {Ajv2020} from 'ajv/dist/2020.js'
 import {Ajv2019} from 'ajv/dist/2019.js'
 import {createHash} from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import {agentTools,readTools} from './tools.js'
+import {agentTools,agentContextTools,readTools} from './tools.js'
 export type ToolDefinition={type:'function';function:{name:string;description:string;parameters:Record<string,unknown>}}
-export type ToolSpec={revision?:string;destination?:string;definition:ToolDefinition;source:string;risk:'read'|'write'|'high';timeoutMs:number;execute?:(args:Record<string,unknown>,signal:AbortSignal,context?:Record<string,unknown>)=>Promise<string>}
+export type ToolSpec={prepare?:(args:Record<string,unknown>,signal:AbortSignal,context:Record<string,unknown>)=>Promise<PreparedAction>;revision?:string;destination?:string;definition:ToolDefinition;source:string;risk:'read'|'write'|'high';timeoutMs:number;execute?:(args:Record<string,unknown>,signal:AbortSignal,context?:Record<string,unknown>)=>Promise<string>}
 export class ToolError extends Error {
  constructor(public code:string,message:string,public details?:unknown){super(message);this.name='ToolError'}
 }
@@ -27,7 +28,7 @@ export class ToolRegistry {
   return args as Record<string,unknown>
  }
 }
-export const builtinSpecs=():ToolSpec[]=>(agentTools as ToolDefinition[]).map(definition=>({definition,source:'builtin',risk:readTools.has(definition.function.name)||['set_plan','read_history'].includes(definition.function.name)?'read':['run_command','run_test','run_test_case','get_diagnostics','http_request'].includes(definition.function.name)?'high':'write',timeoutMs:['read_document','create_document','create_spreadsheet','image_ocr','archive_inspect'].includes(definition.function.name)?120000:['run_test_case','get_diagnostics'].includes(definition.function.name)?300000:30000}))
+export const builtinSpecs=():ToolSpec[]=>([...agentTools,...agentContextTools] as ToolDefinition[]).map(definition=>({definition,source:'builtin',risk:readTools.has(definition.function.name)||['set_plan','read_history','read_tool_result','inspect_build','reconcile_execution'].includes(definition.function.name)?'read':['build_project','run_command','run_test','run_test_case','get_diagnostics','http_request'].includes(definition.function.name)?'high':'write',timeoutMs:['read_document','create_document','create_spreadsheet','image_ocr','archive_inspect'].includes(definition.function.name)?120000:['run_test_case','get_diagnostics'].includes(definition.function.name)?300000:30000}))
 export function canonical(value:unknown):string{if(Array.isArray(value))return '['+value.map(canonical).join(',')+']';if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+canonical((value as Record<string,unknown>)[key])).join(',')+'}';return JSON.stringify(value)??'null'}
 export const fingerprint=(value:unknown)=>createHash('sha256').update(canonical(value)).digest('hex')
 export function redact(value:unknown):unknown{

@@ -24,7 +24,7 @@ let server,window,service
 const errors=[]
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms))
 async function waitFor(check,label){const deadline=Date.now()+20000;while(!await check()){if(Date.now()>deadline)throw new Error(`Timed out: ${label}`);await delay(70)}}
-const js=source=>window.webContents.executeJavaScript(source,true)
+const js=async source=>{try{return await window.webContents.executeJavaScript(source,true)}catch(error){throw new Error(`Renderer script failed: ${source}\n${error}`)}}
 const click=label=>js(`document.querySelector('button[aria-label=${JSON.stringify(label)}]').click()`)
 async function uiText(value){await waitFor(()=>js(`document.body.innerText.includes(${JSON.stringify(value)})`),value)}
 async function main(){try{
@@ -38,7 +38,7 @@ async function main(){try{
   const stop=payload.messages.at(-1).content.includes('STOP'),chunks=stop?Array(100).fill('继续 '):['## 本地回复\n','你好，流式聊天工作正常。\n','```js\nconsole.log("local");\n```']
   let index=0;const timer=setInterval(()=>{if(index<chunks.length){res.write(`data: ${JSON.stringify({choices:[{delta:{content:chunks[index++]}}]})}\r\n\r\n`)}else{clearInterval(timer);res.end(`data: ${JSON.stringify({usage:{prompt_tokens:100,completion_tokens:24,total_tokens:124},choices:[]})}\n\ndata: [DONE]\n\n`)}},stop?150:50);res.once('close',()=>clearInterval(timer))
  });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
- service=new LocalAiStudioService(path.join(root,'data'));service.saveStudioSettings({endpoint:`http://127.0.0.1:${server.address().port}/v1`,model:'smoke-model',theme:'light'})
+ service=new LocalAiStudioService(path.join(root,'data'));service.saveStudioSettings({endpoint:`http://127.0.0.1:${server.address().port}/v1`,model:'previous-model',theme:'light'});service.newSession();service.saveStudioSettings({model:'smoke-model'})
  registerLocalAiStudio(()=>service,()=>service.dispose());ipcMain.handle('ai:open-link',()=>{})
  window=new BrowserWindow({width:1380,height:900,show:false,webPreferences:{preload:path.join(project,'dist-electron/preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:false,backgroundThrottling:false}})
  window.webContents.on('console-message',(_event,level,message)=>{if(level>=3)errors.push(message)})
@@ -46,21 +46,22 @@ async function main(){try{
  trackAuthWindow(window.webContents,true,'http://127.0.0.1:5174')
  await window.loadURL('http://127.0.0.1:5174/tests/fixtures/local-ai-studio.html')
  await waitFor(()=>js("!!document.querySelector('.rail-button[aria-label=工作台]')"),'chat navigation');await click('工作台');await uiText('有什么可以帮你？');await uiText('已连接')
- assert.equal(await js("document.querySelectorAll('.rail-button').length"),6)
+ assert.equal(await js("document.querySelectorAll('.rail-button').length"),7)
  assert.equal(await js("[...document.querySelectorAll('.rail-button>span')].every(label=>label.getBoundingClientRect().height<18)"),true,'navigation labels stay on one line')
  assert.ok(await js("Math.abs(document.querySelector('.local-ai-studio').getBoundingClientRect().width-innerWidth)<2"),'studio fills its flex host')
  assert.equal(await js("document.querySelectorAll('.composer').length"),1)
+ await waitFor(()=>js("!!document.querySelector('input[aria-label=\"会话模型\"]')"),'conversation model control');assert.equal(await js("document.querySelector('input[aria-label=\"会话模型\"]').value"),'smoke-model','active remote model overrides the restored session model')
  await js("document.querySelector('textarea[aria-label=消息]').value='请介绍本地模型';document.querySelector('textarea[aria-label=消息]').dispatchEvent(new Event('input',{bubbles:true}))")
  await js("document.querySelector('.composer').requestSubmit()")
  await uiText('流式聊天工作正常');await waitFor(()=>js("!document.querySelector('.stop-button')"),'stream completion')
  assert.equal(await js("document.querySelectorAll('.code-block').length"),1)
  let current=service.session(service.sessions()[0].id);assert.equal(current.messages.length,2);assert.equal(current.messages[1].tokens,24);assert.equal(current.usage.totalTokens,124);assert.equal(current.messages[1].usage.inputTokens,100)
- assert.match(await js("document.querySelector('.agent-composer-hint .token-usage').innerText"),/124/)
+ assert.match(await js("document.querySelector('.agent-token-usage').innerText"),/124/)
  await js("[...document.querySelectorAll('.message-actions button')].find(button=>button.textContent.includes('重新生成')).click()")
  await waitFor(()=>service.session(current.id).usage.requests===2&&service.session(current.id).usage.totalTokens===248,'regeneration usage');await waitFor(()=>js("!document.querySelector('.stop-button')"),'regeneration finished')
  current=service.session(current.id);assert.equal(current.messages.length,2);assert.equal(current.usage.totalTokens,248)
  await window.reload();await waitFor(()=>js("!!document.querySelector('.rail-button[aria-label=工作台]')"),'reloaded navigation');await click('工作台');await uiText('流式聊天工作正常')
- assert.match(await js("document.querySelector('.agent-composer-hint .token-usage').innerText"),/248/)
+ assert.match(await js("document.querySelector('.agent-token-usage').innerText"),/248/)
  await js("document.querySelector('textarea[aria-label=消息]').value='STOP';document.querySelector('textarea[aria-label=消息]').dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('.composer').requestSubmit()")
  await uiText('继续');await js("document.querySelector('.stop-button').click()");await uiText('已停止生成')
  current=service.session(service.sessions()[0].id);assert.equal(current.messages.at(-1).status,'stopped');assert.equal(current.usage.requests,3);assert.equal(current.usage.totalTokens,248);assert.equal(current.usage.totalReports,2)
@@ -68,7 +69,7 @@ async function main(){try{
  await waitFor(()=>js("!!document.querySelector('.catalog-model-title strong[title=\"test/Small-GGUF\"]')"),'model result');await js("document.querySelector('.catalog-model-title strong[title=\"test/Small-GGUF\"]').closest('button').click()");await uiText('tiny-Q4_K_M.gguf');await js("document.querySelector('.download-file').click()")
  await uiText('SHA-256 已校验');assert.equal(service.models().length,1);assert.deepEqual(fs.readFileSync(service.models()[0].localPath),modelData)
  await click('关闭下载队列');await click('我的模型');await uiText('tiny-Q4_K_M.gguf')
- await click('开发者');await waitFor(()=>js("!!document.querySelector('.developer-workspace')"),'developer workspace');await click('设置');await uiText('本机推理运行时')
+ await click('模型服务');await waitFor(()=>js("!!document.querySelector('.service-workspace')"),'model service workspace');await click('设置');await uiText('应用设置')
  await click('工作台');await click('新建会话');await uiText('有什么可以帮你？')
  await waitFor(()=>js("!document.querySelector('.el-message')"),'transient notifications dismissed')
  await delay(450)
@@ -76,9 +77,9 @@ async function main(){try{
  const screenshot=process.env.LOCAL_AI_SCREENSHOT||path.join(os.tmpdir(),'myplane-local-ai-preview.png');fs.writeFileSync(screenshot,(await window.webContents.capturePage()).toPNG())
  for(const [width,height] of [[520,640],[760,640],[1024,768],[1440,900]]){
   window.setContentSize(width,height);await delay(150)
-  for(const label of ['发现模型','我的模型','开发者','设置','工作台']){
+  for(const label of ['发现模型','我的模型','模型服务','设置','工作台']){
    await click(label);await delay(70)
-   const bounds=await js(`(()=>{const root=document.querySelector('.local-ai-studio').getBoundingClientRect();const page=[...document.querySelectorAll('.unified-workspace,.discover-workspace,.scroll-page,.developer-workspace')].find(el=>el.getBoundingClientRect().width>0);const box=page.getBoundingClientRect();return {root:Math.abs(root.width-innerWidth)<2,page:box.left>=root.left&&box.right<=root.right+1,overflow:document.documentElement.scrollWidth<=innerWidth}})()`)
+   const bounds=await js(`(()=>{const root=document.querySelector('.local-ai-studio').getBoundingClientRect();const page=[...document.querySelectorAll('.unified-workspace,.discover-workspace,.scroll-page,.service-workspace')].find(el=>el.getBoundingClientRect().width>0);const box=page.getBoundingClientRect();return {root:Math.abs(root.width-innerWidth)<2,page:box.left>=root.left&&box.right<=root.right+1,overflow:document.documentElement.scrollWidth<=innerWidth}})()`)
    assert.deepEqual(bounds,{root:true,page:true,overflow:true},`${label} fits ${width}x${height}`)
   }
   if(width<850){

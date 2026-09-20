@@ -4,11 +4,12 @@ import {record,sseData} from '../local-ai-utils.js'
 import type {AgentModelProgress} from '../../shared/local-ai-agent.js'
 import type {ToolDefinition} from './registry.js'
 import {ModelOutputLimitError} from '../local-ai-model-error.js'
+import type {RemoteApiFormat} from '../../shared/local-ai.js'
 export {ModelOutputLimitError} from '../local-ai-model-error.js'
 export type ToolCall={id:string;type:'function';function:{name:string;arguments:string}}
 export type AgentMessage={role:'system'|'user'|'assistant'|'tool';content:string|null|({type:'text';text:string}|{type:'image_url';image_url:{url:string}})[];reasoning_content?:string;tool_calls?:ToolCall[];tool_call_id?:string}
 export type AgentAnswer=Omit<AgentMessage,'content'>&{content:string|null;reasoning?:string}
-export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean}
+export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean;apiFormat?:RemoteApiFormat}
 export class ModelFormatError extends Error {constructor(message:string){super(message);this.name='ModelFormatError'}}
 export const agentModelTiming={firstResponseMs:10*60*1000,idleMs:5*60*1000,totalMs:30*60*1000}
 type RequestOptions={tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
@@ -35,6 +36,7 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
   const requestTools=options.tools&&connection.localLlama?llamaToolDefinitions(options.tools):options.tools
   const thinking=options.summary?false:options.thinking
   const responseCharacterLimit=Math.min(8*1024*1024,Math.max(1024*1024,connection.maxTokens*8)),responseWireLimit=Math.min(32*1024*1024,responseCharacterLimit*3)
+  if(connection.apiFormat==='anthropic')return await requestAnthropic(connection,model,messages,combined,options,requestTools,responseCharacterLimit,responseWireLimit,acceptUsage,activity)
   const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:`Bearer ${connection.key}`}:{})},body:JSON.stringify({model,messages:messages.map(({reasoning_content,...message})=>({...message,...(isDeepSeek(connection.endpoint)&&reasoning_content!==undefined?{reasoning_content}:{})})),...deepseekThinking(connection.endpoint,thinking!==false),...(!requestTools||!requestTools.length?{}:{tools:requestTools,tool_choice:'auto'}),...(connection.localLlama&&thinking!==undefined?{chat_template_kwargs:{enable_thinking:thinking}}:{}),stream:true,stream_options:{include_usage:true},temperature:0.2,max_tokens:connection.maxTokens}),signal:combined})
   if(!response.body)throw new Error('模型响应为空')
   let data:Record<string,unknown>
@@ -98,6 +100,98 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
   if(record(error).name==='TimeoutError'||['UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(String(record(record(error).cause).code)))throw new Error('模型连接超时，本轮未执行工具。请检查模型服务或缩小上下文后继续任务。')
   throw error
  }finally{clearTimeout(idle);clearTimeout(total)}
+}
+
+function anthropicMessageContent(message:AgentMessage):unknown[]{
+ const blocks:unknown[]=[]
+ if(typeof message.content==='string'&&message.content)blocks.push({type:'text',text:message.content})
+ else if(Array.isArray(message.content))for(const item of message.content){
+  if(item.type==='text'&&item.text)blocks.push({type:'text',text:item.text})
+  else if(item.type==='image_url'){
+   const match=item.image_url.url.match(/^data:([^;,]+);base64,(.+)$/s)
+   if(match)blocks.push({type:'image',source:{type:'base64',media_type:match[1],data:match[2]}})
+  }
+ }
+ if(message.role==='assistant'&&message.tool_calls)for(const call of message.tool_calls){
+  let input:unknown={};try{input=JSON.parse(call.function.arguments||'{}')}catch{input={raw:call.function.arguments}}
+  blocks.push({type:'tool_use',id:call.id,name:call.function.name,input})
+ }
+ if(message.role==='tool')return [{type:'tool_result',tool_use_id:message.tool_call_id||'',content:typeof message.content==='string'?message.content:JSON.stringify(message.content??'')}]
+ return blocks.length?blocks:[{type:'text',text:''}]
+}
+
+function anthropicMessages(messages:AgentMessage[]){
+ const system:string[]=[]
+ const turns:{role:'user'|'assistant';content:unknown[]}[]=[]
+ for(const message of messages){
+  if(message.role==='system'){
+   const text=typeof message.content==='string'?message.content:message.content?.filter(item=>item.type==='text').map(item=>item.text).join('\n')||''
+   if(text)system.push(text)
+   continue
+  }
+  const role=message.role==='assistant'?'assistant':'user',content=anthropicMessageContent(message)
+  const previous=turns.at(-1)
+  if(previous?.role===role)previous.content.push(...content)
+  else turns.push({role,content})
+ }
+ return {system:system.join('\n\n'),messages:turns}
+}
+
+async function requestAnthropic(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions,tools:false|ToolDefinition[]|undefined,responseCharacterLimit:number,responseWireLimit:number,acceptUsage:(data:unknown)=>void,activity:()=>void):Promise<AgentAnswer>{
+ const converted=anthropicMessages(messages)
+ const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/messages`,{method:'POST',headers:{'Content-Type':'application/json','anthropic-version':'2023-06-01',...(connection.key?{'x-api-key':connection.key}:{})},body:JSON.stringify({model,max_tokens:connection.maxTokens,messages:converted.messages,...(converted.system?{system:converted.system}:{}),...(!tools||!tools.length?{}:{tools:tools.map(tool=>({name:tool.function.name,description:tool.function.description,input_schema:tool.function.parameters}))}),stream:true}),signal})
+ if(!response.body)throw new Error('模型响应为空')
+ if(!response.ok){const text=(await response.text()).slice(0,1000);throw new Error(`Anthropic 模型请求失败（HTTP ${response.status}）：${text||response.statusText}`)}
+ if(!response.headers.get('content-type')?.includes('text/event-stream')){
+  const data=record(await response.json());acceptUsage(data)
+  return validateAnthropicAnswer(data,connection.maxTokens,options)
+ }
+ let content='',reasoning='',characters=0,wireSize=0,stopReason=''
+ const calls=new Map<number,{id:string;name:string;arguments:string}>()
+ for await(const frame of sseData(response.body,signal)){
+  wireSize+=frame.length;if(wireSize>responseWireLimit)throw new Error('模型响应流过大，请缩小任务')
+  let chunk:Record<string,unknown>;try{chunk=record(JSON.parse(frame))}catch{throw new ModelFormatError('Anthropic 响应流格式错误，本轮未执行工具')}
+  if(chunk.type==='error')throw new Error(String(record(chunk.error).message||'Anthropic 服务返回错误'))
+  if(chunk.type==='message_start')acceptUsage(record(chunk.message))
+  if(chunk.type==='message_delta'){acceptUsage(chunk);const delta=record(chunk.delta);if(typeof delta.stop_reason==='string')stopReason=delta.stop_reason}
+  let added=0,phase:AgentModelProgress['phase']='responding'
+  if(chunk.type==='content_block_start'){
+   const index=Number(chunk.index),block=record(chunk.content_block)
+   if(block.type==='tool_use'){
+    if(!Number.isInteger(index)||index<0||index>7||typeof block.id!=='string'||typeof block.name!=='string'||calls.size>=8)throw new ModelFormatError('Anthropic 工具调用格式错误或单轮超过 8 个')
+    calls.set(index,{id:block.id,name:block.name,arguments:''});phase='tools'
+   }else if(block.type==='text'&&typeof block.text==='string'&&block.text){content+=block.text;options.onContent?.(block.text);added+=block.text.length}
+  }
+  if(chunk.type==='content_block_delta'){
+   const index=Number(chunk.index),delta=record(chunk.delta)
+   if(delta.type==='text_delta'&&typeof delta.text==='string'){content+=delta.text;options.onContent?.(delta.text);added+=delta.text.length}
+   else if(delta.type==='thinking_delta'&&typeof delta.thinking==='string'){reasoning+=delta.thinking;options.onReasoning?.(delta.thinking);added+=delta.thinking.length;phase='thinking'}
+   else if(delta.type==='input_json_delta'&&typeof delta.partial_json==='string'){
+    const call=calls.get(index);if(!call)throw new ModelFormatError('Anthropic 工具参数缺少起始块')
+    call.arguments+=delta.partial_json;added+=delta.partial_json.length;phase='tools'
+    if(call.arguments.length>150000)throw new Error('模型工具调用过长，请缩小任务')
+   }
+  }
+  characters+=added;if(characters>responseCharacterLimit)throw new Error('模型响应超过应用单轮容量，请缩小任务')
+  if(added){activity();options.onProgress?.({phase,characters,toolNames:phase==='tools'?[...calls.values()].map(call=>call.name).filter(Boolean):undefined})}
+ }
+ if(!stopReason)throw new Error('Anthropic 响应流意外中断，本轮未执行工具。请检查模型服务后继续任务。')
+ if(stopReason==='max_tokens')throw new ModelOutputLimitError(connection.maxTokens)
+ const toolCalls=[...calls.entries()].sort((a,b)=>a[0]-b[0]).map(([,call])=>({id:call.id,type:'function' as const,function:{name:call.name,arguments:call.arguments||'{}'}}))
+ if(options.tools===false&&toolCalls.length)throw new Error('摘要请求返回了工具调用，未执行，也未替换原摘要')
+ if(!content.trim()&&!toolCalls.length)throw new Error('模型没有返回答复或工具调用，请选择支持工具调用的模型')
+ return {role:'assistant',content:content||null,...(reasoning?{reasoning}:{}),...(toolCalls.length?{tool_calls:toolCalls}:{})}
+}
+
+function validateAnthropicAnswer(data:Record<string,unknown>,maxTokens:number,options:RequestOptions):AgentAnswer{
+ if(data.type==='error'||data.error)throw new Error(String(record(data.error).message||'Anthropic 服务返回错误'))
+ if(data.stop_reason==='max_tokens')throw new ModelOutputLimitError(maxTokens)
+ const blocks=Array.isArray(data.content)?data.content.map(record):[],content=blocks.filter(block=>block.type==='text').map(block=>String(block.text||'')).join(''),reasoning=blocks.filter(block=>block.type==='thinking').map(block=>String(block.thinking||'')).join('')
+ const calls:ToolCall[]=blocks.filter(block=>block.type==='tool_use').map(block=>({id:String(block.id||''),type:'function',function:{name:String(block.name||''),arguments:JSON.stringify(block.input??{})}}))
+ if(calls.some(call=>!call.id||!call.function.name)||calls.length>8)throw new ModelFormatError('Anthropic 返回了无效的工具调用')
+ if(options.tools===false&&calls.length)throw new Error('摘要请求返回了工具调用，未执行，也未替换原摘要')
+ if(!content.trim()&&!calls.length)throw new Error('模型没有返回答复或工具调用，请选择支持工具调用的模型')
+ return {role:'assistant',content:content||null,...(reasoning?{reasoning}:{}),...(calls.length?{tool_calls:calls}:{})}
 }
 function validateAnswer(data:Record<string,unknown>,maxTokens:number):AgentAnswer{
  if(data.error)throw new Error(String(record(data.error).message||'模型服务返回错误'))

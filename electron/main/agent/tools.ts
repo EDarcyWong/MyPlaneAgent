@@ -5,8 +5,15 @@ const tool=(name:string,description:string,properties:Record<string,unknown>,req
  if(name==='read_document')limits.offset.maximum=80*1024*1024
  return {type:'function',function:{name,description,parameters:{type:'object',properties:Object.fromEntries(Object.entries(properties).map(([key,value])=>[key,{...(value as object),...limits[key]}])),required,additionalProperties:false}}}
 }
+// Controller tools use task-scoped storage, never the editable Python worker.
+export const agentContextTools=[
+ tool('inspect_build','只读发现 Node/Python 构建配置、包管理器、可执行动作和版本指纹。',{},[]),
+ tool('build_project','执行 inspect_build 返回的构建或测试动作；确认后运行，返回退出码与结构化诊断，不自动安装依赖。',{action:{type:'string',pattern:'^(test|check|lint|build)(:[a-zA-Z0-9_-]+)?$'},timeoutSeconds:num('超时秒数，默认 120')},['action']),
+ tool('reconcile_execution','核对本任务中断步骤的文件哈希；只核对，不重放操作。返回结果未知时需要用户核对。',{},[]),
+ tool('read_tool_result','按 resultId 和 nextOffset 读取本任务保存的完整工具结果。',{resultId:{type:'string',pattern:'^[a-fA-F0-9-]{36}$'},offset:num('字符偏移，默认 0')},['resultId']),
+]
 export const agentTools=[
- tool('load_tool_pack','当前工具不足时加载一个专业工具包，下一轮即可使用。可选 code、tests、git、dependencies、runtime、images、archives、compare、todos、documents。',{pack:{type:'string',enum:['code','tests','git','dependencies','runtime','images','archives','compare','todos','documents']}},['pack']),
+ tool('load_tool_pack','加载专业包或一个工具名称。包：code、tests、git、dependencies、runtime、images、archives、compare、todos、documents、edit。catalog 列出工具名称，可用 offset 翻页。',{pack:{type:'string',minLength:1,maxLength:64},offset:num('catalog 偏移，默认 0')},['pack']),
  tool('git_status','查看当前项目 Git 状态。',{},[]),
  tool('git_diff','查看当前项目允许访问的文件差异。',{staged:{type:'boolean'}},[]),
  tool('git_log','查看最近提交。',{limit:{type:'integer',minimum:1,maximum:30}},[]),

@@ -18,7 +18,7 @@ export class LocalAiRuntime {
  private log(line:string){for(const part of line.split(/\r?\n/).filter(Boolean))this.status.logs.push(`${new Date().toLocaleTimeString()} ${part.replaceAll(this.key||'\0','[REDACTED]').slice(0,2000)}`);this.status.logs=this.status.logs.slice(-160)}
  async start(settings:StudioSettings,model:StudioLocalModel,options:DeveloperPreferences={host:'127.0.0.1',parallel:1,embedding:false,metrics:true,hasApiKey:false},apiKey='',loadOptions:RuntimeLoadOptions={}){
   if(this.child||this.status.state==='starting')throw new Error('请先卸载当前模型')
-  if(!validRuntimeExecutable(settings.runtimePath))throw new Error(`未找到可执行的 ${runtimeExecutableName()}。请在开发者 > 运行时中自动查找、安装官方运行包，或选择解压后具有执行权限的运行文件`)
+  if(!validRuntimeExecutable(settings.runtimePath))throw new Error(`未找到可执行的 ${runtimeExecutableName()}。请在“模型服务 > 本地服务 > 运行时”中自动查找、安装官方运行包，或选择解压后具有执行权限的运行文件`)
   if(!model.exists||model.format!=='GGUF')throw new Error('托管运行需要有效的 GGUF 模型文件')
   const projector=findVisionProjector(model.localPath)
   this.status={state:'starting',modelId:model.id,modelName:`myplane-${model.id.slice(0,16)}`,endpoint:`http://127.0.0.1:${settings.runtimePort}/v1`,error:'',logs:[],startedAt:Date.now(),host:options.host,parallel:options.parallel,contextLength:settings.contextLength,embedding:options.embedding}

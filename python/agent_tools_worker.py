@@ -235,9 +235,11 @@ def xlsx_bytes(sheets):
     return out.getvalue()
 def prepare_write(root,tool,args):
     if tool=='apply_patch':
-        changes=[]
+        changes=[];seen=set()
         for item in args['changes']:
-            file=resolve(root,item['path'],True);before=file.read_text('utf-8') if file.exists() else None
+            file=resolve(root,item['path'],True);identity=os.path.normcase(str(file))
+            if identity in seen: raise ValueError('同一文件只能出现一次')
+            seen.add(identity);before=file.read_bytes().decode('utf-8') if file.exists() else None
             if file.suffix.lower() in BINARY_DOCUMENT_EXT: raise ValueError('文本补丁不能写入二进制文档；DOCX 请使用 create_document，XLSX 请使用 create_spreadsheet')
             if before!=item.get('before'): raise ValueError('补丁基线不匹配，请重新读取 '+item['path'])
             changes.append({'path':item['path'],'before':before,'after':item['after'],'expected':sha(before.encode()) if before is not None else None})
@@ -268,16 +270,38 @@ def execute_plan(root,plan):
         started=time.time();done=subprocess.run(plan['command'],cwd=root,shell=True,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=plan['timeout'])
         invalidate(root)
         return compact({'exitCode':done.returncode,'durationMs':round((time.time()-started)*1000),'output':(done.stdout+done.stderr)[:32000]})
-    changes=plan['changes'];prepared=[]
+    changes=plan['changes'];prepared=[];seen=set()
     for change in changes:
-        file=resolve(root,change['path'],True);current=file.read_bytes() if file.exists() else None
+        file=resolve(root,change['path'],True);identity=os.path.normcase(str(file))
+        if identity in seen: raise ValueError('同一文件只能出现一次')
+        seen.add(identity);current=file.read_bytes() if file.exists() else None
         if (sha(current) if current is not None else None)!=change.get('expected'): raise ValueError('文件在确认期间已被修改：'+change['path'])
-        data=bytes.fromhex(change['afterHex']) if 'afterHex' in change else change['after'].encode();prepared.append((file,data))
-    for file,data in prepared:
-        file.parent.mkdir(parents=True,exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=file.parent,delete=False) as tmp: tmp.write(data);name=tmp.name
-        os.replace(name,file)
-    invalidate(root,[file for file,_ in prepared])
+        data=bytes.fromhex(change['afterHex']) if 'afterHex' in change else change['after'].encode()
+        prepared.append((change,file,data,current,file.stat().st_mode & 0o777 if file.exists() else 0o644))
+    def atomic_write(file,data,mode):
+        file.parent.mkdir(parents=True,exist_ok=True);name=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=file.parent,delete=False) as tmp: tmp.write(data);name=tmp.name
+            os.chmod(name,mode);os.replace(name,file)
+        finally:
+            if name and os.path.exists(name): os.unlink(name)
+    applied=[]
+    try:
+        for change,file,data,before,mode in prepared:
+            resolve(root,change['path'],True);current=file.read_bytes() if file.exists() else None
+            if (sha(current) if current is not None else None)!=change.get('expected'): raise ValueError('文件在执行期间发生变化：'+change['path'])
+            atomic_write(file,data,mode);applied.append((change,file,data,before,mode))
+    except Exception as error:
+        pending=[]
+        for change,file,data,before,mode in reversed(applied):
+            try:
+                resolve(root,change['path'])
+                if sha(file.read_bytes())!=sha(data): raise ValueError('出现后续修改')
+                if before is None: file.unlink()
+                else: atomic_write(file,before,mode)
+            except Exception: pending.append(change['path'])
+        raise ValueError(str(error)+('；回退未完成，请核对：'+','.join(pending) if pending else '；已回退本次写入')) from error
+    invalidate(root,[file for _,file,_,_,_ in prepared])
     return compact({'status':'saved','paths':[c['path'] for c in changes]})
 
 def code_files(root,relative='.',limit=1800):

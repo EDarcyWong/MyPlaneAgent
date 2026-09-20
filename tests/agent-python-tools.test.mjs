@@ -14,12 +14,12 @@ function sandbox(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-pyt
 function call(workspace,tool,args={},context={},code){const run=spawnSync(python,[worker],{input:JSON.stringify({workspace,tool,args,context,code}),encoding:'utf8'});assert.equal(run.status,0,run.stderr||run.stdout);const envelope=JSON.parse(run.stdout);assert.equal(envelope.error,undefined);return typeof envelope.output==='string'?envelope.output:JSON.stringify(envelope.output)}
 function callAsync(workspace,tool,args={}){return new Promise((resolve,reject)=>{const child=spawn(python,[worker],{stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',data=>stdout+=data);child.stderr.on('data',data=>stderr+=data);child.on('error',reject);child.on('close',code=>{try{assert.equal(code,0,stderr||stdout);const envelope=JSON.parse(stdout);assert.equal(envelope.error,undefined);resolve(typeof envelope.output==='string'?envelope.output:JSON.stringify(envelope.output))}catch(error){reject(error)}});child.stdin.end(JSON.stringify({workspace,tool,args}))})}
 
-test('Python runtime reuses one worker and invalidates file caches from filesystem state',async t=>{
+test('Python runtime isolates invocations and reads current filesystem state',async t=>{
  const root=sandbox(t),runtime=new PythonToolRuntime(worker);t.after(()=>runtime.dispose());const signal=new AbortController().signal
  const code='def execute(args, context):\n    import os\n    print("custom diagnostic")\n    return {"pid": os.getpid(), "cwd": os.getcwd()}\n'
- const first=JSON.parse((await runtime.execute({workspace:root,tool:'worker_pid',args:{},code},signal)).output),second=JSON.parse((await runtime.execute({workspace:root,tool:'worker_pid',args:{},code},signal)).output);assert.equal(first.pid,second.pid);assert.equal(first.cwd,fs.realpathSync(root))
+ const first=JSON.parse((await runtime.execute({workspace:root,tool:'worker_pid',args:{},code},signal)).output),second=JSON.parse((await runtime.execute({workspace:root,tool:'worker_pid',args:{},code},signal)).output);assert.notEqual(first.pid,second.pid);assert.equal(first.cwd,fs.realpathSync(root))
  fs.writeFileSync(path.join(root,'a.txt'),'one');const listed=JSON.parse((await runtime.execute({workspace:root,tool:'list_files',args:{}},signal)).output);assert.ok(listed.paths.includes('a.txt'))
- const cached=JSON.parse((await runtime.execute({workspace:root,tool:'list_files',args:{}},signal)).output);assert.equal(cached.cached,true)
+ const cached=JSON.parse((await runtime.execute({workspace:root,tool:'list_files',args:{}},signal)).output);assert.equal(cached.cached,undefined)
  fs.writeFileSync(path.join(root,'b.txt'),'two');const refreshed=JSON.parse((await runtime.execute({workspace:root,tool:'list_files',args:{}},signal)).output);assert.ok(refreshed.paths.includes('b.txt'));assert.equal(refreshed.cached,undefined)
  fs.writeFileSync(path.join(root,'a.txt'),'updated value');const read=JSON.parse((await runtime.execute({workspace:root,tool:'read_file',args:{path:'a.txt'}},signal)).output);assert.match(read.text,/updated value/)
 })
@@ -108,4 +108,51 @@ test('tool store routes built-in, control and custom tool versions through Pytho
  const custom=store.save({key:'context_value',name:'上下文',description:'读取执行上下文',parameters:{type:'object',properties:{},additionalProperties:false},python:'def execute(args, context):\n    return context.get("marker", "missing")\n',risk:'read',timeoutMs:5000,changeNote:'创建'})
  const customSpec=store.specs(root).find(spec=>spec.definition.function.name===custom.key)
  assert.equal(await customSpec.execute({},signal,{marker:'passed'}),'passed')
+})
+
+
+test('modified builtin executes once, retains high risk across saves and runtime upgrades',async t=>{
+ const root=sandbox(t),file=path.join(root,'tools.json');let calls=0
+ const runtime={revision:()=> 'runtime-v1',execute:async()=>{calls++;return {output:'{"ok":true}',elapsedMs:1}}}
+ const store=new AgentToolStore(file,runtime),original=store.list().find(tool=>tool.key==='write_file')
+ const input={id:original.id,key:original.key,...original.current,risk:'read',python:'def execute(args, context):\n    # builtin( is only a comment\n    return {"ok": True}\n'}
+ const modified=store.save(input);assert.equal(modified.current.risk,'high')
+ assert.equal(store.save(input).current.risk,'high')
+ const spec=store.specs(root).find(item=>item.definition.function.name==='write_file')
+ assert.equal(spec.prepare,undefined);await spec.execute({},new AbortController().signal);assert.equal(calls,1)
+ const restarted=new AgentToolStore(file,{...runtime,revision:()=> 'runtime-v2'})
+ const current=restarted.list().find(tool=>tool.id===original.id)
+ assert.equal(current.activeVersion,3,'custom implementation must not receive runtime-only versions')
+ assert.equal(current.current.risk,'high');assert.equal(current.current.runtimeRevision,undefined)
+ const snapshot=restarted.version(original.id);snapshot.version.risk='read'
+ assert.equal(restarted.version(original.id).version.risk,'high','returned versions cannot mutate the store')
+})
+
+test('builtin risk floors apply to saves, restore and previously persisted unsafe versions',t=>{
+ const root=sandbox(t),file=path.join(root,'tools.json'),runtime={revision:()=> 'runtime-v1'},store=new AgentToolStore(file,runtime)
+ for(const key of ['write_file','run_command']){
+  const original=store.list().find(tool=>tool.key===key)
+  const saved=store.save({id:original.id,key,...original.current,risk:'read'})
+  assert.equal(saved.current.risk,key==='write_file'?'write':'high')
+  assert.equal(store.restore(original.id,1).current.risk,saved.current.risk)
+ }
+ const persisted=JSON.parse(fs.readFileSync(file,'utf8'))
+ const modified=persisted.find(tool=>tool.key==='read_file');modified.versions[0].python+='\n# changed implementation';modified.versions[0].risk='read'
+ const command=persisted.find(tool=>tool.key==='run_command');for(const version of command.versions)version.risk='read'
+ fs.writeFileSync(file,JSON.stringify(persisted))
+ const restarted=new AgentToolStore(file,runtime)
+ assert.equal(restarted.version(modified.id,1).version.risk,'high')
+ assert.ok(restarted.list().find(tool=>tool.id===command.id).versions.every(version=>version.risk==='high'))
+})
+
+
+test('running tool snapshots keep their original implementation and schema after an update',async t=>{
+ const root=sandbox(t),runtime={revision:()=> 'v1',execute:async request=>({output:request.code,elapsedMs:1})},store=new AgentToolStore(path.join(root,'tools.json'),runtime)
+ const input={key:'snapshot_tool',name:'snapshot',description:'version one',parameters:{type:'object',properties:{},additionalProperties:false},python:'def execute(args, context):\n    return 1\n',risk:'high',timeoutMs:1000}
+ const original=store.save(input),snapshot=store.specs(root).find(spec=>spec.definition.function.name===input.key)
+ store.save({...input,id:original.id,description:'version two',python:'def execute(args, context):\n    return 2\n'})
+ assert.equal(snapshot.definition.function.description,'version one')
+ assert.equal(await snapshot.execute({},new AbortController().signal),input.python)
+ const next=store.specs(root).find(spec=>spec.definition.function.name===input.key)
+ assert.equal(next.definition.function.description,'version two');assert.notEqual(next.revision,snapshot.revision)
 })

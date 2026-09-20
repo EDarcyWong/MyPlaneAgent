@@ -7,6 +7,7 @@ import {createServer} from 'node:http'
 import {randomUUID} from 'node:crypto'
 import JSZip from 'jszip'
 import ExcelJS from 'exceljs'
+import {estimateTokens} from '../dist-electron/main/local-ai-context.js'
 import {AgentWorkspace} from '../dist-electron/main/agent/workspace.js'
 import {extractDocument,makeDocument,makeSpreadsheet} from '../dist-electron/main/agent/documents.js'
 import {LocalAgentService} from '../dist-electron/main/agent/service.js'
@@ -158,7 +159,7 @@ test('token-budget execution pauses when the provider omits usage reports',async
  assert.equal(result.status,'stopped');assert.match(result.error,/没有报告 Token 用量/);assert.equal(result.events.some(event=>event.kind==='tool'),false)
 })
 test('truncated tool arguments are never executed and plain text is not treated as a command',async t=>{
- const h=await harness(t,(_request,n)=>n<2?{choices:[{finish_reason:'length',message:{tool_calls:[call('write_file',{path:'bad.txt',content:'truncated'})]}}]}:response('run_command({command:"touch bad.txt"})'))
+ const h=await harness(t,(_request,n)=>n<3?{choices:[{finish_reason:'length',message:{tool_calls:[call('write_file',{path:'bad.txt',content:'truncated'})]}}]}:response('run_command({command:"touch bad.txt"})'))
  const task=h.start();await until(()=>!h.service.active(task.id));assert.equal(h.service.get(task.id).status,'stopped');assert.match(h.service.get(task.id).error,/截断/)
  const next=h.start({taskId:task.id,prompt:'继续'});await until(()=>!h.service.active(next.id));assert.equal(fs.existsSync(path.join(h.workspace,'bad.txt')),false);assert.match(h.service.get(task.id).events.at(-1).text,/未调用工具/)
 })
@@ -423,7 +424,7 @@ test('chat mode rejects tool calls even when a provider ignores the disabled too
 test('output-limit recovery discards all calls, retries once with smaller work and records all usage',async t=>{
  let requests=0
  const h=await harness(t,(body,n)=>{
-  requests++;assert.equal(body.max_tokens,2048)
+  requests++;assert.equal(body.max_tokens,n===0?2048:4096)
   if(n===0)return {choices:[{finish_reason:'length',message:{tool_calls:[call('write_file',{path:'discard.txt',content:'never write'}),call('list_files',{})]}}],usage:{prompt_tokens:100,completion_tokens:2048,total_tokens:2148}}
   if(n===1){assert.match(body.messages[0].content,/最多调用一个工具/);assert.doesNotMatch(JSON.stringify(body.messages),/discard.txt/);return {...response(null,[call('list_files',{})]),usage:{prompt_tokens:120,completion_tokens:20,total_tokens:140}}}
   return response('已检查目录')
@@ -451,4 +452,40 @@ test('output-limit retry respects cancellation and token budget',async t=>{
   const result=h.service.get(task.id);assert.equal(result.status,'stopped');assert.equal(requests,1);assert.equal(result.events.some(e=>e.kind==='tool'),false)
   assert.match(result.error,cancel?/停止/:/预算/)
  }
+})
+
+
+test('output-limit recovery grows 2048 to 4096 then 8192 and never executes truncated calls',async t=>{
+ const limits=[]
+ const h=await harness(t,(body,n)=>{
+  limits.push(body.max_tokens)
+  if(n<2)return {choices:[{finish_reason:'length',message:{tool_calls:[call('write_file',{path:'truncated.txt',content:'do not execute'})]}}]}
+  return response('恢复完成')
+ })
+ const task=h.start();await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
+ assert.deepEqual(limits,[2048,4096,8192]);assert.equal(result.status,'completed',result.error)
+ assert.equal(result.events.filter(event=>event.kind==='tool').length,0);assert.equal(fs.existsSync(path.join(h.workspace,'truncated.txt')),false)
+ assert.equal(result.context.reservedOutput,8192)
+})
+
+test('output-limit recovery remains bounded when every response is truncated',async t=>{
+ let requests=0
+ const h=await harness(t,()=>{requests++;return {choices:[{finish_reason:'length',message:{content:'partial'}}]}})
+ const task=h.start();await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
+ assert.equal(requests,3);assert.equal(result.status,'stopped');assert.match(result.error,/8192/)
+ assert.equal(result.events.some(event=>event.kind==='tool'),false)
+})
+
+
+test('output recovery respects small context space and disables reasoning on retry',async t=>{
+ const bodies=[]
+ const h=await harness(t,(body,n)=>{
+  bodies.push(body)
+  assert.ok(estimateTokens(body.messages)+estimateTokens(body.tools)+body.max_tokens+32<=4096)
+  return n===0?{choices:[{finish_reason:'length',message:{content:'partial'}}]}:response('完成')
+ },{contextLength:4096,localLlama:true})
+ const task=h.start({fastMode:false});await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
+ assert.equal(result.status,'completed',result.error);assert.equal(bodies.length,2)
+ assert.equal(bodies[0].chat_template_kwargs.enable_thinking,true);assert.equal(bodies[1].chat_template_kwargs.enable_thinking,false)
+ assert.ok(bodies[1].max_tokens>=bodies[0].max_tokens);assert.ok(bodies[1].max_tokens<=2048)
 })

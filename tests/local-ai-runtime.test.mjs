@@ -89,7 +89,7 @@ test('Windows ZIP installation still preserves the server and DLL files',async t
  const root=sandbox(t),zip=new JSZip(),archive=path.join(root,'runtime.zip'),directory=path.join(root,'contents')
  zip.file('release/llama-server.exe','exe');zip.file('release/ggml.dll','dll')
  fs.writeFileSync(archive,await zip.generateAsync({type:'nodebuffer'}))
- assert.equal(await extractRuntimeArchive(archive,directory,'win32',signal()),path.join('release','llama-server.exe'))
+ assert.equal((await extractRuntimeArchive(archive,directory,'win32',signal())).replaceAll('\\','/'),'release/llama-server.exe')
  assert.equal(fs.readFileSync(path.join(directory,'release/ggml.dll'),'utf8'),'dll')
  assert.ok(validRuntimeExecutable(path.join(directory,'release/llama-server.exe'),'win32'))
  const unsafe=new JSZip();unsafe.file('../outside','bad');fs.writeFileSync(archive,await unsafe.generateAsync({type:'nodebuffer'}))

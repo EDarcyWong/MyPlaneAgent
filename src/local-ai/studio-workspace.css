@@ -15,7 +15,7 @@
 .agent-template-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:28px auto 0;max-width:630px}.agent-template-grid>button{display:flex;gap:8px;padding:11px 10px;justify-content:center;border:1px solid var(--s-border);border-radius:10px;box-shadow:none}.agent-template-grid strong{font-size:12px;white-space:nowrap;font-weight:450}.agent-template-icon{width:17px;height:17px;background:transparent}.agent-template-icon svg{width:16px;height:16px}.agent-template-grid>button>svg:last-child{display:none}
 .agent-events{max-width:800px;padding:18px 24px 30px}.agent-task-heading{margin:0 0 18px;justify-content:flex-end}.agent-status{padding:2px 7px;font-size:10px;border:0;background:var(--s-muted)}.agent-status.running,.agent-status.waiting{background:var(--s-muted);color:var(--s-text)}
 .agent-event>header{font-size:11px;font-weight:500}.agent-event.user{margin-left:auto;max-width:85%;width:fit-content;padding:13px 18px;border-radius:16px}.agent-event.assistant{padding:6px 0}.agent-event.tool{border-color:var(--s-border);border-radius:9px}.agent-event summary{font-size:12px;padding:10px 12px}.agent-plan{border:0;padding:14px 16px;background:var(--s-muted);font-size:12px}.agent-plan>div{font-size:12px}
-.agent-composer-wrap{width:calc(100% - 48px);max-width:752px;padding:10px 0 18px}.agent-prompt{border-radius:18px;box-shadow:0 3px 15px #00000005;border-color:var(--s-border);padding:5px}.agent-prompt:focus-within{border-color:var(--s-dim);box-shadow:0 0 0 1px var(--s-border)}.agent-prompt textarea{height:80px;min-height:70px;padding:13px 14px 8px;font-size:14px;resize:none}.agent-prompt>footer{padding:4px 7px 6px;gap:6px}.agent-prompt-options{min-width:0;gap:4px}.agent-mode select{font-size:11px;background:transparent;padding:5px 18px 5px 5px;border:0}.agent-settings summary{font-size:11px;padding:5px;max-width:220px}.agent-settings summary>span{max-width:180px}.agent-prompt .agent-primary{width:32px;height:32px;min-height:32px;padding:7px;border-radius:50%;border:0}.agent-prompt .agent-primary svg{width:17px;height:17px}.agent-prompt .agent-primary:disabled{opacity:.28}.agent-secondary{font-size:12px}.agent-composer-hint{font-size:10px;margin-top:8px;align-items:center;gap:10px}.agent-composer-hint :deep(.token-usage){font-size:10px}
+.agent-composer-wrap{width:calc(100% - 48px);max-width:800px;padding:10px 0 18px}.agent-prompt{border-radius:18px;box-shadow:0 3px 15px #00000005;border-color:var(--s-border);padding:5px}.agent-prompt:focus-within{border-color:var(--s-dim);box-shadow:0 0 0 1px var(--s-border)}.agent-prompt textarea{height:80px;min-height:70px;padding:13px 14px 8px;font-size:14px;resize:none}.agent-prompt>footer{padding:4px 7px 6px;gap:6px}.agent-prompt-options{min-width:0;gap:4px}.agent-mode select{font-size:11px;background:transparent;padding:5px 18px 5px 5px;border:0}.agent-settings summary{font-size:11px;padding:5px;max-width:220px}.agent-settings summary>span{max-width:180px}.agent-prompt .agent-primary{width:32px;height:32px;min-height:32px;padding:7px;border-radius:50%;border:0}.agent-prompt .agent-primary svg{width:17px;height:17px}.agent-prompt .agent-primary:disabled{opacity:.28}.agent-secondary{font-size:12px}.agent-composer-hint{font-size:10px;margin-top:8px;align-items:center;gap:10px}.agent-composer-hint :deep(.token-usage){font-size:10px}
 .agent-settings-panel{max-height:360px;overflow:auto;width:300px}.agent-settings-panel label{display:flex;flex-direction:column;gap:6px;font-size:12px;margin-top:10px}.agent-settings-panel textarea{height:80px;min-height:0;width:100%;border:1px solid var(--s-border);padding:7px;font-size:12px}.agent-settings-panel input{font-size:12px}
 .composer-images{display:flex;gap:8px;overflow:auto;padding:8px 10px 0}.composer-images figure{position:relative;margin:0;flex:none;width:92px}.composer-images img{width:92px;height:64px;object-fit:cover;border:1px solid var(--s-border);border-radius:8px}.composer-images figcaption{font-size:10px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:var(--s-dim)}.composer-images figure>button{position:absolute;right:3px;top:3px;border:0;border-radius:50%;width:19px;height:19px;padding:0;background:var(--s-panel);font-size:14px}.message-images{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.message-images img{max-width:min(240px,100%);max-height:180px;object-fit:contain;border-radius:9px}
 @container studio (max-width:1100px){.agent-history{width:218px}.agent-toolbar{padding-inline:16px}.agent-template-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-width:410px}}
@@ -26,3 +26,61 @@
 
 .tool-audit{font-size:11px;color:var(--s-dim);padding:0 14px;overflow-wrap:anywhere}
 .agent-composer-wrap{padding-bottom:8px}.agent-prompt textarea{height:68px;min-height:60px}@container studio (max-width:850px){.agent-composer-wrap{padding-bottom:8px}.agent-prompt textarea{height:64px;min-height:56px}}@media(max-height:680px){.agent-composer-wrap{padding-bottom:6px}.agent-prompt textarea{height:60px;min-height:54px}}
+
+/* Keep the scroll viewport full height while reserving the measured composer space. */
+.agent-main{position:relative}
+.agent-main>.agent-scroll{padding-bottom:calc(var(--composer-height,180px) + 20px);scroll-padding-bottom:calc(var(--composer-height,180px) + 20px)}
+.agent-main>.agent-composer-wrap{position:absolute;bottom:0;left:50%;transform:translateX(-50%);z-index:4;background:linear-gradient(to bottom,transparent,var(--s-bg) 12px)}
+.agent-composer-wrap>.agent-approval{margin-bottom:8px;padding:10px 12px;border-radius:10px;max-height:30vh;overflow:auto}
+.agent-process-stream{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:inherit}
+.agent-process-details{margin-top:2px;padding:0;border:0;border-radius:0;background:transparent}
+.agent-process-details>.agent-event{margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+.agent-process-details>.agent-event>details>summary{min-height:28px;padding:4px 2px;gap:7px}
+.agent-process-details>.agent-event>details>summary>strong{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.agent-process-details .agent-step-check{width:13px;height:13px;flex:none;color:#40976c}
+.agent-process-details .agent-tool-name{border:0;background:transparent;padding:0;font-size:10px}
+.agent-process-details .agent-event-command{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--s-dim);font:11px/1.4 'SFMono-Regular',Consolas,monospace}
+.agent-process-details .agent-working{padding:5px 2px;margin:0;font-size:12px}
+.agent-process-details .agent-event :deep(.ai-markdown){padding:4px 20px;font-size:13px;line-height:1.65}
+.agent-plan{padding:0;margin-bottom:10px;background:transparent}
+.agent-plan-items{border:0;padding:2px 12px 6px}
+.agent-plan-items>div{gap:7px;margin:3px 0;line-height:1.6}
+.agent-plan-items svg,.agent-plan-items .agent-step-number{width:14px;min-width:14px;height:18px;background:transparent;font-size:10px}
+
+/* Keep execution plans readable as a vertical, bordered list. */
+.agent-plan{border:1px solid var(--s-border);border-radius:10px;background:var(--s-panel);overflow:hidden}
+.agent-plan>summary{min-height:40px;padding:7px 14px;background:color-mix(in srgb,var(--s-muted) 55%,transparent)}
+.agent-plan-items{display:flex;flex-direction:column;align-items:stretch;gap:0;width:100%;margin:0;padding:0;border-top:1px solid var(--s-border)}
+.agent-plan-items>div{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:7px;width:100%;min-height:28px;margin:0;padding:4px 14px;border-bottom:1px solid color-mix(in srgb,var(--s-border) 72%,transparent);box-sizing:border-box;font-size:12px;line-height:1.25}
+.agent-plan-items>div:last-child{border-bottom:0}
+.agent-plan-items>div>span:not(.agent-step-number){min-width:0;overflow-wrap:anywhere}
+.agent-plan-items>div>small{margin-left:10px;white-space:nowrap;color:var(--s-dim);font-size:11px;font-weight:400;text-align:right}
+.agent-plan-items svg,.agent-plan-items .agent-step-number{width:14px;min-width:14px;height:16px;background:transparent;font-size:10px}
+.agent-plan-items>div.completed>svg{color:#40976c}
+.agent-plan-items>div.running{background:color-mix(in srgb,var(--s-accent-soft) 52%,transparent);box-shadow:inset 3px 0 0 var(--s-accent)}
+
+.agent-process:not([open])>summary>strong{display:none}
+.agent-process:not([open])>summary>.agent-process-stream{display:block;flex:1;min-width:0}
+
+.agent-process[open]>summary>strong{display:block}
+.agent-process[open]>summary>.agent-process-stream{display:none}
+
+.agent-message-queue{position:relative;margin:8px 8px -14px;padding:4px 7px 17px;background:var(--s-muted);border:1px solid var(--s-border);border-bottom:0;border-radius:16px 16px 0 0;font-size:13px}
+.agent-message-queue header{display:flex;align-items:center;justify-content:space-between;padding:3px 8px;color:var(--s-dim);font-size:11px}
+.agent-message-queue header button{color:var(--s-accent)}
+.agent-message-queue button{border:0;background:transparent;padding:5px;cursor:pointer;color:var(--s-dim)}
+.agent-message-queue button:hover,.queue-menu>button:hover{background:var(--s-border);color:var(--s-text)}
+.agent-message-queue ol{list-style:none;margin:0;padding:0;max-height:132px;overflow:auto}
+.agent-message-queue li{display:flex;align-items:center;gap:8px;min-height:34px;padding:1px 5px}
+.agent-message-queue .queue-mark{width:15px;height:15px;flex:none;color:var(--s-dim)}
+.agent-message-queue .queue-message{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.agent-message-queue small{color:var(--s-dim);font-weight:400}
+.agent-message-queue .queue-remove,.queue-menu>button{display:grid;place-items:center;width:28px;height:28px;flex:none;border-radius:8px}
+.agent-message-queue button svg,.queue-menu>button svg{width:15px;height:15px}
+.queue-menu>button{cursor:pointer;list-style:none;color:var(--s-dim)}
+.queue-menu>button::-webkit-details-marker{display:none}
+.agent-prompt>footer>.stop-button{margin-left:auto}
+
+.agent-message-queue .queue-steer{display:flex;align-items:center;gap:4px;flex:none;white-space:nowrap;border-radius:7px;font-size:12px}
+.queue-steering-note{margin:4px 8px;color:var(--s-dim);font-size:12px}
+@container studio (max-width:650px){.agent-message-queue .queue-steer{display:none}}
