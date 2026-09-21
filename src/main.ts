@@ -9,8 +9,9 @@ const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
 if(params.get('surface')==='workflow-editor'){
- void window.myplane.localAiStudio('bootstrap').then(bootstrap=>{
+ void Promise.all([window.myplane.localAiStudio('bootstrap'),window.myplane.localAiStudio('connect',{reason:'startup'})]).then(([bootstrap,connection])=>{
   document.title=params.get('workflowId')?'编辑工作流 · MyPlaneAgent':'新建工作流 · MyPlaneAgent'
-  createApp(WorkflowDesigner,{windowMode:true,workflowId:params.get('workflowId')||'',model:bootstrap.settings.model,models:bootstrap.models.map(item=>({id:item.id}))}).mount('#app')
+  const models=bootstrap.settings.source==='managed'?[{id:bootstrap.runtime.modelName||bootstrap.settings.model,name:bootstrap.runtime.modelName||'当前本地模型'}]:connection.models.map(item=>({id:item.id,name:item.name}))
+  createApp(WorkflowDesigner,{windowMode:true,workflowId:params.get('workflowId')||'',model:bootstrap.settings.source==='managed'?bootstrap.runtime.modelName:bootstrap.settings.model,models}).mount('#app')
  })
 }else createApp(LocalAiStudio,{standalone:true}).mount('#app')

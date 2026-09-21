@@ -183,7 +183,7 @@ export class LocalAgentService {
  }
  private save(task:StoredTask){this.updateFacts(task);task.updatedAt=now();writeIntegrationJson(this.file(task.id),task)}
  private publish(run:Run,save=true){if(save)this.save(run.task);run.emit(this.public(run.task))}
- list():AgentTaskSummary[]{return fs.readdirSync(this.directory).filter(f=>/^[a-f\d-]{36}\.json$/i.test(f)).flatMap(file=>{try{const {events,plan,artifacts,...summary}=this.public(this.load(file.slice(0,-5)));return [summary]}catch{return []}}).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt))}
+ list():AgentTaskSummary[]{return fs.readdirSync(this.directory).filter(f=>/^[a-f\d-]{36}\.json$/i.test(f)).flatMap(file=>{try{const {events,plan,artifacts,...summary}=this.public(this.load(file.slice(0,-5)));return summary.hidden?[]:[summary]}catch{return []}}).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt))}
  projects():AgentProject[]{
   const projects=readIntegrationJson<AgentProject[]>(path.join(this.directory,'projects.json'),[])
   if(!Array.isArray(projects)||projects.some(p=>!p||typeof p.id!=='string'||!/^[a-f\d-]{36}$/i.test(p.id)||typeof p.name!=='string'||!p.name.trim()||typeof p.workspace!=='string'||!path.isAbsolute(p.workspace)||typeof p.createdAt!=='string'||typeof p.updatedAt!=='string'))throw new Error('项目记录已损坏，请检查本地 projects.json')
@@ -241,14 +241,14 @@ export class LocalAgentService {
   }
   const pending=run.pending;run.pending=undefined;pending.resolve(approved)
  }
- start(input:{approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;taskId?:string;workspace?:string;mode:AgentMode;model:string;prompt:string;maxSteps:number},owner:number,emit:(task:AgentTask)=>void){
+ start(input:{approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;taskId?:string;workspace?:string;hidden?:boolean;mode:AgentMode;model:string;prompt:string;maxSteps:number},owner:number,emit:(task:AgentTask)=>void){
   if([...this.runs.values(),...this.compactions.values()].some(run=>run.owner===owner)||input.taskId&&this.compactions.has(input.taskId))throw new Error('请先完成或停止当前 Agent 任务')
   const prompt=(input.images?.length?String(input.prompt||'').slice(0,16000):bounded(input.prompt,'任务要求',16000)).trim(),model=bounded(input.model,'模型',500),maxSteps=integer(input.maxSteps,20,0,120)
    if(!modes.has(input.mode))throw new Error('任务模式无效')
    const approvalMode=input.approvalMode||'ask';if(!approvalModes.has(approvalMode))throw new Error('任务权限模式无效')
   const connection=this.connection();let task:StoredTask
   if(input.taskId){if(this.runs.has(input.taskId))throw new Error('任务仍在执行');task=this.load(input.taskId);if(input.projectId&&input.projectId!==task.projectId)throw new Error('不能更改已有任务所属项目，请新建任务');this.closePendingCalls(task);this.applySteering(task)}
-  else{const project=input.projectId?this.project(input.projectId):undefined,root=project?.workspace||bounded(input.workspace,'工作目录',2000),workspace=new AgentWorkspace(root);if(project&&workspace.root!==project.workspace)throw new Error('项目目录位置已改变，请重新选择目录创建项目');const assignedProject=project||this.ensureWorkspaceProject(workspace.root),time=now();task={usage:emptyTokenUsageTotals(),id:randomUUID(),projectId:assignedProject.id,title:prompt.slice(0,48)||'图片对话',workspace:workspace.root,mode:input.mode,model,status:'running',steps:0,maxSteps,plan:[],events:[],artifacts:[],messages:[],error:'',createdAt:time,updatedAt:time}}
+  else{const project=input.projectId?this.project(input.projectId):undefined,root=project?.workspace||bounded(input.workspace,'工作目录',2000),workspace=new AgentWorkspace(root);if(project&&workspace.root!==project.workspace)throw new Error('项目目录位置已改变，请重新选择目录创建项目');const assignedProject=project||this.ensureWorkspaceProject(workspace.root),time=now();task={usage:emptyTokenUsageTotals(),id:randomUUID(),projectId:assignedProject.id,...(input.hidden?{hidden:true}:{}),title:prompt.slice(0,48)||'图片对话',workspace:workspace.root,mode:input.mode,model,status:'running',steps:0,maxSteps,plan:[],events:[],artifacts:[],messages:[],error:'',createdAt:time,updatedAt:time}}
   if(!input.taskId&&input.seed){
    const seed=input.seed
    task.sourceSessionId=seed.id;task.title=seed.title==='新对话'?task.title:seed.title
