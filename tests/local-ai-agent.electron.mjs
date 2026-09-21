@@ -95,7 +95,7 @@ async function main(){try{
  assert.match(collapsedExecution.flow,/等待确认工具：修改文件：\{"path":"math\.mjs".*"oldText":"a - b"/)
  await screenshot('agent-process-collapsed')
  assert.match(fs.readFileSync(path.join(workspace,'math.mjs'),'utf8'),/a - b/)
- assert.equal(await js("document.querySelector('.agent-create-project').disabled && document.querySelector('.agent-project-item').disabled"),true)
+ assert.equal(await js("document.querySelector('.agent-create-project').disabled && !document.querySelector('.agent-project-item').disabled"),true)
  await click('.agent-process>summary')
  await click('.agent-event.tool.waiting>details>summary')
  assert.equal(await js("document.querySelector('.agent-event.tool.waiting>details').open"),true)
@@ -131,11 +131,11 @@ async function main(){try{
   {name:'文档整理项目',count:'1',tasks:['分析文档目录']},
   {name:'加法工具项目',count:'2',tasks:['再次分析此项目','修复加法函数，运行验证，并生成 Word 报告。']}
  ])
- await click('.agent-project-group .agent-group-toggle')
- assert.equal(await js("document.querySelector('.agent-group-toggle').getAttribute('aria-expanded')"),'false')
+ await click('.agent-project-group .agent-project-item')
+ assert.equal(await js("document.querySelector('.agent-project-item').getAttribute('aria-expanded')"),'false')
  assert.equal(await js("getComputedStyle(document.querySelector('.agent-task-list')).display"),'none')
  assert.equal(await js("document.querySelectorAll('.agent-project-item.selected').length"),0,'collapse does not change workspace')
- await click('.agent-project-group .agent-group-toggle')
+ await click('.agent-project-group .agent-project-item')
  dialog.showOpenDialog=async()=>({canceled:false,filePaths:[cancelledFolder]});await click('.agent-workspace-picker')
  await until(()=>js("!document.querySelector('.agent-workspace-picker').disabled"),'directory project');dialog.showOpenDialog=originalDialog
  await submit('整理独立目录');await until(()=>js("!!document.querySelector('.agent-result')&&!document.querySelector('.agent-approval')"),'standalone task')
@@ -144,7 +144,7 @@ async function main(){try{
  assert.equal(await js("document.querySelectorAll('.agent-project-group[data-project-id=\"\"]').length"),0,'directory tasks are not unclassified')
  assert.equal(await js("document.querySelectorAll('.agent-task-item').length"),4,'each task appears exactly once')
  await screenshot('agent-project-groups')
- await js("[...document.querySelectorAll('.agent-project-item')].find(el=>el.querySelector('strong').textContent==='加法工具项目').click()")
+ await js("[...document.querySelectorAll('.agent-project-item')].find(el=>el.querySelector('strong').textContent==='加法工具项目').closest('.agent-project-group').querySelector('.agent-task-item').click()")
  assert.equal(await js("document.querySelector('.agent-project-item.selected').closest('.agent-project-group').querySelectorAll('.agent-task-item').length"),2)
  assert.equal(await js("document.querySelector('.agent-workspace-picker').title"),project.workspace)
  await js(`document.querySelector('.agent-project-item.selected').closest('.agent-project-group').querySelectorAll('.agent-task-item')[1].click()`);await until(()=>js("document.querySelectorAll('.agent-result-files button').length===2"),'original project task')

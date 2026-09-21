@@ -7,6 +7,7 @@ import {developerProtocols,developerRoutes,type DeveloperProtocol,type Developer
 import {LOCAL_AI_MAX_OUTPUT_TOKENS} from '../../electron/shared/local-ai'
 
 import {developerExample} from './developer-api-examples'
+import {serviceErrorText,showServiceStartError} from './service-error-dialog'
 
 const props=defineProps<{settings:StudioSettings;runtime?:StudioRuntime;models:StudioLocalModel[];connection?:StudioConnection;connecting:boolean;serviceMode?:'managed'|'external'}>()
 const emit=defineEmits<{settings:[Partial<StudioSettings>];runtime:[StudioRuntime];connect:[];importModels:[];discover:[];settingsPage:[]}>()
@@ -18,7 +19,7 @@ const load=reactive({runtimePort:props.settings.runtimePort,contextLength:props.
 const protocol=ref<DeveloperProtocol>('lmstudio'),downloadJobId=ref('')
 const route=ref<DeveloperRoute>('lmModels'),requestBody=ref(''),response=ref<DeveloperResponse>(),requestBusy=ref(false),exampleLanguage=ref<'curl'|'python'|'javascript'|'powershell'>('powershell')
 const logFilter=ref(''),logLevel=ref('all'),followLogs=ref(true),logPanel=ref<HTMLElement>()
-let timer:ReturnType<typeof setTimeout>|undefined,disposed=false,initialized=false
+let timer:ReturnType<typeof setTimeout>|undefined,disposed=false,initialized=false,shownRuntimeError=props.runtime?.error||''
 const managed=computed(()=>props.serviceMode?props.serviceMode==='managed':props.settings.source==='managed')
 const active=computed(()=>!!props.runtime?.pid||['starting','running','stopping'].includes(props.runtime?.state||''))
 const serverActive=computed(()=>active.value||state.value?.serverRunning===true)
@@ -44,11 +45,11 @@ const protocolKeys=Object.keys(developerProtocols) as DeveloperProtocol[]
 const protocolRoutes=computed(()=>developerProtocols[protocol.value].routes)
 const routeKeys=computed(()=>[...protocolRoutes.value,...(['health','properties','slots','metrics'] as DeveloperRoute[])])
 function selectProtocol(value:DeveloperProtocol){if(requestBusy.value)return;protocol.value=value;route.value=developerProtocols[value].routes[0]}
-async function toggleApiOnly(){await run('api-server',async()=>{emit('runtime',await api(state.value?.serverRunning?'stopRuntime':'startApiServer'));emit('settings',{source:'managed'});await refreshState()})}
+async function toggleApiOnly(){const starting=!state.value?.serverRunning;await run('api-server',async()=>{emit('runtime',await api(starting?'startApiServer':'stopRuntime'));emit('settings',{source:'managed'});await refreshState()},starting?showServiceStartError:undefined)}
 async function unloadApiModel(){await run('unload',async()=>{emit('runtime',await api('unloadRuntime'));await refreshState()})}
 
-function report(cause:unknown){error.value=String(cause).replace(/^Error: (?:Error invoking remote method '[^']+': Error: )?/,'')}
-async function run(name:string,work:()=>Promise<void>){if(busy.value)return;busy.value=name;error.value='';try{await work()}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}finally{busy.value=''}}
+function report(cause:unknown){error.value=serviceErrorText(cause)}
+async function run(name:string,work:()=>Promise<void>,onError?:(cause:unknown)=>Promise<unknown>){if(busy.value)return;busy.value=name;error.value='';try{await work()}catch(cause){if(cause!=='cancel'&&cause!=='close'){if(onError){shownRuntimeError=serviceErrorText(cause);await onError(cause)}else report(cause)}}finally{busy.value=''}}
 async function copy(text:string){try{await navigator.clipboard.writeText(text);ElMessage.success('已复制')}catch(cause){report(cause)}}
 async function open(url:string){try{await window.myplane.openAiLink(url)}catch(cause){report(cause)}}
 async function refreshState(){
@@ -68,13 +69,14 @@ async function install(item:RuntimePackage){await run('install',async()=>{
 async function cancelInstall(){await run('cancel-install',async()=>{await api('runtimeInstallCancel');await refreshState()})}
 async function toggleServer(){
  if(!managed.value){emit('connect');return}
+ const starting=!active.value
  await run('server',async()=>{
   if(active.value){emit('runtime',await api('stopRuntime'));return}
   const model=localModels.value.find(item=>item.id===selectedId.value)||localModels.value[0]
   if(!model){emit('runtime',await api('startApiServer'));await refreshState();return}
   if(!state.value?.runtimeFound){candidates.value=await api('runtimeDetect');if(!candidates.value.length){page.value='runtime';throw new Error('未找到 llama-server，请安装官方运行包或手动选择运行文件')};emit('settings',await api('settings',{runtimePath:candidates.value[0].path}))}
   selectedId.value=model.id;emit('runtime',await api('startRuntime',{id:model.id}));emit('settings',{source:'managed'});page.value='server'
- })
+ },starting?showServiceStartError:undefined)
 }
 async function externalModel(id:string,unload=false){await run('external-model',async()=>{await api('loadExternal',{id,unload});emit('connect')})}
 async function saveConfiguration(){await run('save',async()=>{
@@ -110,6 +112,7 @@ async function cancelRequest(){try{await api('developerCancelRequest')}catch(cau
 const example=computed(()=>developerExample(route.value,requestUrl.value,requestBody.value,exampleLanguage.value))
 watch(response,value=>{if(!value||route.value!=='lmDownload')return;try{const body=JSON.parse(value.body);if(typeof body.job_id==='string')downloadJobId.value=body.job_id}catch{}})
 watch(()=>props.settings,settings=>Object.assign(load,{runtimePort:settings.runtimePort,contextLength:settings.contextLength,gpuLayers:settings.gpuLayers,threads:settings.threads,temperature:settings.temperature,topP:settings.topP,maxTokens:settings.maxTokens,repeatPenalty:settings.repeatPenalty}),{deep:true})
+watch(()=>props.runtime?.error,value=>{if(managed.value&&value&&value!==shownRuntimeError){shownRuntimeError=value;void showServiceStartError(value)}else if(!value)shownRuntimeError=''})
 watch(localModels,models=>{if(!models.some(item=>item.id===selectedId.value))selectedId.value=models.find(item=>item.id===props.runtime?.modelId)?.id||models[0]?.id||''},{immediate:true})
 watch([route,modelIdentifier],()=>template(),{immediate:true})
 watch(()=>logLines.value.join('\n'),async()=>{if(followLogs.value){await nextTick();if(logPanel.value)logPanel.value.scrollTop=logPanel.value.scrollHeight}})
@@ -126,7 +129,6 @@ onBeforeUnmount(()=>{disposed=true;clearTimeout(timer);if(requestBusy.value)void
 
    <template v-if="page==='server'">
     <div v-if="managed&&!state?.runtimeFound" class="dev-runtime-callout"><Cpu/><div><strong>还没有配置 llama-server？</strong><p>模型文件不是运行程序。可在这里查找已安装运行时，或下载完整官方运行包。</p></div><button class="dev-button primary" @click="page='runtime'">配置运行时 <ArrowRight/></button></div>
-    <div v-if="runtime?.error&&managed" class="dev-alert">{{runtime.error}}</div>
     <section class="dev-section"><header><h2>{{managed?'已加载模型':connection?.provider==='lmstudio'?'LM Studio 模型':'服务报告的模型'}}</h2><button class="dev-button" @click="emit('importModels')"><Plus/>导入模型</button></header>
      <div v-if="managed" class="dev-load-row"><select v-model="selectedId" aria-label="选择服务模型" :disabled="active"><option value="" disabled>选择本地 GGUF 模型</option><option v-for="item in localModels" :key="item.id" :value="item.id">{{item.file}}</option></select><button class="dev-button primary" :disabled="!!busy||active||!selectedId" @click="toggleServer">加载并启动</button></div>
      <article v-if="managed&&active" class="dev-model-card"><header><span class="dev-model-state" :class="{online:runtime?.state==='running'}">{{runtime?.state==='running'?'READY':runtime?.state==='starting'?'LOADING':statusLabel}}</span><span>GGUF</span><span>{{runtime?.embedding?'向量模式':'文本推理'}}</span></header><strong>{{loaded?.file||runtime?.modelName}}</strong><div class="dev-model-meta"><button class="dev-inline" @click="copy(runtime?.modelName||'')"><code>{{runtime?.modelName}}</code><CopyDocument/></button><span v-if="loaded">{{byteLabel(loaded.size)}}</span><span>并发 {{runtime?.parallel||1}}</span><button class="dev-button" :disabled="!!busy" @click="toggleServer">卸载</button></div></article>

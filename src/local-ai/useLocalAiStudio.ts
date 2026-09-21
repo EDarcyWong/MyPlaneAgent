@@ -7,10 +7,11 @@ import {clipboardImageFiles,readChatImages} from './chat-images'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
 import {builtinCatalog,type StudioCatalog,type StudioDiscoveryModel} from '../../electron/shared/local-ai-catalog'
 import type {StudioModelDetails} from '../../electron/shared/local-ai-studio'
+import {showServiceStartError,showServiceValidationError} from './service-error-dialog'
 
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
- const tab=ref<'agent'|'chat'|'discover'|'models'|'server'|'tools'|'settings'>('agent'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
+ const tab=ref<'agent'|'chat'|'workflow'|'automation'|'discover'|'models'|'server'|'tools'|'settings'>('agent'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
  const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system'})
  const apiKey=ref(''),hfToken=ref(''),connection=ref<StudioConnection>(),connecting=ref(false),remoteProfiles=ref<LocalAiRemoteProfile[]>([]),sessions=ref<StudioSessionSummary[]>([]),session=ref<StudioSession>(),sessionFilter=ref('')
  const images=ref<StudioImage[]>([]),attaching=ref(false)
@@ -81,15 +82,22 @@ export function useLocalAiStudio(){
  async function deleteSession(item:StudioSessionSummary){if(sending.value)return;try{await ElMessageBox.confirm(`删除“${item.title}”？此操作不会删除模型。`,'删除对话',{type:'warning'});await api('deleteSession',{id:item.id});await refreshSessions();if(session.value?.id===item.id){session.value=undefined;if(sessions.value[0])await openSession(sessions.value[0].id);else await newSession()}}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function saveSettings(testConnection=false){let savedSuccessfully=false;await run('save',async()=>{const payload:StudioSettingsInput={...settings,...(apiKey.value?{apiKey:apiKey.value}:{}),...(hfToken.value?{hfToken:hfToken.value}:{})};const saved=await api('settings',payload);Object.assign(settings,saved);apiKey.value='';hfToken.value='';if(saved.source==='external')remoteProfiles.value=await api('remoteProfiles');ElMessage.success('设置已保存');connection.value=undefined;model.value=saved.model;if(testConnection)await connect();savedSuccessfully=true});return savedSuccessfully}
  async function useRemoteProfile(id:string){await run('profile-use',async()=>{const result=await api('remoteProfileUse',{id});Object.assign(settings,result.settings);remoteProfiles.value=result.profiles;apiKey.value='';connection.value=undefined;if(settings.source==='external'){model.value=settings.model;await connect()}else if(runtime.value?.state==='running')model.value=runtime.value.modelName;ElMessage.success(settings.source==='external'?'已切换远程服务配置':'已载入配置，当前仍使用本地服务')})}
- async function saveRemoteProfile(input:{id?:string;name:string;apiFormat:RemoteApiFormat;endpoint:string;model?:string;contextLength?:number;apiKey?:string;clearApiKey?:boolean},testConnection=true){let savedSuccessfully=false;await run('profile-save',async()=>{const result=await api('remoteProfileSave',input);Object.assign(settings,result.settings);remoteProfiles.value=result.profiles;apiKey.value='';connection.value=undefined;if(settings.source==='external'){model.value=settings.model;if(testConnection)await connect()}else if(runtime.value?.state==='running')model.value=runtime.value.modelName;ElMessage.success(settings.source==='external'?'远程服务配置已保存':'配置已保存，当前仍使用本地服务');savedSuccessfully=true});return savedSuccessfully}
+ async function saveRemoteProfile(input:{id?:string;name:string;apiFormat:RemoteApiFormat;endpoint:string;model?:string;contextLength?:number;apiKey?:string;clearApiKey?:boolean},testConnection=true){
+  if(busy.value)return false
+  let savedSuccessfully=false;busy.value='profile-save';error.value=''
+  try{const result=await api('remoteProfileSave',input);Object.assign(settings,result.settings);remoteProfiles.value=result.profiles;apiKey.value='';connection.value=undefined;if(settings.source==='external'){model.value=settings.model;if(testConnection)await connect()}else if(runtime.value?.state==='running')model.value=runtime.value.modelName;ElMessage.success(settings.source==='external'?'远程服务配置已保存':'配置已保存，当前仍使用本地服务');savedSuccessfully=true}
+  catch(cause){await showServiceValidationError(cause)}finally{error.value='';busy.value=''}
+  return savedSuccessfully
+ }
  async function deleteRemoteProfile(id:string){await run('profile-delete',async()=>{await ElMessageBox.confirm('删除后将移除这条配置历史及其本机保存的密钥引用。当前服务不会停止。','删除远程配置',{type:'warning',confirmButtonText:'删除配置',cancelButtonText:'取消'});remoteProfiles.value=await api('remoteProfileDelete',{id});ElMessage.success('配置历史已删除')})}
  async function clearKey(kind:'api'|'hf'){await run('clear-key',async()=>{Object.assign(settings,await api('settings',kind==='api'?{clearApiKey:true}:{clearHfToken:true}));if(kind==='api')apiKey.value='';else hfToken.value='';ElMessage.success('已移除密钥')})}
  async function connect(silent:unknown=false){
   if(connecting.value)return
   const source=settings.source,configured=settings.model.trim(),selection=model.value
+  if(silent!==true)error.value=''
   connecting.value=true
   try{
-   const result=await api('connect');if(source!==settings.source)return
+   const result=await api('connect',silent===true?{reason:'startup'}:{reason:'manual'});if(source!==settings.source)return
    connection.value=result
    if(result.ok&&model.value===selection){
     const first=result.models[0]?.instanceId||result.models[0]?.id||''
@@ -97,10 +105,15 @@ export function useLocalAiStudio(){
      const selectionAvailable=result.models.some(item=>item.id===selection||item.instanceId===selection)
      model.value=configured||selectionAvailable&&selection||first||selection
     }else if(runtime.value?.state==='running')model.value=runtime.value.modelName
-   }else if(!result.ok&&silent!==true)error.value=result.error
-  }catch(cause){if(silent!==true)report(cause)}finally{connecting.value=false}
+   }else if(!result.ok&&silent!==true)await showServiceValidationError(result.error)
+  }catch(cause){if(silent!==true)await showServiceValidationError(cause)}finally{if(silent!==true)error.value='';connecting.value=false}
  }
- async function switchSource(source:'managed'|'external'){await run('source',async()=>{Object.assign(settings,await api('settings',{source}));connection.value=undefined;if(source==='managed'&&runtime.value?.state==='running')model.value=runtime.value.modelName;await connect()})}
+ async function switchSource(source:'managed'|'external'){
+  if(busy.value)return
+  busy.value='source';error.value=''
+  try{Object.assign(settings,await api('settings',{source}));connection.value=undefined;if(source==='managed'&&runtime.value?.state==='running')model.value=runtime.value.modelName;await connect()}
+  catch(cause){if(source==='external')await showServiceValidationError(cause);else report(cause)}finally{if(source==='external')error.value='';busy.value=''}
+ }
  function selectRemoteApiFormat(format:RemoteApiFormat){if(settings.apiFormat===format)return;connection.value=undefined;apiKey.value='';Object.assign(settings,{apiFormat:format,endpoint:format==='anthropic'?'https://api.anthropic.com/v1':'https://api.openai.com/v1',model:'',hasApiKey:false,contextLength:format==='anthropic'?131072:128000,maxTokens:format==='anthropic'?8192:4096})}
  async function usePreset(provider:'lmstudio'|'ollama'|'llamacpp'|'deepseek'|'anthropic'){connection.value=undefined;settings.apiFormat=provider==='anthropic'?'anthropic':'openai';apiKey.value='';settings.hasApiKey=false;if(provider==='anthropic'){Object.assign(settings,{endpoint:'https://api.anthropic.com/v1',model:'',contextLength:131072,maxTokens:8192});return}if(provider==='deepseek'){Object.assign(settings,deepseekPreset);return}Object.assign(settings,{model:'',contextLength:4096,maxTokens:2048});settings.endpoint=provider==='lmstudio'?'http://127.0.0.1:1234/v1':provider==='ollama'?'http://127.0.0.1:11434/v1':'http://127.0.0.1:8080/v1'}
  function applyCatalog(found:StudioCatalog){
@@ -140,7 +153,13 @@ export function useLocalAiStudio(){
  async function downloadAction(item:StudioDownload,action:'pause'|'resume'|'cancel'|'remove'){try{if(action==='cancel')await ElMessageBox.confirm('取消下载并清理未完成的临时文件？','取消下载');const rows=await api('downloadAction',{id:item.id,action});if(data.value)data.value.downloads=rows}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function importModels(){await run('import',async()=>{if(data.value)data.value.models=await api('importModels')})}
  async function removeModel(item:StudioLocalModel,deleteFile=false){try{await ElMessageBox.confirm(deleteFile?`永久删除文件 ${item.file}？`:`从模型库移除 ${item.file}？原文件会保留；如果文件位于设置的下载目录中，下次扫描时会重新出现在列表中。`,deleteFile?'删除模型文件':'移除模型记录',{type:'warning'});if(data.value)data.value.models=await api('removeModel',{id:item.id,deleteFile})}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
- async function startModel(item:StudioLocalModel){if(!settings.runtimePath){tab.value='server';ElMessage.info('请在“模型服务 > 本地服务 > 运行时”中查找或安装 llama-server，再选择模型启动服务');return}await run('load',async()=>{const state=await api('startRuntime',{id:item.id});settings.source='managed';if(data.value)data.value.runtime=state;tab.value='server';connection.value=undefined})}
+ async function startModel(item:StudioLocalModel){
+  if(!settings.runtimePath){tab.value='server';await showServiceStartError('未配置 llama-server。请在“模型服务 > 本地服务 > 运行时”中查找或安装运行时，再启动模型服务。');return}
+  if(busy.value)return
+  busy.value='load';error.value=''
+  try{const state=await api('startRuntime',{id:item.id});settings.source='managed';if(data.value)data.value.runtime=state;tab.value='server';connection.value=undefined}
+  catch(cause){await showServiceStartError(cause)}finally{busy.value=''}
+ }
  async function stopModel(){await run('unload',async()=>{if(data.value)data.value.runtime=await api('stopRuntime');connection.value=undefined})}
  async function externalModel(id:string,unload=false){await run('external-model',async()=>{connection.value=await api('loadExternal',{id,unload});if(!unload){model.value=id;ElMessage.success('模型已加载')}})}
  async function chooseDirectory(){await run('directory',async()=>{const picked=await api('chooseDirectory');if(picked)settings.downloadDirectory=picked})}

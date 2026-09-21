@@ -8,6 +8,7 @@ import {extractDocument,makeDocument,makeSpreadsheet} from './documents.js'
 import type {FileExpectation} from '../../shared/agent-execution.js'
 import {executeProcess} from './execution-supervisor.js'
 import {inspectBuild,prepareBuild} from './build-profile.js'
+import {analyzeTestResult} from './test-analysis.js'
 
 const ignored=new Set(['.git','node_modules','dist','dist-electron','release','vendor','.idea','.venv','venv','__pycache__'])
 const secret=(name:string)=>/^\.env(?:\.|$)/i.test(name)&&!/^\.env\.(example|sample|template)$/i.test(name)||/^(\.ssh|\.aws|\.gnupg|credentials(?:\.json)?|id_rsa|id_ed25519)$/i.test(name)||/\.(pem|key|p12|pfx)$/i.test(name)
@@ -65,11 +66,15 @@ export class AgentWorkspace {
   if(name==='run_test'){
    const script=bounded(args.script,'测试脚本',100);if(!/^(test|check|lint|build)(:[a-zA-Z0-9_-]+)?$/.test(script))throw new Error('只支持 test/check/lint/build 及其子脚本')
    const manifest=JSON.parse(this.read('package.json'));if(typeof manifest.scripts?.[script]!=='string')throw new Error('项目未定义此脚本')
-   return {preview:{command:'npm run '+script,cwd:this.root,note:'项目脚本可以执行任意代码，仍需确认。'},execute:(s,onOutput)=>this.command('npm run '+script,integer(args.timeoutSeconds,60,1,300),s,onOutput)}
+   return {preview:{command:'npm run '+script,cwd:this.root,note:'优先在本机已有容器沙盒中运行：网络关闭、临时 HOME、非 root、限制资源；沙盒不可用时必须由用户确认后降级执行。'},execute:async(s,onOutput)=>{
+    const raw=JSON.parse(await this.command('npm run '+script,integer(args.timeoutSeconds,60,1,300),s,onOutput))
+    const failureAnalysis=analyzeTestResult(raw,[],script)
+    return JSON.stringify({exitCode:raw.exitCode,durationMs:raw.durationMs,termination:raw.termination,error:raw.error,truncated:raw.truncated,sandbox:raw.sandbox,failureAnalysis,output:raw.output})
+   }}
   }
   if(name==='run_command'){
    const command=bounded(args.command,'命令',8000),timeout=integer(args.timeoutSeconds,60,1,300)
-   return {preview:{command,cwd:this.root,note:'命令以当前用户权限执行，可访问目录外文件及网络；工作目录不是系统沙箱。仅执行你认可的命令。'},execute:(signal,onOutput)=>this.command(command,timeout,signal,onOutput)}
+   return {preview:{command,cwd:this.root,note:'优先在本机已有容器沙盒中运行；沙盒不可用时必须由用户确认，降级命令仍可访问宿主机文件和网络。'},execute:(signal,onOutput)=>this.command(command,timeout,signal,onOutput)}
   }
   const relative=bounded(args.path,'目标路径',2000),target=this.resolve(relative,true)
   if(target===this.root)throw new Error('目标必须是文件')
@@ -167,6 +172,6 @@ export class AgentWorkspace {
  }
  private async command(command:string,timeout:number,signal:AbortSignal,onOutput?:(text:string)=>void):Promise<string>{
   signal.throwIfAborted();this.resolve('.')
-  return JSON.stringify(await executeProcess({executable:command,cwd:this.root,shell:true,timeoutMs:timeout*1000},signal,onOutput))
+  return JSON.stringify(await executeProcess({executable:command,cwd:this.root,shell:true,timeoutMs:timeout*1000,sandbox:'prefer'},signal,onOutput))
  }
 }

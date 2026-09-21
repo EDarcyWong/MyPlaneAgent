@@ -1,5 +1,6 @@
 {
   "name": "myplane-agent",
+  "productName": "MyPlaneAgent",
   "version": "0.1.0",
   "private": true,
   "description": "Independent local AI and Agent desktop workspace.",

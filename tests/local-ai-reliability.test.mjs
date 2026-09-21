@@ -36,6 +36,11 @@ test('a corrected call proceeds, repeated failures pause, and no-op read loops a
  h=await harness(t,()=>reply([call('read_file',{path:'missing'})]));task=h.start();await until(()=>!h.service.active(task.id));assert.equal(h.requests(),3);assert.match(h.service.get(task.id).error,/连续失败/)
  h=await harness(t,()=>reply([call('list_files',{})]));task=h.start();await until(()=>!h.service.active(task.id));assert.equal(h.requests(),4);assert.match(h.service.get(task.id).error,/重复调用/)
 })
+test('distinct failures use the expanded cumulative failure limit',async t=>{
+ const h=await harness(t,(_body,n)=>reply([call('read_file',{path:`missing-${n}.txt`})])),task=h.start()
+ await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
+ assert.equal(h.requests(),10);assert.equal(result.events.filter(event=>event.status==='failed').length,10);assert.match(result.error,/达到 10 次失败上限/)
+})
 test('read-only blocks writes; scoped auto mode edits ordinary files but keeps scripts and commands gated',async t=>{
  const h=await harness(t,()=>reply([call('write_file',{path:'src/a.ts',content:'new'})]));fs.mkdirSync(path.join(h.workspace,'src'));let project=h.service.createProject(h.workspace,'web')
  h.service.updateProject({id:project.id,policy:'read-only',autoWritePaths:[]});let task=h.start({projectId:project.id});await until(()=>!h.service.active(task.id));assert.equal(fs.existsSync(path.join(h.workspace,'src/a.ts')),false);assert.equal(h.service.get(task.id).events.at(-1).status,'rejected')

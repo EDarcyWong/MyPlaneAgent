@@ -19,6 +19,7 @@ type GatewayBackend={
 }
 type DownloadJob={repo:string;files:string[];ids:string[];revision:string;startedAt:string;completedAt?:string;total:number}
 type SavedResponse={model:string;messages:Json[];bytes:number;expires:number}
+type GatewayLogLevel='debug'|'info'|'warn'|'error'
 class ApiError extends Error {
  constructor(readonly status:number,readonly type:string,message:string,readonly param?:string){super(message)}
 }
@@ -45,11 +46,11 @@ export class LocalAiGateway {
  private inferenceCount=0
  private history=new Map<string,SavedResponse>()
  private jobs:Record<string,DownloadJob>={}
- constructor(private readonly backend:GatewayBackend,private readonly jobsFile:string){
+ constructor(private readonly backend:GatewayBackend,private readonly jobsFile:string,private readonly onLog?:(level:GatewayLogLevel,message:string)=>void){
   try{
    const saved=readIntegrationJson<Record<string,DownloadJob>>(jobsFile,{})
    for(const [id,job] of Object.entries(saved).slice(-200))if(/^job_[a-f\d-]{36}$/i.test(id)&&job&&Array.isArray(job.files)&&Array.isArray(job.ids)&&typeof job.repo==='string'&&typeof job.revision==='string')this.jobs[id]=job
-  }catch{this.log('Download job metadata could not be read; the model download queue is unchanged.')}
+  }catch{this.log('Download job metadata could not be read; the model download queue is unchanged.','warn')}
  }
  get running(){return this.server?.listening===true}
  get active(){return this.running||!!this.starting}
@@ -57,20 +58,20 @@ export class LocalAiGateway {
  get apiKey(){return this.key}
  requestLogs(){return [...this.logs]}
  clearLogs(){this.logs=[]}
- private log(message:string){this.logs.push(`${new Date().toLocaleTimeString()} [API] ${message.replaceAll(this.key||'\0','[REDACTED]').slice(0,500)}`);this.logs=this.logs.slice(-160)}
+ private log(message:string,level:GatewayLogLevel='info'){const clean=message.replaceAll(this.key||'\0','[REDACTED]').slice(0,500);this.logs.push(`${new Date().toLocaleTimeString()} [API] ${clean}`);this.logs=this.logs.slice(-160);this.onLog?.(level,clean)}
  async start(host:string,port:number,key:string){
   if(this.running)return
   if(this.starting)return this.starting
   this.key=key||randomUUID();this.base=`http://127.0.0.1:${port}`
   const server=createServer((request,response)=>{void this.handle(request,response)})
   this.server=server;server.requestTimeout=30000;server.headersTimeout=10000;server.keepAliveTimeout=5000
-  server.on('error',error=>this.log(`Listener error: ${error.message}`))
+  server.on('error',error=>this.log(`Listener error: ${error.message}`,'error'))
   this.starting=new Promise<void>((resolve,reject)=>{
    const onError=(error:Error)=>reject(new Error(`API 端口 ${port} 启动失败：${error.message}`))
    server.once('error',onError);server.listen(port,host,()=>{server.removeListener('error',onError);resolve()})
   })
   try{await this.starting;this.log(`Listening on ${host}:${port}; LM Studio API / OpenAI / Anthropic; authentication required`)}
-  catch(error){this.server=undefined;this.key='';throw error}
+  catch(error){this.server=undefined;this.key='';this.log(error instanceof Error?error.message:String(error),'error');throw error}
   finally{this.starting=undefined}
  }
  async stop(){
@@ -150,7 +151,7 @@ export class LocalAiGateway {
   }finally{
    if(inference)this.inferenceCount--
    this.requests.delete(controller);request.removeListener('aborted',abort);response.removeListener('close',abort)
-   this.log(`${request.method||'GET'} ${pathname} ${response.statusCode} ${Date.now()-started}ms`)
+   this.log(`${request.method||'GET'} ${pathname} ${response.statusCode} ${Date.now()-started}ms`,'debug')
   }
  }
  private models(){return this.backend.models().filter(model=>model.exists&&model.format==='GGUF'&&firstShard(model.file)&&!/(?:^|\/)mmproj[-.]/i.test(model.file))}

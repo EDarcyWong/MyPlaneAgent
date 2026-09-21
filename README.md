@@ -26,7 +26,9 @@ npm run test:smoke
 1. 打开应用即进入工作台。
 2. 在设置中连接外部兼容服务，或导入 GGUF 模型并选择/安装 llama.cpp 运行时。
 3. 选择模型后聊天；创建项目并选择工作目录后使用 Agent。
-4. 在工具页面管理 Python 工具和项目 MCP 连接。
+4. 在“工作流”页面组合 Agent、条件与通知节点，并查看节点运行时间线。
+5. 在“定时任务”页面按单次、间隔、每日、每周或 Cron 计划运行项目 Agent 或工作流。
+6. 在工具页面管理 Python 工具和项目 MCP 连接。
 
 Python 工具需要 Python 3；macOS/Linux 默认使用 PATH 中的 `python3`，Windows 使用 `python`，可以用 `MYPLANE_PYTHON` 指定解释器。PDF、图片与 OCR 功能的可选依赖：
 

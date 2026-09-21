@@ -6,6 +6,8 @@ import type {McpCommands} from './local-ai-mcp.js'
 import type {AgentCommands} from './local-ai-agent.js'
 import type {AgentToolCommands} from './local-ai-tools.js'
 import type {StudioDeveloperCommands} from './local-ai-developer.js'
+import type {AutomationCommands} from './local-ai-automation.js'
+import type {WorkflowCommands} from './local-ai-workflow.js'
 
 export type StudioSettings = LocalAiSettings & {
   source: 'external'|'managed'
@@ -52,7 +54,7 @@ export type StudioCommands = {
   remoteProfileUse:{input:{id:string};output:{settings:StudioSettings;profiles:LocalAiRemoteProfile[]}}
   remoteProfileDelete:{input:{id:string};output:LocalAiRemoteProfile[]}
   snapshot:{input:undefined;output:StudioSnapshot}
-  connect:{input:undefined;output:StudioConnection}
+  connect:{input:{reason?:'startup'|'manual'}|undefined;output:StudioConnection}
   search:{input:{query:string;format:'gguf'|'all';sort:'downloads'|'likes'|'lastModified'};output:LocalAiSearchResult[]}
   catalog:{input:{query:string;format:'gguf'|'all';sort:'downloads'|'likes'|'lastModified';cachedOnly?:boolean};output:StudioCatalog}
   modelDetails:{input:{repoId:string};output:StudioModelDetails}
@@ -79,4 +81,4 @@ export type StudioCommands = {
   chat:{input:{sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean};output:{started:boolean}}
   compactSession:{input:{sessionId:string;requestId:string;model:string};output:{started:boolean}}
   stopChat:{input:{requestId:string};output:void}
-}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands
+}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands

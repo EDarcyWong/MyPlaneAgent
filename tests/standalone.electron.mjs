@@ -1,4 +1,4 @@
-import {app,BrowserWindow} from 'electron'
+import {app,BrowserWindow,Menu} from 'electron'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -13,24 +13,36 @@ async function main(){let code=0;try{
  await import('../dist-electron/main/index.js')
  await app.whenReady()
  await until(()=>BrowserWindow.getAllWindows().length,'window created')
- const win=BrowserWindow.getAllWindows()[0],js=source=>win.webContents.executeJavaScript(source,true)
+ const win=BrowserWindow.getAllWindows()[0],js=async source=>{try{return await win.webContents.executeJavaScript(source,true)}catch(error){throw new Error(`Renderer script failed: ${source}\n${error}`)}}
  await until(()=>!win.webContents.isLoading()&&win.webContents.getURL().includes('index.html'),'production renderer loaded')
  await until(()=>js("!!document.querySelector('.agent-new')&&!document.querySelector('.agent-new').disabled"),'workspace ready')
  assert.equal(app.getName(),'MyPlaneAgent')
  assert.equal(app.getPath('userData'),root)
  assert.equal(win.webContents.getLastWebPreferences().sandbox,true)
- assert.deepEqual(await js('Object.keys(window.myplane).sort()'),['localAiStudio','onLocalAiAgentEvent','onLocalAiStudioEvent','openAiLink'])
+ const menuLabels=Menu.getApplicationMenu().items.map(item=>item.label)
+ for(const label of ['文件','编辑','视图','窗体','帮助'])assert.ok(menuLabels.includes(label),`application menu includes ${label}`)
+ assert.ok(Menu.getApplicationMenu().items.find(item=>item.label==='帮助').submenu.items.some(item=>item.label==='打开日志目录'))
+ assert.match(fs.readFileSync(path.join(root,'logs','myplane-agent.log'),'utf8'),/\[INFO\] \[app\] 应用启动/)
+ assert.deepEqual(await js('Object.keys(window.myplane).sort()'),['applicationLogs','closeWorkflowEditor','localAiStudio','onApplicationLogToggle','onLocalAiAgentEvent','onLocalAiStudioEvent','onWorkflowSaved','openAiLink','openWorkflowEditor','workflowEditorSaved'])
  const bootstrap=await js("window.myplane.localAiStudio('bootstrap')")
  assert.equal(bootstrap.settings.runtimePort,8089)
  assert.ok(bootstrap.settings.downloadDirectory.startsWith(root))
- for(const label of ['我的模型','开发者','工具','设置','工作台']){
+ await js('window.myplane.openWorkflowEditor()')
+ await until(()=>BrowserWindow.getAllWindows().some(item=>item!==win&&item.webContents.getURL().includes('surface=workflow-editor')),'workflow editor window created')
+ const workflowEditor=BrowserWindow.getAllWindows().find(item=>item!==win&&item.webContents.getURL().includes('surface=workflow-editor'))
+ await until(()=>workflowEditor.webContents.executeJavaScript("!!document.querySelector('.workflow-editor-window.is-native-window')",true),'workflow editor canvas loaded')
+ assert.equal(workflowEditor.getTitle(),'新建工作流 · MyPlaneAgent')
+ assert.equal(workflowEditor.getParentWindow(),win)
+ await workflowEditor.webContents.executeJavaScript('window.myplane.closeWorkflowEditor()',true)
+ await until(()=>BrowserWindow.getAllWindows().length===1,'workflow editor window closed')
+ for(const label of ['工作流','定时任务','我的模型','模型服务','工具','设置','工作台']){
   await js(`document.querySelector('[aria-label="${label}"]').click()`)
  }
- await js(`document.querySelector('[aria-label="设置"]').click()`)
- await js("[...document.querySelectorAll('.preset-buttons button')].find(button=>button.textContent.includes('DeepSeek')).click()")
+ await js(`document.querySelector('[aria-label="模型服务"]').click()`)
+ await js("[...document.querySelectorAll('.remote-quick-presets button')].find(button=>button.textContent.includes('DeepSeek')).click()")
  assert.equal(await js("document.querySelector('input[type=url]').value"),'https://api.deepseek.com')
  assert.equal(await js("document.querySelector('input[list=settings-models]').value"),'deepseek-flash')
- assert.ok(await js("document.body.innerText.includes('保存并测试连接')"))
+ assert.ok(await js("document.body.innerText.includes('连接配置')&&document.body.innerText.includes('DeepSeek')"))
  await win.loadFile(path.resolve('dist/index.html'))
  await until(()=>js("!!document.querySelector('.agent-new')&&!document.querySelector('.agent-new').disabled"),'workspace restored after reload')
  const unauthorized=new BrowserWindow({show:false,webPreferences:{preload:path.resolve('dist-electron/preload/index.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false}})

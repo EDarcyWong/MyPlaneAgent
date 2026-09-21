@@ -39,6 +39,19 @@ test('resumes a persisted partial download using immutable revision and validate
  assert.equal(queue.list()[0].status,'paused');queue.action(id,'resume');await until(()=>queue.list()[0].status==='completed')
  assert.deepEqual(fs.readFileSync(target),body);assert.equal(completed[0].id,id);assert.equal(fs.existsSync(`${target}.${id}.part`),false)
 })
+test('download lifecycle logs operations without exposing authorization headers',async t=>{
+ const root=sandbox(t),body=Buffer.from('GGUF-audited-download'),logs=[]
+ const request=async(_url,options)=>{assert.equal(options.headers.Authorization,'Bearer hf_private_download_token');return new Response(body,{headers:{'content-length':String(body.length)}})}
+ const queue=new LocalAiDownloads(path.join(root,'queue.json'),()=>path.join(root,'models'),()=>({Authorization:'Bearer hf_private_download_token'}),()=>{},request,(level,message)=>logs.push(`${level} ${message}`));t.after(()=>queue.dispose())
+ queue.enqueue('org/audited-model',[{file:'audited.gguf',size:body.length,type:'file',format:'GGUF',quantization:'',revision,sha256:sha(body)}])
+ await until(()=>queue.list()[0].status==='completed')
+ const output=logs.join('\n')
+ assert.match(output,/已加入下载队列/)
+ assert.match(output,/开始下载/)
+ assert.match(output,/正在校验下载/)
+ assert.match(output,/下载完成/)
+ assert.doesNotMatch(output,/hf_private_download_token|Authorization|Bearer/)
+})
 test('a server ignoring Range restarts the file instead of corrupting it',async t=>{
  const root=sandbox(t),target=path.join(root,'model.gguf'),file=path.join(root,'queue.json'),body=Buffer.from('GGUF-full-content'),id='restart-test'
  fs.writeFileSync(`${target}.${id}.part`,'old bytes');fs.writeFileSync(file,JSON.stringify([{id,repoId:'org/model',file:'model.gguf',revision,sha256:sha(body),target,status:'paused',received:9,total:body.length,speed:0,error:'',createdAt:new Date().toISOString()}]))

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch,type UnwrapNestedRefs} from 'vue'
-import {FolderOpened,FolderAdd,EditPen,VideoPause,Check,Close,Document,Cpu,ArrowRight,ArrowDown,ArrowUp,Search,Tools,Grid,InfoFilled,ChatDotRound,Download,MoreFilled,Delete,Setting} from '@element-plus/icons-vue'
+import {FolderOpened,FolderAdd,EditPen,VideoPause,Check,Close,Document,Cpu,ArrowRight,ArrowDown,ArrowUp,Search,Tools,Grid,InfoFilled,ChatDotRound,Download,MoreFilled,Delete,Setting,Connection} from '@element-plus/icons-vue'
 import {ElMessageBox,ElDropdown,ElDropdownMenu,ElDropdownItem,ElDialog} from 'element-plus'
 import AgentProjectActions from './AgentProjectActions.vue'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
@@ -11,6 +11,7 @@ import AiMarkdown from '../AiMarkdown.vue'
 import {messageQueues} from './message-queue'
 import WorkspaceChatMessages from './WorkspaceChatMessages.vue'
 import AgentCodePreview from './AgentCodePreview.vue'
+import AgentValidationDetail from './AgentValidationDetail.vue'
 import AgentFileTooltip from './AgentFileTooltip.vue'
 import type {useLocalAiStudio} from './useLocalAiStudio'
 import type {AgentTask,AgentTaskSummary,AgentMode,AgentEvent,AgentProject,AgentApprovalMode,AgentFilePreview} from '../../electron/shared/local-ai-agent'
@@ -23,8 +24,11 @@ const selectionPreference='myplane.local-ai.workspace.selection'
 const emit=defineEmits<{state:[value:string]}>()
 const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
 const tasks=ref<AgentTaskSummary[]>([]),task=ref<AgentTask>(),workspace=ref<{path:string;token:string}>(),mode=ref<AgentMode>('general'),model=ref(props.model),prompt=ref(''),maxSteps=ref(20),fastMode=ref(true),tokenBudget=ref(0),approvalMode=ref<AgentApprovalMode>('ask'),auditLog=ref(''),busy=ref(false),error=ref(''),loading=ref(true),historyOpen=ref(false),scroller=ref<HTMLElement>(),follow=ref(true)
+const auditOpen=ref(false),auditLoading=ref(false)
+let auditRequest=0
 const projects=ref<AgentProject[]>([]),projectId=ref('')
 const project=computed(()=>projects.value.find(p=>p.id===projectId.value))
+const webEnabled=computed(()=>!!project.value&&project.value.webAccess!=='disabled')
 const visibleTasks=computed(()=>projectId.value?tasks.value.filter(t=>t.projectId===projectId.value):tasks.value)
 const collapsedGroups=ref(new Set<string>())
 type HistoryItem={id:string;kind:'agent'|'chat';projectId?:string;title:string;updatedAt:string;status:string}
@@ -65,7 +69,7 @@ async function removeEntry(item:HistoryItem){
  try{
   await ElMessageBox.confirm(`删除“${item.title}”？任务记录和审计记录将一并删除，项目文件不会被删除。`,'删除会话',{type:'warning',confirmButtonText:'删除',cancelButtonText:'取消'})
   await api('agentDelete',{id:item.id});tasks.value=tasks.value.filter(saved=>saved.id!==item.id)
-  if(task.value?.id===item.id){task.value=undefined;prompt.value='';auditLog.value='';rememberSelection()}
+  if(task.value?.id===item.id){auditRequest++;task.value=undefined;prompt.value='';auditLog.value='';auditOpen.value=false;auditLoading.value=false;rememberSelection()}
  }catch(e){if(e!=='cancel'&&e!=='close')error.value=String(e)}
 }
 async function renameChat(item:HistoryItem){const saved=ch.sessions.find(session=>session.id===item.id);if(saved)await ch.renameSession(saved)}
@@ -84,13 +88,57 @@ const performanceWarning=computed(()=>{
  return issues.length?issues.join('；')+'。这会显著拖慢 Agent 的每轮推理，修改加载参数后需重新加载模型。':''
 })
 const performanceWarningDismissed=ref(false),artifactLimits=ref<Record<string,number>>({})
-const approvalHint=computed(()=>approvalMode.value==='full'?'工具自动执行，项目只读限制仍然有效':approvalMode.value==='auto'?'普通工作区文件修改自动批准；命令和外部工具仍需确认':'修改文件、命令和外部工具会请求确认')
+const approvalHint=computed(()=>approvalMode.value==='unrestricted'?'完全控制：文件、命令和外部工具均自动执行，不再请求确认':approvalMode.value==='full'?'工作区文件自动修改；命令仅在容器沙盒可用时自动，MCP 和未隔离工具仍需确认':approvalMode.value==='auto'?'普通工作区文件修改自动批准；命令和外部工具仍需确认':'修改文件、命令和外部工具会请求确认')
 const restoredEvents=computed(()=>new Set((task.value?.events||[]).filter(event=>event.tool==='restore_change'&&typeof event.args?.eventId==='string').map(event=>String(event.args!.eventId))))
 const eventPaths=(event:AgentEvent)=>event.preview?.changes?.map(change=>change.path)||[String(event.preview?.path||event.args?.path||'')].filter(Boolean)
 // Older saved previews use null for a file that did not exist yet.
 const firstChangedLine=(before:string|null|undefined,after:string|undefined)=>{if(before==null)return 1;const previous=before.replace(/\r\n?/g,'\n').split('\n'),next=(after||'').replace(/\r\n?/g,'\n').split('\n'),length=Math.max(previous.length,next.length);for(let index=0;index<length;index++)if(previous[index]!==next[index])return index+1;return 1}
 const eventChanges=(event:AgentEvent)=>event.preview?.changes?.map(change=>({path:change.path,line:firstChangedLine(change.before,change.after)}))||(event.preview?.path?[{path:event.preview.path,line:firstChangedLine(event.preview.before,event.preview.after)}]:eventPaths(event).map(path=>({path,line:1})))
 const compactElapsed=(milliseconds:number)=>{const seconds=Math.max(0,Math.round(milliseconds/1000));return seconds>=3600?`${Math.floor(seconds/3600)}小时${Math.floor(seconds%3600/60)}分钟`:seconds>=60?`${Math.floor(seconds/60)}分${seconds%60}秒`:`${seconds}秒`}
+function parsedValidationOutput(event:AgentEvent){if(!event.output)return {} as Record<string,unknown>;try{const value=JSON.parse(event.output);return value&&typeof value==='object'?value as Record<string,unknown>:{} as Record<string,unknown>}catch{return {} as Record<string,unknown>}}
+function validationPurpose(event:AgentEvent){
+ const command=String(event.preview?.command||event.args?.command||''),action=String(event.args?.action||event.args?.script||''),target=String(event.args?.target||''),checker=String(event.args?.checker||''),evidence=[command,action,target,checker].join(' ')
+ if(/gradle\.properties/i.test(evidence))return {title:'Gradle 配置',kind:'环境配置',success:'已读取并检查项目级与用户级 Gradle 配置。'}
+ if(/\bjava(?:c)?\s+(?:-version|--version)|JAVA_HOME|java\.home/i.test(evidence))return {title:'Java 开发环境',kind:'运行环境',success:'Java 版本、JAVA_HOME 和运行路径检查已完成。'}
+ if(/\b(?:gradlew?|gradle)\b.*\btest\b/i.test(evidence))return {title:'Gradle 测试',kind:'自动测试',success:'Gradle 测试已完成，未报告失败。'}
+ if(/\b(?:mvnw?|maven)\b.*\btest\b/i.test(evidence))return {title:'Maven 测试',kind:'自动测试',success:'Maven 测试已完成，未报告失败。'}
+ if(/\bpytest\b/i.test(evidence))return {title:target?`Python 测试 · ${target.split(/[\\/]/).at(-1)}`:'Python 测试',kind:'自动测试',success:'Python 测试已完成，未报告失败。'}
+ if(/vue-tsc|(?:^|\s)tsc(?:\s|$)|type.?check/i.test(evidence))return {title:'类型检查',kind:'静态检查',success:'类型检查已完成，未发现阻断问题。'}
+ if(/\b(?:eslint|stylelint|lint)\b/i.test(evidence))return {title:'代码规范检查',kind:'静态检查',success:'代码规范检查已完成，未发现阻断问题。'}
+ if(/\b(?:npm|pnpm|yarn)\b.*\btest\b/i.test(evidence))return {title:'项目测试',kind:'自动测试',success:'项目测试已完成，未报告失败。'}
+ if(/\b(?:npm|pnpm|yarn)\b.*\bbuild\b|\bbuild\b/i.test(action))return {title:'项目构建',kind:'构建验证',success:'项目构建已完成。'}
+ if(event.tool==='get_diagnostics')return {title:'代码诊断',kind:'静态检查',success:'代码诊断已完成，未发现阻断问题。'}
+ if(event.tool==='run_test_case')return {title:target?`单项测试 · ${target.split(/[\\/]/).at(-1)}`:'单项测试',kind:'自动测试',success:'指定测试已完成，未报告失败。'}
+ if(event.tool==='run_test')return {title:action?`项目脚本 · ${action}`:'项目脚本验证',kind:'自动验证',success:'项目验证脚本已正常完成。'}
+ if(event.tool==='build_project')return {title:action?`项目${action==='build'?'构建':'验证'} · ${action}`:'构建 / 验证项目',kind:'构建验证',success:'项目构建或验证步骤已正常完成。'}
+ return {title:'命令检查',kind:'自定义验证',success:'命令已正常完成；完整命令和输出可在详情中查看。'}
+}
+function validationResult(event:AgentEvent){
+ const parsed=parsedValidationOutput(event),exitCode=event.audit?.exitCode??(typeof parsed.exitCode==='number'?parsed.exitCode:undefined),purpose=validationPurpose(event)
+ const state=event.status==='rejected'?'skipped':event.status==='completed'&&exitCode===0?'passed':event.status==='completed'?'completed':'failed'
+ const failureAnalysis=parsed.failureAnalysis&&typeof parsed.failureAnalysis==='object'?parsed.failureAnalysis as Record<string,unknown>:undefined
+ const failureSummary=typeof failureAnalysis?.summary==='string'?failureAnalysis.summary:typeof event.execution?.failure?.message==='string'?event.execution.failure.message:typeof parsed.error==='string'?parsed.error:''
+ const summary=state==='passed'?purpose.success:state==='skipped'?'用户未批准，本项未执行。':state==='completed'?'验证已执行，但没有可判定的退出状态。':failureSummary||`验证未通过${exitCode===undefined?'':`（退出码 ${exitCode}）`}。`
+ const command=String(event.preview?.command||event.args?.command||'').trim(),parameters=command?'':event.args?JSON.stringify(event.args,null,2):''
+ return {id:event.id,...purpose,state,status:state==='passed'?'通过':state==='skipped'?'未执行':state==='completed'?'已完成':'未通过',summary,exitCode,duration:event.audit?.durationMs,command,parameters,raw:output(event)}
+}
+function groupValidationResults(items:ReturnType<typeof validationResult>[]){
+ const rows:{id:string;title:string;kind:string;state:string;status:string;summary:string;exitCode?:number;duration?:number;count:number;items:ReturnType<typeof validationResult>[]}[]=[]
+ for(const item of items){
+  const previous=rows.at(-1)
+  if(item.state==='passed'&&previous?.state==='passed'&&previous.title===item.title){
+   previous.items.push(item);previous.count=previous.items.length;previous.duration=previous.items.reduce((total,current)=>total+(current.duration||0),0);previous.summary=`连续 ${previous.count} 次${item.title}均已通过。`;previous.exitCode=undefined
+  }else rows.push({...item,count:1,items:[item]})
+ }
+ return rows
+}
+function summaryCoverage(text:string){
+ const labels=text.split(/\r?\n/).map(line=>line.replace(/^\s*(?:#{1,6}\s*|[-+*]\s+|\d+[.)]\s+)/,'').replace(/[*_`]/g,'').trim().toLowerCase())
+ return {
+  files:labels.some(line=>/^(?:(?:修改|变更|改动|已编辑|涉及|生成)(?:的)?文件|文件(?:修改|变更|改动|清单))(?:\s*[:：]|\s*[（(—-]|\s*$)/.test(line)),
+  validation:labels.some(line=>/^(?:(?:验证|测试|检查)(?:结果|情况|结论)|构建(?:结果|情况))(?:\s*[:：]|\s*[（(—-]|\s*$)/.test(line))
+ }
+}
 const resultGroups=computed(()=>{
  const groups:{user:AgentEvent;events:AgentEvent[]}[]=[],artifacts=new Map((task.value?.artifacts||[]).map(item=>[item.path,item]))
  for(const event of task.value?.events||[]){if(event.kind==='user'&&!event.steering)groups.push({user:event,events:[]});else if(groups.length)groups.at(-1)!.events.push(event)}
@@ -102,9 +150,16 @@ const resultGroups=computed(()=>{
    for(const change of eventChanges(event))if(!editsByPath.has(change.path))editsByPath.set(change.path,{event,...change,undoable:!!(event.preview?.changes?.length||event.preview?.path&&event.preview.after!==undefined)})
   }
   const paths=new Set(mutations.flatMap(event=>eventPaths(event)))
-  const validations=group.events.filter(event=>['build_project','run_test','run_test_case','get_diagnostics','run_command'].includes(event.tool||'')).map(event=>{let exitCode=event.audit?.exitCode;try{if(exitCode===undefined&&event.output)exitCode=JSON.parse(event.output).exitCode}catch{}return {id:event.id,label:toolLabel(event.tool),detail:String(event.args?.action||event.args?.script||event.args?.target||event.args?.checker||event.args?.command||''),passed:event.status==='completed'&&exitCode===0&&event.execution?.verification?.status!=='unverified',exitCode,duration:event.audit?.durationMs}})
+  const validations=group.events.filter(event=>['build_project','run_test','run_test_case','get_diagnostics','run_command'].includes(event.tool||'')).map(validationResult)
+  const validationRows=groupValidationResults(validations)
+  const validationSummary=validations.length?validations.some(item=>item.state==='failed')?`${validations.filter(item=>item.state==='failed').length} 项未通过，请展开详情查看原因`:validations.every(item=>item.state==='passed')?`${validations.length} 项验证全部通过`:`${validations.filter(item=>item.state==='passed').length} 项通过，${validations.filter(item=>item.state!=='passed').length} 项需留意`:''
   const last=group.events.at(-1),fallbackEnd=index===groups.length-1?Date.parse(task.value?.runCompletedAt||task.value?.updatedAt||group.user.createdAt):Date.parse(groups[index+1].user.createdAt),duration=group.user.durationMs??Math.max(0,(last?.audit?.endedAt?Date.parse(last.audit.endedAt):fallbackEnd)-Date.parse(group.user.createdAt))
-  return {id:group.user.id,user:group.user,summary:[...group.events].reverse().find(event=>event.kind==='assistant'&&event.text.trim())?.text||'任务已完成。',artifacts:[...paths].map(path=>{const item=artifacts.get(path);return item?{...item,line:changedLines.get(path)||1}:undefined}).filter((item):item is NonNullable<typeof item>=>!!item),validations,edits:[...editsByPath.values()],duration}
+  const summary=[...group.events].reverse().find(event=>event.kind==='assistant'&&event.text.trim())?.text||'任务已完成。',coverage=summaryCoverage(summary)
+  const groupArtifacts=[...paths].map(path=>{const item=artifacts.get(path);return item?{...item,line:changedLines.get(path)||1}:undefined}).filter((item):item is NonNullable<typeof item>=>!!item),edits=[...editsByPath.values()]
+  const referenceLines=new Map<string,number>()
+  for(const event of group.events)for(const path of eventPaths(event))if(path)referenceLines.set(path,changedLines.get(path)||Number(event.args?.line)||Number(event.args?.startLine)||referenceLines.get(path)||1)
+  for(const item of [...groupArtifacts,...edits])referenceLines.set(item.path,item.line)
+  return {id:group.user.id,user:group.user,summary,coverage,fileReferences:[...referenceLines].map(([path,line])=>({path,line})),artifacts:groupArtifacts,validations,validationRows,validationSummary,edits,duration}
  })
 })
 const settledGroups=computed(()=>task.value?.status==='completed'?resultGroups.value:resultGroups.value.slice(0,-1))
@@ -121,6 +176,7 @@ const completedPlanSteps=computed(()=>currentPlan.value.filter(item=>item.status
 const artifactLimit=(id:string)=>artifactLimits.value[id]||3
 function showMoreArtifacts(id:string){artifactLimits.value={...artifactLimits.value,[id]:artifactLimit(id)+3}}
 const filePreviewOpen=ref(false),filePreviewExpanded=ref(false),filePreviewLoading=ref(false),filePreviewError=ref(''),filePreviewLine=ref(1),filePreview=ref<AgentFilePreview>()
+const validationDetail=ref<ReturnType<typeof groupValidationResults>[number]>(),validationDetailExpanded=ref(false)
 type TooltipAnchor={x:number;y:number}
 const fileTooltipOpen=ref(false),fileTooltipLoading=ref(false),fileTooltipError=ref(''),fileTooltipLine=ref(1),fileTooltip=ref<AgentFilePreview>(),fileTooltipAnchor=ref<TooltipAnchor>()
 let unsubscribe:(()=>void)|undefined,disposed=false,selection=0,tooltipTimer:ReturnType<typeof setTimeout>|undefined,tooltipHideTimer:ReturnType<typeof setTimeout>|undefined,tooltipRequest=0
@@ -145,7 +201,7 @@ function closeSettings(){settingsOpen.value=false}
 function focusSettingsTrigger(){settingsTrigger.value?.focus()}
 const pending=computed(()=>task.value?.events.find(e=>e.status==='waiting'))
 const statusLabel=(status:string)=>({running:'正在执行',waiting:'等待确认',completed:'已完成',stopped:'已停止',failed:'执行失败'}[status]||status)
-const toolLabel=(name?:string)=>({inspect_build:'检查构建配置',build_project:'构建 / 验证项目',reconcile_execution:'核对中断步骤',read_tool_result:'读取工具原文',restore_change:'恢复文件',git_status:'Git 状态',git_diff:'Git 差异',git_log:'Git 历史',apply_patch:'多文件补丁',run_test:'运行验证',read_history:'查阅任务历史',set_plan:'更新任务计划',list_files:'浏览文件',search_files:'检索项目',read_file:'读取代码 / 文本',read_document:'读取文档',write_file:'写入文件',replace_text:'修改文件',create_document:'生成文档',create_spreadsheet:'生成表格',run_command:'运行命令'}[name||'']||name)
+const toolLabel=(name?:string)=>({web_search:'搜索互联网',web_fetch:'读取网页',inspect_build:'检查构建配置',build_project:'构建 / 验证项目',reconcile_execution:'核对中断步骤',read_tool_result:'读取工具原文',restore_change:'恢复文件',git_status:'Git 状态',git_diff:'Git 差异',git_log:'Git 历史',apply_patch:'多文件补丁',run_test:'运行验证',read_history:'查阅任务历史',set_plan:'更新任务计划',list_files:'浏览文件',search_files:'检索项目',read_file:'读取代码 / 文本',read_document:'读取文档',write_file:'写入文件',replace_text:'修改文件',create_document:'生成文档',create_spreadsheet:'生成表格',run_command:'运行命令'}[name||'']||name)
 const eventCommand=(event:AgentEvent)=>{const command=event.preview?.command??event.args?.command;return typeof command==='string'?command.replace(/\s+/g,' ').trim():''}
 const inlinePreview=(value:string,limit=88)=>{const text=value.replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').trim();return text.length>limit?text.slice(0,limit)+'…':text}
 const toolArgumentPreview=(event:AgentEvent)=>{
@@ -198,13 +254,22 @@ async function resolveExecution(eventId:string,outcome:'completed'|'not-applied'
  try{receive(await api('agentResolveExecution',{id:task.value.id,eventId,outcome,note:outcome==='completed'?'用户已核对实际结果，确认完成':'用户已核对实际状态，确认未执行'}))}catch(e){error.value=String(e)}finally{busy.value=false}
 }
 async function restoreChange(eventId:string){if(!task.value||locked.value)return;busy.value=true;try{receive(await api('agentRestore',{id:task.value.id,eventId}))}catch(e){error.value=String(e)}finally{busy.value=false}}
-async function showAudit(){if(!task.value)return;try{auditLog.value=await api('agentAudit',{id:task.value.id})}catch(e){error.value=String(e)}}
-async function previewFile(path:string,line=1){if(!task.value)return;filePreviewOpen.value=true;filePreviewExpanded.value=false;filePreviewLine.value=Math.max(1,line);filePreviewLoading.value=true;filePreviewError.value='';filePreview.value=undefined;try{filePreview.value=await api('agentPreview',{id:task.value.id,path})}catch(e){filePreviewError.value=String(e).replace(/^Error:\s*(?:Error invoking remote method '[^']+':\s*)?(?:Error:\s*)?/,'')}finally{filePreviewLoading.value=false}}
+async function toggleAudit(){
+ if(auditOpen.value){auditOpen.value=false;return}
+ if(!task.value||auditLoading.value)return
+ if(auditLog.value){auditOpen.value=true;return}
+ const taskId=task.value.id,revision=++auditRequest
+ auditLoading.value=true
+ try{const value=await api('agentAudit',{id:taskId});if(revision!==auditRequest||task.value?.id!==taskId)return;auditLog.value=value;auditOpen.value=true}catch(e){if(revision===auditRequest)error.value=String(e)}finally{if(revision===auditRequest)auditLoading.value=false}
+}
+async function previewFile(path:string,line=1){if(!task.value)return;validationDetail.value=undefined;validationDetailExpanded.value=false;filePreviewOpen.value=true;filePreviewExpanded.value=false;filePreviewLine.value=Math.max(1,line);filePreviewLoading.value=true;filePreviewError.value='';filePreview.value=undefined;try{filePreview.value=await api('agentPreview',{id:task.value.id,path})}catch(e){filePreviewError.value=String(e).replace(/^Error:\s*(?:Error invoking remote method '[^']+':\s*)?(?:Error:\s*)?/,'')}finally{filePreviewLoading.value=false}}
+function showValidationDetail(result:ReturnType<typeof groupValidationResults>[number]){filePreviewOpen.value=false;filePreviewExpanded.value=false;validationDetail.value=result;validationDetailExpanded.value=false}
+function closeValidationDetail(){validationDetail.value=undefined;validationDetailExpanded.value=false}
 function showFileTooltip(path:string,line:number,event:MouseEvent){clearTimeout(tooltipTimer);clearTimeout(tooltipHideTimer);const taskId=task.value?.id,request=++tooltipRequest;fileTooltipAnchor.value={x:event.clientX,y:event.clientY};fileTooltipLine.value=Math.max(1,line);tooltipTimer=setTimeout(async()=>{if(!taskId||request!==tooltipRequest)return;fileTooltipOpen.value=true;fileTooltipLoading.value=true;fileTooltipError.value='';fileTooltip.value=undefined;try{const preview=await api('agentPreview',{id:taskId,path});if(request===tooltipRequest)fileTooltip.value=preview}catch(e){if(request===tooltipRequest)fileTooltipError.value=String(e).replace(/^Error:\s*(?:Error invoking remote method '[^']+':\s*)?(?:Error:\s*)?/,'')}finally{if(request===tooltipRequest)fileTooltipLoading.value=false}},280)}
 function keepFileTooltip(){clearTimeout(tooltipHideTimer)}
 function scheduleHideFileTooltip(){clearTimeout(tooltipHideTimer);tooltipHideTimer=setTimeout(hideFileTooltip,220)}
 function hideFileTooltip(){clearTimeout(tooltipTimer);clearTimeout(tooltipHideTimer);tooltipRequest++;fileTooltipOpen.value=false;fileTooltipLoading.value=false}
-function toggleFilePreview(){if(filePreviewOpen.value){filePreviewOpen.value=false;filePreviewExpanded.value=false}else if(filePreview.value)filePreviewOpen.value=true}
+function toggleFilePreview(){if(filePreviewOpen.value){filePreviewOpen.value=false;filePreviewExpanded.value=false}else if(filePreview.value){validationDetail.value=undefined;validationDetailExpanded.value=false;filePreviewOpen.value=true}}
 async function refresh(){const [savedTasks,savedProjects]=await Promise.all([api('agentTasks'),api('agentProjects')]);tasks.value=savedTasks;projects.value=savedProjects}
 function rememberProject(){try{localStorage.setItem(projectPreference,projectId.value)}catch{/* Storage may be unavailable. */}}
 function receive(next:AgentTask){if(disposed)return;const index=tasks.value.findIndex(t=>t.id===next.id);const {events,plan,artifacts,...summary}=next;if(index>=0)tasks.value.splice(index,1);tasks.value.unshift(summary);if(task.value?.id===next.id){task.value=next;void scroll()}}
@@ -244,8 +309,13 @@ async function projectCommand(id:string,command:string){
   projects.value=projects.value.map(project=>project.id===id?updated:project)
  }catch(e){if(e!=='cancel'&&e!=='close')error.value=String(e)}
 }
+async function toggleProjectWeb(){
+ const item=project.value;if(!item||locked.value)return
+ busy.value=true;error.value=''
+ try{const updated=await api('agentUpdateProject',{id:item.id,policy:item.policy||'confirm',webAccess:webEnabled.value?'disabled':'allow',webAllowSyntheticIp:item.webAllowSyntheticIp!==false,autoWritePaths:[...(item.autoWritePaths||[])],memory:item.memory||''});projects.value=projects.value.map(project=>project.id===updated.id?updated:project)}catch(e){if(e!=='cancel'&&e!=='close')error.value=String(e)}finally{busy.value=false}
+}
 async function selectProject(id:string){if(locked.value)return;projectId.value=id;engine.value=id?'agent':'chat';mode.value='general';collapsedGroups.value.delete(id);workspace.value=undefined;rememberProject();await newTask()}
-async function open(id:string){if(busy.value||active.value&&task.value?.id!==id)return;const revision=++selection;try{const found=await api('agentTask',{id});if(revision!==selection)return;task.value=found;engine.value='agent';sourceSessionId.value=undefined;ch.images=[];projectId.value=found.projectId||'';rememberProject();model.value=found.model;mode.value=found.mode;fastMode.value=found.fastMode!==false;tokenBudget.value=found.tokenBudget||0;approvalMode.value=found.approvalMode||'ask';auditLog.value='';maxSteps.value=found.maxSteps;prompt.value='';error.value='';historyOpen.value=false;follow.value=true;rememberSelection();void scroll()}catch(e){error.value=String(e)}}
+async function open(id:string){if(busy.value||active.value&&task.value?.id!==id)return;const revision=++selection;try{const found=await api('agentTask',{id});if(revision!==selection)return;auditRequest++;task.value=found;engine.value='agent';sourceSessionId.value=undefined;ch.images=[];projectId.value=found.projectId||'';rememberProject();model.value=found.model;mode.value=found.mode;fastMode.value=found.fastMode!==false;tokenBudget.value=found.tokenBudget||0;approvalMode.value=found.approvalMode||'ask';auditLog.value='';auditOpen.value=false;auditLoading.value=false;maxSteps.value=found.maxSteps;prompt.value='';error.value='';historyOpen.value=false;follow.value=true;rememberSelection();void scroll()}catch(e){error.value=String(e)}}
 async function newTask(){
  if(locked.value)return
  selection++;if(mode.value==='chat')engine.value='chat'
@@ -323,7 +393,7 @@ watch([()=>task.value?.status,()=>ch.sending],([status,sending],[previousStatus,
 watch([active,()=>ch.sending,busy,loading,steeringItem,()=>task.value?.status,queueKey],()=>{void drainQueue()},{flush:'post'})
 async function compact(){if(engine.value==='chat'){await ch.compactSession();return}if(!task.value||locked.value)return;busy.value=true;error.value='';try{receive(await api('agentCompact',{id:task.value.id}))}catch(e){error.value=String(e)}finally{busy.value=false}}
 async function stop(){if(queueKey.value)(messageQueues[queueKey.value]??={items:[],paused:false}).paused=true;if(engine.value==='chat'){await ch.stop();return}if(!task.value)return;try{await api('agentStop',{id:task.value.id})}catch(e){error.value=String(e)}}
-async function approve(approved:boolean){if(!task.value||!pending.value||busy.value)return;busy.value=true;try{await api('agentApprove',{id:task.value.id,eventId:pending.value.id,approved})}catch(e){error.value=String(e)}finally{busy.value=false}}
+async function approve(approved:boolean,scope:'once'|'similar'='once'){if(!task.value||!pending.value||busy.value)return;busy.value=true;try{await api('agentApprove',{id:task.value.id,eventId:pending.value.id,approved,scope})}catch(e){error.value=String(e)}finally{busy.value=false}}
 async function reveal(path:string){if(!task.value)return;try{await api('agentReveal',{id:task.value.id,path})}catch(e){error.value=String(e)}}
 watch(scroller,value=>{ch.scroller=value})
 watch(()=>ch.sending,()=>{void scroll()})
@@ -332,7 +402,7 @@ watch([()=>props.model,locked],([value])=>{
 },{flush:'post'})
 watch(performanceWarning,()=>{performanceWarningDismissed.value=false})
 watch([()=>task.value?.id,()=>task.value?.status],()=>{artifactLimits.value={}})
-watch(()=>task.value?.id,()=>{filePreviewOpen.value=false;filePreviewExpanded.value=false;filePreviewLine.value=1;filePreview.value=undefined;filePreviewError.value='';hideFileTooltip()})
+watch(()=>task.value?.id,()=>{auditRequest++;auditOpen.value=false;auditLoading.value=false;filePreviewOpen.value=false;filePreviewExpanded.value=false;filePreviewLine.value=1;filePreview.value=undefined;filePreviewError.value='';validationDetail.value=undefined;validationDetailExpanded.value=false;hideFileTooltip()})
 watch([model,()=>ch.settings.source,()=>ch.runtime?.state,()=>ch.runtime?.modelName,locked],()=>{
  if(!locked.value)model.value=currentModelSelection(model.value,ch.settings.source,ch.runtime)
 })
@@ -351,8 +421,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
    <nav class="agent-project-list" aria-label="项目与会话">
     <section v-for="group in taskGroups" :key="group.id" class="agent-project-group" :data-project-id="group.id">
      <header class="agent-group-header" :class="{selected:group.id&&projectId===group.id}">
-      <button class="agent-group-toggle" :aria-label="`${collapsedGroups.has(group.id)?'展开':'收起'}${group.name}`" :aria-expanded="!collapsedGroups.has(group.id)" :aria-controls="'agent-group-'+(group.id||'standalone')" @click="toggleGroup(group.id)"><ArrowRight v-if="collapsedGroups.has(group.id)"/><ArrowDown v-else/></button>
-      <button class="agent-project-item" :class="{selected:group.id&&projectId===group.id}" :disabled="locked||!group.available" :title="group.workspace||group.name" @click="selectProject(group.id)"><FolderOpened v-if="group.id"/><ChatDotRound v-else/><span><strong>{{group.name}}</strong></span><small>{{group.tasks.length}}</small></button>
+      <button class="agent-project-item" :class="{selected:group.id&&projectId===group.id}" :title="`${collapsedGroups.has(group.id)?'展开':'收起'}${group.name}`" :aria-label="`${collapsedGroups.has(group.id)?'展开':'收起'}${group.name}`" :aria-expanded="!collapsedGroups.has(group.id)" :aria-controls="'agent-group-'+(group.id||'standalone')" @click="toggleGroup(group.id)"><FolderOpened v-if="group.id"/><ChatDotRound v-else/><span><strong>{{group.name}}</strong></span><small>{{group.tasks.length}}</small></button>
       <AgentProjectActions v-if="group.id&&group.available" :project="group" :disabled="locked" @command="command=>projectCommand(group.id,command)"/>
      </header>
      <div v-show="!collapsedGroups.has(group.id)" :id="'agent-group-'+(group.id||'standalone')" class="agent-task-list">
@@ -367,7 +436,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
    </nav>
    <footer><Check/><span>记录保存在本机</span></footer>
   </aside>
-  <section class="agent-main" :style="{'--composer-height':composerHeight+'px'}" :class="{'is-welcome':!hasConversation,'preview-expanded':filePreviewOpen&&filePreviewExpanded}">
+  <section class="agent-main" :style="{'--composer-height':composerHeight+'px'}" :class="{'is-welcome':!hasConversation,'preview-expanded':filePreviewOpen&&filePreviewExpanded||!!validationDetail&&validationDetailExpanded}">
    <header class="agent-toolbar">
     <button class="agent-icon agent-history-toggle" aria-label="项目与会话" title="项目与会话" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/></button>
     <div class="workspace-heading"><strong :title="currentConversation?.title">{{hasConversation?currentConversation?.title:'新会话'}}</strong><button class="agent-workspace-picker" :disabled="locked" :title="workspacePath||'可选：选择项目文件夹'" @click="chooseWorkspace"><FolderOpened/><span>{{workspaceName}}</span><ArrowDown/></button></div>
@@ -389,7 +458,26 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
     <WorkspaceChatMessages v-else-if="chatVisible" :messages="ch.messages" :sending="ch.sending" @copy="ch.copy" @regenerate="ch.send(true)"/>
     <div v-else-if="task" class="agent-events">
      <section v-if="unresolvedExecutions.length" class="agent-error agent-recovery" role="status"><strong>这些步骤的执行结果需要核对</strong><p>可继续只读检查。确认实际结果后，再恢复写入或命令执行。</p><div v-for="operation in unresolvedExecutions" :key="operation.id"><p>{{toolLabel(operation.tool)}} · {{operation.execution?.failure?.message}}</p><pre>{{JSON.stringify(operation.args,null,2)}}</pre><button class="agent-secondary" :disabled="locked" @click="resolveExecution(operation.id,'completed')">已核对完成</button><button class="agent-secondary" :disabled="locked" @click="resolveExecution(operation.id,'not-applied')">确认未执行</button></div></section>
-     <template v-if="settledGroups.length"><article v-for="group in settledGroups" :key="group.id" class="agent-turn-group"><section class="agent-turn-user"><div v-if="group.user.images?.length" class="message-images"><img v-for="image in group.user.images" :key="image.dataUrl" :src="image.dataUrl" :alt="image.name"/></div><AiMarkdown v-if="group.user.text" :text="group.user.text"/></section><section class="agent-result"><header><strong>用时{{compactElapsed(group.duration)}}</strong></header><section><h3>问题总结</h3><AiMarkdown :text="group.summary"/></section><section v-if="group.artifacts.length" class="agent-file-table"><header><h3>修改文件</h3><small>{{group.artifacts.length}} 个</small></header><div class="agent-result-files"><button v-for="artifact in group.artifacts.slice(0,artifactLimit(group.id))" :key="artifact.path" @mouseenter="showFileTooltip(artifact.path,artifact.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(artifact.path,artifact.line)"><Document/><span><strong>{{artifact.path}}</strong><small>第 {{artifact.line}} 行 · 点击预览</small></span><ArrowRight/></button></div><button v-if="artifactLimit(group.id)<group.artifacts.length" class="agent-artifacts-more" @click="showMoreArtifacts(group.id)">再显示 3 个文件</button></section><section><h3>验证结果</h3><div v-if="group.validations.length" class="agent-validation-list"><div v-for="result in group.validations" :key="result.id" :class="{failed:!result.passed}"><Check v-if="result.passed"/><Close v-else/><span><strong>{{result.label}}</strong><small>{{result.detail||'已执行'}}<template v-if="result.exitCode!==undefined"> · 退出码 {{result.exitCode}}</template><template v-if="result.duration!==undefined"> · {{(result.duration/1000).toFixed(1)}} 秒</template></small></span></div></div><p v-else class="agent-result-empty">未运行自动验证。</p></section><section v-if="group.edits.length" class="agent-file-table"><header><h3>已编辑文件</h3><small>{{group.edits.length}} 个</small></header><div class="agent-edit-list"><div v-for="operation in group.edits" :key="operation.event.id+operation.path"><button class="agent-edit-file" @mouseenter="showFileTooltip(operation.path,operation.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(operation.path,operation.line)"><span><strong>{{operation.path}}</strong><small>第 {{operation.line}} 行 · {{toolLabel(operation.event.tool)}} · {{new Date(operation.event.createdAt).toLocaleTimeString()}}</small></span></button><button :disabled="busy||!operation.undoable" :title="operation.undoable?'撤销本次修改':'缺少可撤销快照'" @click="restoreChange(operation.event.id)">撤销</button></div></div></section></section></article><footer v-if="task.status==='completed'" class="agent-result-audit"><button class="agent-secondary" @click="showAudit">查看审计记录</button><pre v-if="auditLog" class="agent-tool-output">{{auditLog}}</pre></footer></template>
+     <template v-if="settledGroups.length">
+      <article v-for="group in settledGroups" :key="group.id" class="agent-turn-group">
+       <section class="agent-turn-user"><div v-if="group.user.images?.length" class="message-images"><img v-for="image in group.user.images" :key="image.dataUrl" :src="image.dataUrl" :alt="image.name"/></div><AiMarkdown v-if="group.user.text" :text="group.user.text"/></section>
+       <section class="agent-result">
+        <header><strong>用时{{compactElapsed(group.duration)}}</strong></header>
+        <section><h3 v-if="!group.coverage.files&&!group.coverage.validation">问题总结</h3><AiMarkdown :text="group.summary" :files="group.fileReferences" @file-enter="showFileTooltip" @file-leave="scheduleHideFileTooltip" @file-click="previewFile"/></section>
+        <section v-if="group.artifacts.length&&!group.coverage.files" class="agent-file-table"><header><h3>修改文件</h3><small>{{group.artifacts.length}} 个</small></header><div class="agent-result-files"><button v-for="artifact in group.artifacts.slice(0,artifactLimit(group.id))" :key="artifact.path" @mouseenter="showFileTooltip(artifact.path,artifact.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(artifact.path,artifact.line)"><Document/><span><strong>{{artifact.path}}</strong><small>第 {{artifact.line}} 行 · 点击预览</small></span><ArrowRight/></button></div><button v-if="artifactLimit(group.id)<group.artifacts.length" class="agent-artifacts-more" @click="showMoreArtifacts(group.id)">再显示 3 个文件</button></section>
+        <section v-if="!group.coverage.validation" class="agent-validation-section">
+         <header><div><h3>验证结果</h3><p v-if="group.validationSummary">{{group.validationSummary}}</p></div></header>
+         <div v-if="group.validationRows.length" class="agent-validation-table-wrap"><table class="agent-validation-table"><thead><tr><th>验证项目</th><th>结果</th><th>说明</th><th>耗时</th><th>技术详情</th></tr></thead><tbody><tr v-for="result in group.validationRows" :key="result.id" :class="result.state"><td><strong>{{result.title}}<b v-if="result.count>1" class="agent-validation-count">× {{result.count}}</b></strong><small>{{result.kind}}</small></td><td><span class="agent-validation-status" :class="result.state"><Check v-if="result.state==='passed'"/><Close v-else-if="result.state==='failed'"/>{{result.status}}</span></td><td><p>{{result.summary}}</p><small v-if="result.exitCode!==undefined">退出码 {{result.exitCode}}</small></td><td>{{result.duration===undefined?'—':(result.duration/1000).toFixed(1)+' 秒'}}</td><td><button class="agent-validation-open" @click="showValidationDetail(result)">查看详情</button></td></tr></tbody></table></div>
+         <p v-else class="agent-result-empty">未运行自动验证。</p>
+        </section>
+        <section v-if="group.edits.length&&!group.coverage.files" class="agent-file-table"><header><h3>已编辑文件</h3><small>{{group.edits.length}} 个</small></header><div class="agent-edit-list"><div v-for="operation in group.edits" :key="operation.event.id+operation.path"><button class="agent-edit-file" @mouseenter="showFileTooltip(operation.path,operation.line,$event)" @mouseleave="scheduleHideFileTooltip" @click="previewFile(operation.path,operation.line)"><span><strong>{{operation.path}}</strong><small>第 {{operation.line}} 行 · {{toolLabel(operation.event.tool)}} · {{new Date(operation.event.createdAt).toLocaleTimeString()}}</small></span></button><button :disabled="busy||!operation.undoable" :title="operation.undoable?'撤销本次修改':'缺少可撤销快照'" @click="restoreChange(operation.event.id)">撤销</button></div></div></section>
+       </section>
+      </article>
+      <footer v-if="task.status==='completed'" class="agent-result-audit">
+       <button class="agent-secondary agent-audit-toggle" :disabled="auditLoading" :aria-expanded="auditOpen" @click="toggleAudit"><ArrowDown v-if="auditOpen"/><ArrowRight v-else/>{{auditLoading?'正在读取…':auditOpen?'收起审计记录':'查看审计记录'}}</button>
+       <pre v-if="auditOpen" class="agent-tool-output">{{auditLog||'暂无审计记录。'}}</pre>
+      </footer>
+     </template>
      <template v-if="task.status!=='completed'">
       <header class="agent-task-heading"><span class="agent-status" :class="task.status" role="status">{{statusLabel(task.status)}}<template v-if="task.mode!=='chat'"> · {{task.steps}} / {{task.maxSteps||'按预算'}} 轮</template></span></header>
       <article v-if="currentTurnUser" class="agent-event user">
@@ -415,7 +503,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
     </div>
    </div>
    <div ref="composerElement" class="agent-composer-wrap">
-   <div v-if="pending" class="agent-approval" role="region" aria-label="Agent 操作确认"><div><strong>{{pending.audit?.source.startsWith('mcp:')?'确认调用外部工具':pending.preview?.command?'确认执行命令':'确认文件修改'}}</strong><span :title="pending.preview?.command||pending.preview?.path">{{pending.audit?.source.startsWith('mcp:')?pending.text:pending.preview?.command||pending.preview?.path}}</span><small>{{pending.audit?.source.startsWith('mcp:')?'参数将发送给该服务，请查看上方服务名称和完整参数。':pending.preview?.command?'命令可访问目录外文件及网络，请查看上方完整命令。':'请查看上方待写入内容，批准后写入工作目录。'}}</small></div><button class="agent-secondary" :disabled="busy" @click="approve(false)"><Close/>拒绝</button><button class="agent-primary" :disabled="busy" @click="approve(true)"><Check/>批准执行</button></div>
+   <div v-if="pending" class="agent-approval" role="region" aria-label="Agent 操作确认"><div><strong>{{pending.audit?.source.startsWith('mcp:')?'确认调用外部工具':pending.preview?.command?'确认执行命令':'确认文件修改'}}</strong><span :title="pending.preview?.command||pending.preview?.path">{{pending.audit?.source.startsWith('mcp:')?pending.text:pending.preview?.command||pending.preview?.path}}</span><small>{{pending.audit?.source.startsWith('mcp:')?'参数将发送给该服务，请查看上方服务名称和完整参数。':pending.preview?.command?'命令可访问目录外文件及网络，请查看上方完整命令。':'请查看上方待写入内容，批准后写入工作目录。'}}</small></div><button class="agent-secondary" :disabled="busy" @click="approve(false)"><Close/>拒绝</button><button v-if="pending.preview?.approvalLabel" class="agent-secondary agent-approve-similar" :disabled="busy" :title="`以后自动允许当前对话中的 ${pending.preview.approvalLabel} 类命令`" @click="approve(true,'similar')"><Check/>批准类似命令</button><button class="agent-primary" :disabled="busy" @click="approve(true)"><Check/>仅批准本次</button></div>
     <p v-if="task?.events.some(event=>event.steering==='pending')" class="queue-steering-note" role="status">调整要求已加入，等待当前步骤结束后处理…</p>
     <ContextUsageDisplay v-if="hasConversation" :context="currentConversation?.context" :checkpoint="currentConversation?.checkpoint" :has-history="hasConversation" :disabled="locked" :shortcut="`Enter 发送 · Shift + Enter 换行${ch.attaching?' · 正在读取图片…':''}`" @compact="compact"/>
     <div v-if="engine==='agent'&&performanceWarning&&!performanceWarningDismissed" class="agent-performance-warning"><Cpu/><span><strong>当前推理配置较慢</strong>{{performanceWarning}}</span><button type="button" @click="ch.tab='settings'">调整加载参数</button><button type="button" class="agent-performance-dismiss" aria-label="关闭加载参数提示" title="关闭" @click="performanceWarningDismissed=true"><Close/></button></div>
@@ -441,8 +529,9 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
      <textarea v-model="draft" aria-label="消息" :disabled="loading||ch.sessionBusy" :maxlength="engine==='chat'?100000:16000" :placeholder="active||ch.sending?'输入下一项任务，发送后排队执行…':hasConversation?'补充要求，继续这段对话…':'询问任何问题，或描述你想完成的工作…'" @paste="pasteImages" @keydown="!$event.isComposing&&$event.key==='Enter'&&!$event.shiftKey&&($event.preventDefault(),submitDraft())"></textarea>
      <footer>
       <div class="agent-prompt-options">
-        <label v-if="engine==='agent'" class="agent-mode agent-approval-mode" :title="approvalHint"><select v-model="approvalMode" :disabled="locked" aria-label="任务权限"><option value="ask">请求选择</option><option value="auto">帮我批准</option><option value="full">完全访问</option></select></label>
+        <label v-if="engine==='agent'" class="agent-mode agent-approval-mode" :title="approvalHint"><select v-model="approvalMode" :disabled="locked" aria-label="任务权限"><option value="ask">请求选择</option><option value="auto">帮我批准</option><option value="full">沙盒自动</option><option value="unrestricted">完全控制</option></select></label>
        <select v-model="selectedModel" class="agent-model-select" :disabled="locked" :title="modelName" aria-label="会话模型"><option v-if="!modelOptions.length" value="">选择模型</option><option v-for="item in modelOptions" :key="item.value" :value="item.value">{{item.label}}</option></select>
+       <button v-if="engine==='agent'&&project" type="button" class="agent-web-toggle" :class="{active:webEnabled}" :disabled="locked" :title="webEnabled?'联网已开启；点击关闭':'联网已关闭；点击开启'" :aria-label="webEnabled?'关闭联网':'开启联网'" :aria-pressed="webEnabled" @click="toggleProjectWeb"><Connection/></button>
        <button ref="settingsTrigger" type="button" class="agent-settings-trigger" title="会话设置" aria-label="会话设置" @click="openSettings"><Setting/></button>
        <ElDialog v-model="settingsOpen" class="agent-settings agent-settings-dialog" modal-class="agent-settings-overlay" width="min(500px, calc(100vw - 32px))" :style="settingsTheme" :show-close="false" append-to-body align-center @closed="focusSettingsTrigger">
         <template #header><div class="agent-settings-header"><div><strong>会话设置</strong><small>调整当前会话的执行与生成参数</small></div><button type="button" class="agent-icon" aria-label="关闭会话设置" @click="closeSettings"><Close/></button></div></template>
@@ -460,6 +549,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
    </div>
   </section>
   <AgentCodePreview :open="filePreviewOpen" :expanded="filePreviewExpanded" :preview="filePreview" :loading="filePreviewLoading" :error="filePreviewError" :line="filePreviewLine" @close="toggleFilePreview" @toggle-expand="filePreviewExpanded=!filePreviewExpanded"/>
+  <AgentValidationDetail v-if="validationDetail" :detail="validationDetail" :expanded="validationDetailExpanded" @close="closeValidationDetail" @toggle-expand="validationDetailExpanded=!validationDetailExpanded"/>
   <AgentFileTooltip :open="fileTooltipOpen" :preview="fileTooltip" :loading="fileTooltipLoading" :error="fileTooltipError" :line="fileTooltipLine" :anchor="fileTooltipAnchor" @enter="keepFileTooltip" @leave="hideFileTooltip"/>
  </main>
 </template>

@@ -129,9 +129,27 @@ test('task approval modes auto-approve the intended tool risk levels',async t=>{
  const safeTask=auto.start({approvalMode:'auto'});await until(()=>!auto.service.active(safeTask.id));const safeResult=auto.service.get(safeTask.id)
  assert.equal(safeResult.approvalMode,'auto');assert.equal(fs.readFileSync(path.join(auto.workspace,'auto.txt'),'utf8'),'approved');assert.equal(safeResult.events.find(event=>event.tool==='write_file').audit.authorization,'automatic')
  round=0
+ const previous=process.env.MYPLANE_SANDBOX_DISABLE;process.env.MYPLANE_SANDBOX_DISABLE='1';t.after(()=>{if(previous===undefined)delete process.env.MYPLANE_SANDBOX_DISABLE;else process.env.MYPLANE_SANDBOX_DISABLE=previous})
  const full=await harness(t,()=>round++===0?response(null,[call('run_command',{command:'node -e "console.log(42)"'})]):response('完成'))
- const fullTask=full.start({approvalMode:'full'});await until(()=>!full.service.active(fullTask.id));const fullResult=full.service.get(fullTask.id)
- assert.equal(fullResult.approvalMode,'full');assert.equal(fullResult.events.find(event=>event.tool==='run_command').audit.authorization,'automatic');assert.match(JSON.parse(fullResult.events.find(event=>event.tool==='run_command').output).output,/42/)
+ const fullTask=full.start({approvalMode:'full'});await until(()=>full.service.get(fullTask.id).status==='waiting');const pending=full.service.get(fullTask.id).events.at(-1);assert.equal(pending.tool,'run_command');assert.match(pending.preview.note,/宿主机当前用户权限降级/);full.service.approve(fullTask.id,pending.id,true,7);await until(()=>!full.service.active(fullTask.id));const fullResult=full.service.get(fullTask.id)
+ const command=fullResult.events.find(event=>event.tool==='run_command'),result=JSON.parse(command.output);assert.equal(fullResult.approvalMode,'full');assert.equal(command.audit.authorization,'confirmed');assert.equal(result.sandbox.active,false);assert.match(result.output,/42/)
+})
+test('similar command approvals persist in the conversation and skip matching prompts',async t=>{
+ let round=0
+ const previous=process.env.MYPLANE_SANDBOX_DISABLE;process.env.MYPLANE_SANDBOX_DISABLE='1';t.after(()=>{if(previous===undefined)delete process.env.MYPLANE_SANDBOX_DISABLE;else process.env.MYPLANE_SANDBOX_DISABLE=previous})
+ const h=await harness(t,()=>round++===0?response(null,[call('run_command',{command:'node -p 1'})]):round===2?response(null,[call('run_command',{command:'node -p 2'})]):response('完成'))
+ const task=h.start({approvalMode:'full'});await until(()=>h.service.get(task.id).status==='waiting');const pending=h.service.get(task.id).events.at(-1)
+ assert.equal(pending.preview.approvalLabel,'node -p');h.service.approve(task.id,pending.id,true,7,'similar');await until(()=>!h.service.active(task.id))
+ const result=h.service.get(task.id),commands=result.events.filter(event=>event.tool==='run_command')
+ assert.equal(result.approvedCommands.length,1);assert.equal(result.approvedCommands[0].label,'node -p');assert.deepEqual(commands.map(event=>event.audit.authorization),['confirmed','automatic']);assert.match(commands[1].output,/2/)
+ const resumed=h.start({taskId:task.id,prompt:'继续同类检查',approvalMode:'full'});await until(()=>!h.service.active(resumed.id));assert.equal(h.service.get(task.id).approvedCommands[0].label,'node -p')
+})
+test('unrestricted conversation mode runs host commands without approval prompts',async t=>{
+ let round=0
+ const previous=process.env.MYPLANE_SANDBOX_DISABLE;process.env.MYPLANE_SANDBOX_DISABLE='1';t.after(()=>{if(previous===undefined)delete process.env.MYPLANE_SANDBOX_DISABLE;else process.env.MYPLANE_SANDBOX_DISABLE=previous})
+ const h=await harness(t,()=>round++===0?response(null,[call('run_command',{command:'node -p 7'})]):response('完成'))
+ const task=h.start({approvalMode:'unrestricted'});await until(()=>!h.service.active(task.id));const result=h.service.get(task.id),command=result.events.find(event=>event.tool==='run_command')
+ assert.equal(result.approvalMode,'unrestricted');assert.equal(result.status,'completed');assert.equal(command.audit.authorization,'automatic');assert.match(command.output,/7/)
 })
 test('stop cancels pending approval and closes every outstanding tool call',async t=>{
  const h=await harness(t,()=>response(null,[call('write_file',{path:'stop.txt',content:'no'}),call('read_file',{path:'stop.txt'})]));const task=h.start();await until(()=>h.service.get(task.id).status==='waiting');const pending=h.service.get(task.id).events.at(-1)

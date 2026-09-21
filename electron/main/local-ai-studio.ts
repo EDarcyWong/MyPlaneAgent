@@ -2,7 +2,7 @@ import {compactContext,contextMessages,contextStatus,needsCompaction,assertConte
 import {requestAgentModel,type AgentMessage} from './agent/model.js'
 import type {TokenUsage} from '../shared/local-ai-usage.js'
 import {readTokenUsage,mergeTokenUsage,emptyTokenUsageTotals,updateTokenUsageTotals,sumTokenUsage} from '../shared/local-ai-usage.js'
-import {app,BrowserWindow,dialog,net,shell,safeStorage,type WebContents,type IpcMainInvokeEvent} from 'electron'
+import {app,BrowserWindow,dialog,net,shell,safeStorage,Notification,type WebContents,type IpcMainInvokeEvent} from 'electron'
 import {existsSync,statSync,readdirSync,readFileSync,realpathSync,unlinkSync,writeFileSync} from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -30,16 +30,31 @@ import {LocalAgentService} from './agent/service.js'
 import {PythonToolRuntime} from './agent/python.js'
 import {AgentToolStore} from './agent/tool-store.js'
 import {AgentWorkspace} from './agent/workspace.js'
-import type {AgentMode,AgentApprovalMode} from '../shared/local-ai-agent.js'
+import type {AgentMode,AgentApprovalMode,AgentTask} from '../shared/local-ai-agent.js'
 import type {AgentToolSaveInput} from '../shared/local-ai-tools.js'
 import {chatImages,chatMessageContent,maxSessionImageChars} from '../shared/local-ai-chat.js'
+import {AutomationService} from './agent/automation.js'
+import type {AutomationTaskInput} from '../shared/local-ai-automation.js'
+import {WorkflowService} from './agent/workflow.js'
+import type {WorkflowDefinitionInput} from '../shared/local-ai-workflow.js'
 
+export type StudioLogSink=(level:'debug'|'info'|'warn'|'error',scope:string,message:string)=>void
+type OperationAudit={scope:'local-service'|'remote-service'|'download'|'automation';label:string;target?:string}
+const taskPreviewPaths=(task:AgentTask)=>{
+ const paths=new Set(task.artifacts.map(item=>item.path))
+ for(const event of task.events){
+  if(event.preview?.path)paths.add(event.preview.path)
+  for(const change of event.preview?.changes||[])paths.add(change.path)
+  if(['read_file','read_document','write_file','replace_text','create_document','create_spreadsheet'].includes(event.tool||'')&&typeof event.args?.path==='string')paths.add(event.args.path)
+ }
+ return paths
+}
 export class LocalAiStudioService extends LocalAiService {
  private preferences:Partial<StudioSettings>&{deepseekDefaultsVersion?:number}
  private readonly preferencesFile:string
  private readonly sessionsDirectory:string
  private readonly downloads:LocalAiDownloads
- private readonly runtime=new LocalAiRuntime()
+ private readonly runtime:LocalAiRuntime
  private readonly chats=new Map<string,{owner:number;sessionId:string;controller:AbortController}>()
  private readonly metadata=new Map<string,{time:number;details:StudioModelDetails}>()
  private readonly catalogFile:string
@@ -51,6 +66,8 @@ export class LocalAiStudioService extends LocalAiService {
  private readonly probeFile:string
  private readonly mcp:AgentMcpManager
  private readonly agent:LocalAgentService
+ private readonly automation:AutomationService
+ private readonly workflow:WorkflowService
  private readonly pythonTools:PythonToolRuntime
  private readonly toolStore:AgentToolStore
  private readonly agentWorkspaces=new Map<string,{owner:number;path:string}>()
@@ -58,8 +75,9 @@ export class LocalAiStudioService extends LocalAiService {
  private loadingRuntime=false
  private stoppingServer=false
  private catalogCache:Record<string,StudioCatalog>={}
- constructor(dataRoot:string){
-  super(dataRoot);this.preferencesFile=path.join(dataRoot,'local-ai-studio-settings.json');this.sessionsDirectory=path.join(dataRoot,'local-ai-sessions')
+ constructor(dataRoot:string,private readonly applicationLog?:StudioLogSink){
+  const log=applicationLog
+  super(dataRoot);this.runtime=new LocalAiRuntime((level,message)=>log?.(level,'runtime',message));this.preferencesFile=path.join(dataRoot,'local-ai-studio-settings.json');this.sessionsDirectory=path.join(dataRoot,'local-ai-sessions')
   this.preferences=readIntegrationJson<Partial<StudioSettings>&{deepseekDefaultsVersion?:number}>(this.preferencesFile,{})
   const saved=super.settings()
   if(isDeepSeek(saved.endpoint)&&this.preferences.deepseekDefaultsVersion!==1){
@@ -74,12 +92,15 @@ export class LocalAiStudioService extends LocalAiService {
   this.agent=new LocalAgentService(path.join(dataRoot,'local-ai-agent-tasks'),()=>{const settings=this.inferenceSettings();if(settings.source==='managed'&&this.runtime.snapshot().state!=='running')throw new Error('请先加载支持工具调用的本地模型');return {...this.service(),maxTokens:settings.maxTokens,contextLength:settings.contextLength,localLlama:settings.source==='managed'}},id=>this.mcp.specs(id),id=>{const project=this.agent.projects().find(project=>project.id===id);return this.toolStore.specs(project?.workspace||process.cwd())})
   this.probeFile=path.join(dataRoot,'local-ai-model-profiles.json')
   this.mcp=new AgentMcpManager(path.join(dataRoot,'local-ai-mcp.json'),id=>{const project=this.agent.projects().find(project=>project.id===id);if(!project)throw new Error('项目不存在');new AgentWorkspace(project.workspace);return project},value=>{if(!safeStorage.isEncryptionAvailable()||process.platform==='linux'&&safeStorage.getSelectedStorageBackend()==='basic_text')throw new Error('系统安全存储不可用，不能保存 MCP 凭据');return safeStorage.encryptString(value).toString('base64')},value=>this.decrypt(value))
+  const notify=(title:string,body:string)=>{if(Notification.isSupported())new Notification({title,body}).show()}
+  this.workflow=new WorkflowService(path.join(dataRoot,'local-ai-workflows'),this.agent,(level,message)=>log?.(level,'workflow',message),notify)
+  this.automation=new AutomationService(path.join(dataRoot,'local-ai-automations'),this.agent,(level,message)=>log?.(level,'automation',message),notify,{exists:(id,projectId)=>this.workflow.definitions().some(item=>item.id===id&&item.projectId===projectId&&item.enabled),start:(id,onUpdate)=>this.workflow.start(id,onUpdate),cancel:id=>{this.workflow.cancel(id)}})
   this.modelIcons=new LocalAiModelIcons(path.join(dataRoot,'local-ai-model-icons'))
-  this.developer=new LocalAiDeveloper(dataRoot)
+  this.developer=new LocalAiDeveloper(dataRoot,(level,message)=>log?.(level,'developer-api',message))
   this.installer=new LocalAiInstaller(path.join(dataRoot,'local-ai-runtimes'),runtimePath=>this.saveStudioSettings({runtimePath}))
   try{const cache=readIntegrationJson<Record<string,StudioCatalog>>(this.catalogFile,{});for(const [key,value] of Object.entries(record(cache)).slice(-20)){const item=record(value);if(Array.isArray(item.models)&&typeof item.updatedAt==='string')this.catalogCache[key]=value as StudioCatalog}}catch{/* A disposable catalog cache must not prevent startup. */}
-  this.downloads=new LocalAiDownloads(path.join(dataRoot,'local-ai-download-queue.json'),()=>this.normalizeDownloadDirectory(),()=>this.hfHeaders(),entry=>this.saveDownloads([entry,...this.readDownloads().filter(item=>item.localPath!==entry.localPath)]),(url,options)=>net.fetch(url,options))
-  this.gateway=new LocalAiGateway({models:()=>this.models(),runtime:()=>this.runtime.snapshot(),credential:()=>this.runtime.apiKey,load:async(id,options)=>{await this.startRuntime(id,options);return this.runtime.snapshot()},unload:()=>this.runtime.stop(),files:repo=>this.files(repo),enqueue:(repo,file)=>this.enqueue({repoId:repo,file}),downloads:()=>this.downloads.list()},path.join(dataRoot,'local-ai-api-download-jobs.json'))
+  this.downloads=new LocalAiDownloads(path.join(dataRoot,'local-ai-download-queue.json'),()=>this.normalizeDownloadDirectory(),()=>this.hfHeaders(),entry=>this.saveDownloads([entry,...this.readDownloads().filter(item=>item.localPath!==entry.localPath)]),(url,options)=>net.fetch(url,options),(level,message)=>log?.(level,'download',message))
+  this.gateway=new LocalAiGateway({models:()=>this.models(),runtime:()=>this.runtime.snapshot(),credential:()=>this.runtime.apiKey,load:async(id,options)=>{await this.startRuntime(id,options);return this.runtime.snapshot()},unload:()=>this.runtime.stop(),files:repo=>this.files(repo),enqueue:(repo,file)=>this.enqueue({repoId:repo,file}),downloads:()=>this.downloads.list()},path.join(dataRoot,'local-ai-api-download-jobs.json'),(level,message)=>log?.(level,'local-api',message))
  }
  studioSettings():StudioSettings{
   const p=this.preferences,base=super.settings(),source=p.source==='managed'?'managed':'external',contextMaximum=source==='external'&&isDeepSeek(base.endpoint)?DEEPSEEK_CONTEXT_TOKENS:131072
@@ -107,8 +128,9 @@ export class LocalAiStudioService extends LocalAiService {
  bootstrap():StudioBootstrap{return {chatImagesSupported:true,...this.snapshot(),settings:this.studioSettings(),models:this.models(),sessions:this.sessions()}}
  private service(){const settings=this.studioSettings();if(settings.source==='managed'){return {apiFormat:'openai' as const,endpoint:this.gateway.endpoint||`http://127.0.0.1:${settings.runtimePort}/v1`,key:this.gateway.apiKey}}const config=this.config();return {apiFormat:config.apiFormat,endpoint:endpoint(config.endpoint),key:config.encryptedApiKey?this.decrypt(config.encryptedApiKey):''}}
  private async request(url:string,body?:unknown,timeout=15_000){const service=this.service();return jsonResponse(await fetch(url,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(service.apiFormat==='anthropic'?{'anthropic-version':'2023-06-01',...(service.key?{'x-api-key':service.key}:{})}:service.key?{Authorization:`Bearer ${service.key}`}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(timeout)}))}
- async connect():Promise<StudioConnection>{
-  const service=this.service(),start=Date.now()
+ async connect(reason:'startup'|'manual'|'model-operation'='manual'):Promise<StudioConnection>{
+  const service=this.service(),start=Date.now(),protocol=service.apiFormat==='anthropic'?'Anthropic':'OpenAI',endpoint=this.endpointLabel(service.endpoint)
+  this.applicationLog?.('info','remote-service',`开始验证远程服务状态；原因=${reason}；协议=${protocol}；地址=${endpoint}`)
   try{
    if(service.apiFormat==='anthropic'&&!service.key)throw new Error('请先填写并保存 Anthropic API Key')
    if(service.apiFormat==='openai'&&isDeepSeek(service.endpoint)&&!service.key)throw new Error('请先填写并保存 DeepSeek API Key')
@@ -118,9 +140,11 @@ export class LocalAiStudioService extends LocalAiService {
    if(service.apiFormat==='openai'&&this.studioSettings().source==='external'&&!isDeepSeek(service.endpoint)){
     try{const native=record(await this.request(`${service.endpoint.replace(/\/v1$/,'')}/api/v1/models`,undefined,2500));if(Array.isArray(native.models)){provider='lmstudio';models=native.models.map(record).filter(item=>item.type==='llm').map(item=>{const instances=Array.isArray(item.loaded_instances)?item.loaded_instances.map(record):[];const first=instances[0];return {id:textValue(item.key)||textValue(item.id),name:textValue(item.display_name)||textValue(item.key),loaded:instances.length>0,instanceId:first?textValue(first.id):undefined,contextLength:Number(record(first?.config).context_length)||undefined}}).filter(item=>item.id)}}catch{}
    }
-   return {ok:true,endpoint:service.endpoint,latencyMs:Date.now()-start,models,provider,error:''}
-  }catch(error){return {ok:false,endpoint:service.endpoint,latencyMs:Date.now()-start,models:[],provider:service.apiFormat==='anthropic'?'anthropic':'openai',error:String(error)}}
+   const latencyMs=Date.now()-start;this.applicationLog?.('info','remote-service',`远程服务验证成功；原因=${reason}；提供方=${provider}；模型数=${models.length}；耗时=${latencyMs}ms`)
+   return {ok:true,endpoint:service.endpoint,latencyMs,models,provider,error:''}
+  }catch(error){const latencyMs=Date.now()-start,message=error instanceof Error?error.message:String(error);this.applicationLog?.('warn','remote-service',`远程服务验证失败；原因=${reason}；协议=${protocol}；地址=${endpoint}；耗时=${latencyMs}ms；错误=${message}`);return {ok:false,endpoint:service.endpoint,latencyMs,models:[],provider:service.apiFormat==='anthropic'?'anthropic':'openai',error:String(error)}}
  }
+ private endpointLabel(value:string){try{return new URL(value).origin}catch{return '无效地址'}}
  private discoveryModel(value:unknown):StudioDiscoveryModel{
   const item=record(value),card=record(item.cardData),config=record(item.config),gguf=record(item.gguf),id=textValue(item.id)||textValue(item.modelId)
   const tags=Array.isArray(item.tags)?item.tags.filter((tag):tag is string=>typeof tag==='string').slice(0,80):[]
@@ -225,14 +249,15 @@ export class LocalAiStudioService extends LocalAiService {
    if(this.stoppingServer)throw new Error('API 服务正在停止')
    await this.runtime.start(settings,model,preferences,this.gateway.apiKey,options)
    return this.runtimeSnapshot()
-  }finally{this.loadingRuntime=false}
+  }catch(error){this.applicationLog?.('error','runtime',error instanceof Error?error.message:String(error));throw error}
+  finally{this.loadingRuntime=false}
  }
  async stopRuntime(){
   this.stoppingServer=true
   try{await this.gateway.stop();await this.runtime.stop();return this.runtimeSnapshot()}
   finally{this.stoppingServer=false}
  }
- async loadExternal(input:unknown){const value=record(input),id=required(value.id,'模型 ID'),service=this.service();if(this.studioSettings().source!=='external')throw new Error('请切换至外部服务');const status=await this.connect();if(status.provider!=='lmstudio')throw new Error('当前服务不支持模型加载管理，请在服务端加载模型');await this.request(`${service.endpoint.replace(/\/v1$/,'')}/api/v1/models/${value.unload?'unload':'load'}`,value.unload?{instance_id:id}:{model:id,context_length:this.studioSettings().contextLength},300_000);return this.connect()}
+ async loadExternal(input:unknown){const value=record(input),id=required(value.id,'模型 ID'),service=this.service();if(this.studioSettings().source!=='external')throw new Error('请切换至外部服务');const status=await this.connect('model-operation');if(status.provider!=='lmstudio')throw new Error('当前服务不支持模型加载管理，请在服务端加载模型');await this.request(`${service.endpoint.replace(/\/v1$/,'')}/api/v1/models/${value.unload?'unload':'load'}`,value.unload?{instance_id:id}:{model:id,context_length:this.studioSettings().contextLength},300_000);return this.connect('model-operation')}
  private sessionFile(id:string){if(!/^[a-f\d-]{36}$/i.test(id))throw new Error('会话 ID 无效');return path.join(this.sessionsDirectory,`${id}.json`)}
  private saveSession(session:StudioSession){session.updatedAt=new Date().toISOString();writeIntegrationJson(this.sessionFile(session.id),session);return session}
  sessions():StudioSessionSummary[]{
@@ -289,6 +314,8 @@ export class LocalAiStudioService extends LocalAiService {
  }
  private async generate(session:StudioSession,service:{apiFormat:'openai'|'anthropic';endpoint:string;key:string},settings:StudioSettings,signal:AbortSignal,emit:(event:StudioEvent)=>void,requestId:string,compactOnly=false){
   const started=Date.now(),answer:StudioMessage={id:randomUUID(),role:'assistant',content:'',reasoning:'',createdAt:new Date().toISOString(),model:session.model,status:'complete'};let error='';let lastSave=Date.now()
+  const logScope=settings.source==='managed'?'local-service':'remote-service'
+  this.applicationLog?.('info',logScope,`${compactOnly?'上下文压缩':'模型推理'}开始；模型=${session.model}`)
   const responseCharacterLimit=Math.min(8*1024*1024,Math.max(500000,settings.maxTokens*8))
   session.usage??=emptyTokenUsageTotals()
   emit({type:'delta',requestId,content:'',reasoning:'',sessionUsage:session.usage})
@@ -316,13 +343,100 @@ export class LocalAiStudioService extends LocalAiService {
    answer.elapsedMs=Date.now()-started;if(!compactOnly&&!session.messages.includes(answer))session.messages.push(answer)
    if(session.context?.state!=='error')session.context={...this.chatContextStatus(session,settings),message:session.context?.message}
    try{this.saveSession(session)}catch(cause){error=`${error?error+'；':''}保存会话失败：${String(cause)}`}
+   const outcome=signal.aborted?'已停止':error?'失败':'完成',message=`${compactOnly?'上下文压缩':'模型推理'}${outcome}；模型=${session.model}；耗时=${answer.elapsedMs}ms${error?`；错误=${error}`:''}`
+   this.applicationLog?.(error?'error':signal.aborted?'warn':'info',logScope,message)
    emit({type:'finished',requestId,session,error:error||undefined})
   }
  }
  async dispatch(action:string,input:unknown,event:IpcMainInvokeEvent):Promise<unknown>{
+  const audit=this.operationAudit(action,input)
+  if(!audit)return this.execute(action,input,event)
+  const started=Date.now(),target=audit.target?`；${audit.target}`:''
+  this.applicationLog?.('info',audit.scope,`${audit.label}：开始${target}`)
+  try{
+   const result=await this.execute(action,input,event)
+   this.applicationLog?.('info',audit.scope,`${audit.label}：完成；耗时=${Date.now()-started}ms`)
+   return result
+  }catch(error){const message=error instanceof Error?error.message:String(error);this.applicationLog?.('error',audit.scope,`${audit.label}：失败；耗时=${Date.now()-started}ms；错误=${message}`);throw error}
+ }
+ private operationAudit(action:string,input:unknown):OperationAudit|undefined{
+  const value=record(input),text=(key:string,limit=160)=>textValue(value[key],limit),source=value.source==='managed'?'本地服务':value.source==='external'?'远程服务':this.studioSettings().source==='managed'?'本地服务':'远程服务'
+  switch(action as keyof StudioCommands){
+   case 'settings':{const hidden=new Set(['apiKey','hfToken','systemPrompt','clearApiKey','clearHfToken']),keys=Object.keys(value).filter(key=>!hidden.has(key));return {scope:source==='本地服务'?'local-service':'remote-service',label:'保存服务设置',target:`类型=${source}；变更=${keys.join(',')||'无'}`}}
+   case 'remoteProfileSave':return {scope:'remote-service',label:'保存远程服务配置',target:`名称=${text('name',80)||'未命名'}；协议=${text('apiFormat',20)||'未指定'}；地址=${this.endpointLabel(text('endpoint',1000))}`}
+   case 'remoteProfileUse':return {scope:'remote-service',label:'切换远程服务配置',target:`配置=${text('id',80)}`}
+   case 'remoteProfileDelete':return {scope:'remote-service',label:'删除远程服务配置',target:`配置=${text('id',80)}`}
+   case 'loadExternal':return {scope:'remote-service',label:value.unload?'卸载远程模型':'加载远程模型',target:`模型=${text('id',500)}`}
+   case 'chat':return {scope:source==='本地服务'?'local-service':'remote-service',label:'提交模型推理',target:`类型=${source}；模型=${text('model',500)}`}
+   case 'compactSession':return {scope:source==='本地服务'?'local-service':'remote-service',label:'压缩对话上下文',target:`类型=${source}；模型=${text('model',500)}`}
+   case 'stopChat':return {scope:source==='本地服务'?'local-service':'remote-service',label:'停止模型推理'}
+   case 'search':return {scope:'download',label:'搜索模型',target:`格式=${text('format',20)||'gguf'}；排序=${text('sort',20)||'downloads'}`}
+   case 'catalog':return {scope:'download',label:value.cachedOnly===true?'读取模型目录缓存':'刷新模型目录',target:`格式=${text('format',20)||'gguf'}；排序=${text('sort',20)||'downloads'}`}
+   case 'modelDetails':return {scope:'download',label:'查看模型信息',target:`仓库=${text('repoId',200)}`}
+   case 'readme':return {scope:'download',label:'查看模型说明',target:`仓库=${text('repoId',200)}`}
+   case 'files':return {scope:'download',label:'查看模型文件',target:`仓库=${text('repoId',200)}`}
+   case 'enqueue':return {scope:'download',label:'添加模型下载',target:`仓库=${text('repoId',200)}；文件=${text('file',800)}`}
+   case 'downloadAction':{const row=this.downloads.list().find(item=>item.id===text('id',100));return {scope:'download',label:'操作模型下载',target:`操作=${text('action',20)}${row?`；仓库=${row.repoId}；文件=${row.file}`:''}`}}
+   case 'importModels':return {scope:'download',label:'导入本地模型'}
+   case 'removeModel':return {scope:'download',label:value.deleteFile===true?'删除本地模型文件':'移除本地模型记录',target:`模型=${text('id',100)}`}
+   case 'revealModel':return {scope:'download',label:'在文件管理器中显示模型',target:`模型=${text('id',100)}`}
+   case 'chooseDirectory':return {scope:'download',label:'选择模型下载目录'}
+   case 'developerSettings':return {scope:'local-service',label:'保存本地服务设置',target:`变更=${Object.keys(value).filter(key=>!['apiKey','clearApiKey'].includes(key)).join(',')||'无'}`}
+   case 'runtimeDetect':return {scope:'local-service',label:'检测本地运行时'}
+   case 'runtimePackages':return {scope:'local-service',label:'查询可用运行包'}
+   case 'runtimeInstall':return {scope:'local-service',label:'安装本地运行时',target:`运行包=${text('id',100)}`}
+   case 'runtimeInstallCancel':return {scope:'local-service',label:'取消安装本地运行时'}
+   case 'developerKey':return {scope:'local-service',label:'复制本地服务凭据'}
+   case 'developerRequest':return {scope:'local-service',label:'发送本地服务调试请求',target:`路由=${text('route',200)}`}
+   case 'developerCancelRequest':return {scope:'local-service',label:'取消本地服务调试请求'}
+   case 'developerClearLogs':return {scope:'local-service',label:'清空本地服务请求日志'}
+   case 'developerExportLogs':return {scope:'local-service',label:'导出本地服务日志'}
+   case 'startApiServer':return {scope:'local-service',label:'启动本地 API 服务'}
+   case 'unloadRuntime':case 'stopRuntime':return {scope:'local-service',label:'停止本地模型服务'}
+   case 'startRuntime':return {scope:'local-service',label:'启动本地模型服务',target:`模型=${text('id',100)}`}
+   case 'chooseRuntime':return {scope:'local-service',label:'选择本地运行时'}
+   case 'automationSave':return {scope:'automation',label:'保存定时任务',target:`名称=${text('name',100)||'未命名'}`}
+   case 'automationDelete':return {scope:'automation',label:'删除定时任务',target:`任务=${text('id',100)}`}
+   case 'automationAction':return {scope:'automation',label:'操作定时任务',target:`任务=${text('id',100)}；操作=${text('action',20)}`}
+   case 'workflowSave':return {scope:'automation',label:'保存工作流',target:`名称=${text('name',100)||'未命名'}`}
+   case 'workflowDelete':return {scope:'automation',label:'删除工作流',target:`工作流=${text('id',100)}`}
+   case 'workflowAction':return {scope:'automation',label:'操作工作流',target:`工作流=${text('id',100)}；操作=${text('action',20)}`}
+   case 'workflowCancel':return {scope:'automation',label:'取消工作流运行',target:`运行=${text('runId',100)}`}
+   case 'workflowRetry':return {scope:'automation',label:'重试工作流节点',target:`运行=${text('runId',100)}；节点=${text('nodeId',100)}`}
+   default:return undefined
+  }
+ }
+ private async execute(action:string,input:unknown,event:IpcMainInvokeEvent):Promise<unknown>{
   const value=record(input),owner=BrowserWindow.fromWebContents(event.sender)
   if(!owner)throw new Error('窗口不可用')
   switch(action as keyof StudioCommands){
+   case 'workflowDefinitions':return this.workflow.definitions()
+   case 'workflowRuns':return this.workflow.runs(textValue(value.workflowId)||undefined,Number(value.limit)||100)
+   case 'workflowDelete':{const id=required(value.id,'工作流 ID');if(this.automation.tasks().some(task=>task.workflowId===id))throw new Error('仍有定时任务引用此工作流，请先修改或删除相关定时任务');return this.workflow.delete(id)}
+   case 'workflowCancel':return this.workflow.cancel(required(value.runId,'运行 ID'))
+   case 'workflowRetry':return this.workflow.retry(required(value.runId,'运行 ID'),required(value.nodeId,'节点 ID'))
+   case 'workflowAction':{const action=required(value.action,'操作',20);if(!['run','enable','pause'].includes(action))throw new Error('工作流操作无效');return this.workflow.action(required(value.id,'工作流 ID'),action as 'run'|'enable'|'pause')}
+   case 'workflowSave':{
+    const input=value as unknown as WorkflowDefinitionInput
+    if(input.nodes?.some(node=>node.type==='agent'&&['auto','full'].includes(node.config.approvalMode))){const result=await dialog.showMessageBox(owner,{type:'warning',title:'允许工作流自动执行',message:'工作流包含无人值守 Agent 节点，是否保存？',detail:'节点只能使用项目现有权限。仍需人工确认的高风险操作会被拒绝，不会在后台永久等待。',buttons:['取消','保存'],defaultId:0,cancelId:0});if(result.response!==1)throw new Error('已取消保存工作流')}
+    return this.workflow.save(input)
+   }
+   case 'automationTasks':return this.automation.tasks()
+   case 'automationTemplates':return this.automation.templates()
+   case 'automationRuns':return this.automation.runs(textValue(value.taskId)||undefined,Number(value.limit)||100)
+   case 'automationDelete':return this.automation.delete(required(value.id,'任务 ID'))
+   case 'automationAction':{
+    const action=required(value.action,'操作',20);if(!['enable','pause','run'].includes(action))throw new Error('定时任务操作无效')
+    return this.automation.action(required(value.id,'任务 ID'),action as 'enable'|'pause'|'run')
+   }
+   case 'automationSave':{
+    const input=value as unknown as AutomationTaskInput,previous=input.id?this.automation.tasks().find(item=>item.id===input.id):undefined
+    if(['auto','full'].includes(input.agent?.approvalMode)&&previous?.agent.approvalMode!==input.agent.approvalMode){
+     const result=await dialog.showMessageBox(owner,{type:'warning',title:'允许定时任务自动执行',message:'允许此任务在无人值守时自动执行可授权操作？',detail:'任务会使用项目现有的文件与联网权限。需要逐次确认的高风险操作会被拒绝，不会停在后台等待确认。',buttons:['取消','允许'],defaultId:0,cancelId:0})
+     if(result.response!==1)throw new Error('已取消保存定时任务')
+    }
+    return this.automation.save(input)
+   }
    case 'agentChooseWorkspace':{
     const pick=await dialog.showOpenDialog(owner,{title:'选择 Agent 可以读取和修改的项目 / 文档目录',properties:['openDirectory','createDirectory']})
     if(pick.canceled)return null
@@ -349,6 +463,8 @@ export class LocalAiStudioService extends LocalAiService {
    case 'mcpDelete':return this.mcp.remove(required(value.id,'服务 ID'))
    case 'agentUpdateProject':{
     if(value.policy==='project-auto'){const result=await dialog.showMessageBox(owner,{type:'warning',title:'项目自动修改',message:'允许在选定范围内自动修改普通文本文件？',detail:'范围：'+JSON.stringify(value.autoWritePaths)+'。命令、测试脚本、敏感配置和 MCP 工具仍逐次确认。',buttons:['取消','允许'],defaultId:0,cancelId:0});if(result.response!==1)throw new Error('已取消权限变更')}
+    if(value.webAccess==='allow'&&this.agent.projects().find(project=>project.id===value.id)?.webAccess!=='allow'){const result=await dialog.showMessageBox(owner,{type:'warning',title:'允许联网检索',message:'允许此项目的 Agent 无需逐次确认即可搜索和读取公网页面？',detail:'搜索词和要读取的 URL 会发送到外部服务。工具会拦截常见凭据、本机绝对路径、localhost、局域网和云元数据地址。',buttons:['取消','允许联网'],defaultId:0,cancelId:0});if(result.response!==1)throw new Error('已取消联网权限变更')}
+    if(value.webAllowSyntheticIp===true&&!this.agent.projects().find(project=>project.id===value.id)?.webAllowSyntheticIp){const result=await dialog.showMessageBox(owner,{type:'warning',title:'兼容 fake-IP 代理',message:'允许联网工具访问 198.18.0.0/15 合成地址？',detail:'这会放宽该保留网段的 SSRF 防护。仅当本机正在使用 Clash 等可信透明代理的 fake-IP 模式时开启。其他本机、局域网和云元数据地址仍会被拦截。',buttons:['取消','开启兼容'],defaultId:0,cancelId:0});if(result.response!==1)throw new Error('已取消 fake-IP 兼容设置')}
     return this.agent.updateProject(value as Parameters<LocalAgentService['updateProject']>[0])
    }
    case 'agentResolveExecution':{
@@ -408,10 +524,10 @@ export class LocalAiStudioService extends LocalAiService {
    }
    case 'agentCompact':{this.trackAgentOwner(event.sender);return this.agent.compact(required(value.id,'任务 ID'),event.sender.id,task=>{if(!event.sender.isDestroyed())event.sender.send('local-ai:agent-event',task)})}
    case 'agentStop':return this.agent.stop(required(value.id,'任务 ID'),event.sender.id)
-   case 'agentApprove':return this.agent.approve(required(value.id,'任务 ID'),required(value.eventId,'操作 ID'),value.approved as boolean,event.sender.id)
+   case 'agentApprove':return this.agent.approve(required(value.id,'任务 ID'),required(value.eventId,'操作 ID'),value.approved as boolean,event.sender.id,value.scope as 'once'|'similar'|undefined)
    case 'agentPreview':{
     const task=this.agent.get(required(value.id,'任务 ID')),relative=required(value.path,'文件路径',2000)
-    if(!task.artifacts.some(item=>item.path===relative))throw new Error('此文件不属于任务产物')
+    if(!taskPreviewPaths(task).has(relative))throw new Error('此文件未出现在当前任务记录中')
     const workspace=new AgentWorkspace(task.workspace),extension=path.extname(relative).toLowerCase(),language=extension.slice(1)||'text';let content='',truncated=false,note=''
     if(['.docx','.xlsx','.pdf'].includes(extension)){const result=JSON.parse(await workspace.query('read_document',{path:relative},new AbortController().signal));content=result.text;truncated=result.nextOffset!==null;note=result.note||''}
     else{const source=workspace.read(relative),limit=300000;content=source.slice(0,limit);truncated=source.length>limit}
@@ -429,7 +545,7 @@ export class LocalAiStudioService extends LocalAiService {
    case 'remoteProfileUse':{const id=required(value.id,'配置 ID'),result=this.remoteProfileUse(id),profile=result.profiles.find(item=>item.id===id);this.saveStudioSettings({apiFormat:result.settings.apiFormat,endpoint:result.settings.endpoint,model:result.settings.model,...(profile?{contextLength:profile.contextLength}:{})});return {settings:this.studioSettings(),profiles:result.profiles}}
    case 'remoteProfileDelete':return this.remoteProfileDelete(required(value.id,'配置 ID'))
    case 'snapshot':return this.snapshot()
-   case 'connect':return this.connect()
+   case 'connect':return this.connect(value.reason==='startup'?'startup':'manual')
    case 'search':return this.search(input)
    case 'catalog':return this.catalog(input)
    case 'modelDetails':return this.modelDetails(required(value.repoId,'模型仓库'))
@@ -473,7 +589,8 @@ export class LocalAiStudioService extends LocalAiService {
   }
  }
  private trackAgentOwner(sender:WebContents){if(this.agentOwners.has(sender.id))return;this.agentOwners.add(sender.id);sender.once('destroyed',()=>{this.agent.stopOwner(sender.id);this.agentOwners.delete(sender.id);for(const [key,item] of this.agentWorkspaces)if(item.owner===sender.id)this.agentWorkspaces.delete(key)})}
- async dispose(){for(const probe of this.probes.values())probe.abort();this.agent.dispose();this.pythonTools.dispose();const mcpCleanup=this.mcp.dispose();for(const chat of this.chats.values())chat.controller.abort();this.installer.dispose();this.developer.dispose();this.gateway.dispose();this.runtime.dispose();this.downloads.dispose();await mcpCleanup}
+ hasEnabledAutomations(){return this.automation.tasks().some(task=>task.enabled)}
+ async dispose(){for(const probe of this.probes.values())probe.abort();this.automation.dispose();this.workflow.dispose();this.agent.dispose();this.pythonTools.dispose();const mcpCleanup=this.mcp.dispose();for(const chat of this.chats.values())chat.controller.abort();this.installer.dispose();this.developer.dispose();this.gateway.dispose();this.runtime.dispose();this.downloads.dispose();await mcpCleanup}
 }
 
 export function registerLocalAiStudio(service:()=>LocalAiStudioService,dispose:()=>void|Promise<void>){

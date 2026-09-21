@@ -41,7 +41,7 @@ test('steering waits for a started tool, skips unstarted batch calls and keeps t
   spec('first',async()=>{started=true;return await new Promise(resolve=>{release=()=>resolve('{"ok":true}')})}),
   spec('second',async()=>{secondCalls++;return '{}'})
  ])
- const task=h.start();await until(()=>started)
+ const task=h.start();await until(()=>h.service.get(task.id).status==='waiting');const pending=h.service.get(task.id).events.at(-1);assert.equal(pending.tool,'first');h.service.approve(task.id,pending.id,true,7);await until(()=>started)
  h.service.steer(task.id,randomUUID(),'跳过剩余操作，只汇报',[],7)
  await pause(30);assert.equal(h.bodies.length,1,'must not start another round during a tool')
  release();await until(()=>!h.service.active(task.id))

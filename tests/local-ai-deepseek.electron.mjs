@@ -6,17 +6,21 @@ import path from 'node:path'
 import {LocalAiStudioService} from '../dist-electron/main/local-ai-studio.js'
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-deepseek-'))
 let service
+const applicationLogs=[]
 const originalFetch=globalThis.fetch
 async function main(){try{
  await app.whenReady()
  fs.writeFileSync(path.join(root,'local-ai-settings.json'),JSON.stringify({endpoint:'https://api.deepseek.com',model:'deepseek-flash',maxTokens:2048,encryptedApiKey:'',encryptedHfToken:'',downloadDirectory:path.join(root,'models')}))
  fs.writeFileSync(path.join(root,'local-ai-studio-settings.json'),JSON.stringify({source:'external',contextLength:134096}))
- service=new LocalAiStudioService(root)
+ service=new LocalAiStudioService(root,(level,scope,message)=>applicationLogs.push({level,scope,message}))
  assert.equal(service.studioSettings().maxTokens,65536)
  assert.equal(service.studioSettings().contextLength,1000000)
- assert.match((await service.connect()).error,/API Key/)
+ assert.match((await service.connect('startup')).error,/API Key/)
+ assert.ok(applicationLogs.some(entry=>entry.scope==='remote-service'&&entry.message.includes('原因=startup')&&entry.message.includes('验证失败')))
  // Fake credentials and transport: no billable calls or OS credential changes.
  service.service=()=>({endpoint:'https://api.deepseek.com',key:'test-key'})
+ assert.doesNotMatch(JSON.stringify(service.operationAudit('settings',{apiKey:'test-key',systemPrompt:'private prompt',model:'deepseek-flash'})),/test-key|private prompt/)
+ assert.doesNotMatch(JSON.stringify(service.operationAudit('developerRequest',{route:'models',body:{apiKey:'test-key',prompt:'private prompt'}})),/test-key|private prompt/)
  const requests=[]
  globalThis.fetch=async(url,init)=>{
   requests.push(url)
@@ -33,6 +37,7 @@ async function main(){try{
  assert.equal(connection.provider,'deepseek')
  assert.equal(connection.models.length,2)
  assert.deepEqual(requests,['https://api.deepseek.com/models'])
+ assert.doesNotMatch(JSON.stringify(applicationLogs),/test-key/)
  const session=service.newSession()
  session.model='deepseek-flash'
  session.messages.push({id:'user-1',role:'user',content:'你好',createdAt:new Date().toISOString()})

@@ -12,7 +12,7 @@ export class LocalAiDownloads {
  private rows:StudioDownload[]
  private active:{id:string;controller:AbortController}|undefined
  private disposed=false
- constructor(private file:string,private directory:()=>string,private headers:()=>Record<string,string>,private completed:(entry:LocalAiDownloadEntry)=>void,private request:(url:string,options:RequestInit)=>Promise<Response>=fetch){
+ constructor(private file:string,private directory:()=>string,private headers:()=>Record<string,string>,private completed:(entry:LocalAiDownloadEntry)=>void,private request:(url:string,options:RequestInit)=>Promise<Response>=fetch,private readonly onLog?:(level:'info'|'warn'|'error',message:string)=>void){
   this.rows=readIntegrationJson<StudioDownload[]>(file,[])
   if(!Array.isArray(this.rows))throw new Error('下载队列数据格式错误')
   for(const row of this.rows){if(['downloading','verifying','queued'].includes(row.status)){row.status='paused';row.error='上次下载已中断，可继续下载'}row.speed=0}
@@ -28,6 +28,7 @@ export class LocalAiDownloads {
    const id=randomUUID(),folder=inside(directory,`${safeRepo.replaceAll('/','--')}--${file.revision.slice(0,12)}`),target=inside(folder,name)
    if(existsSync(target))continue
    this.rows.push({id,repoId:safeRepo,file:name,revision:file.revision,sha256:file.sha256,target,status:'queued',received:0,total:file.size||0,speed:0,error:'',createdAt:new Date().toISOString()})
+   this.onLog?.('info',`已加入下载队列：${safeRepo}/${name}（${file.size||0} bytes）`)
   }
   this.persist();this.pump();return this.list()
  }
@@ -47,6 +48,7 @@ export class LocalAiDownloads {
    if(this.active?.id===id||!['completed','cancelled','failed'].includes(row.status))throw new Error('请先取消该下载任务')
    this.removePartial(row);this.rows=this.rows.filter(item=>item.id!==id)
   }else throw new Error('无效的下载操作')
+  this.onLog?.('info',`下载操作 ${action}：${row.repoId}/${row.file}，状态 ${row.status}`)
   this.persist();this.pump();return this.list()
  }
  private partial(row:StudioDownload){return `${row.target}.${row.id}.part`}
@@ -55,13 +57,14 @@ export class LocalAiDownloads {
   if(this.active||this.disposed)return
   const row=this.rows.find(item=>item.status==='queued');if(!row)return
   const controller=new AbortController();this.active={id:row.id,controller}
-  void this.run(row,controller.signal).catch(error=>{if(!['paused','cancelled','queued'].includes(row.status)){row.status='failed';row.error=String(error)}row.speed=0}).finally(()=>{if(row.status==='cancelled'){try{this.removePartial(row)}catch(error){row.error=String(error)}}this.active=undefined;try{this.persist()}catch(error){row.status='failed';row.error=String(error)}this.pump()})
+  void this.run(row,controller.signal).catch(error=>{if(!['paused','cancelled','queued'].includes(row.status)){row.status='failed';row.error=String(error);this.onLog?.('error',`下载失败：${row.repoId}/${row.file}；${row.error}`)}row.speed=0}).finally(()=>{if(row.status==='cancelled'){try{this.removePartial(row)}catch(error){row.error=String(error)}}this.active=undefined;try{this.persist()}catch(error){row.status='failed';row.error=String(error);this.onLog?.('error',`保存下载状态失败：${row.repoId}/${row.file}`)}this.pump()})
  }
  private async run(row:StudioDownload,signal:AbortSignal){
   row.status='downloading';row.error='';mkdirSync(path.dirname(row.target),{recursive:true})
   const partial=this.partial(row);let offset=existsSync(partial)?statSync(partial).size:0
   if(row.total>0&&offset>row.total)offset=0
   row.received=offset
+  this.onLog?.('info',`${offset?'继续':'开始'}下载：${row.repoId}/${row.file}${offset?`，从 ${offset} bytes 继续`:''}`)
   if(!(row.total>0&&offset===row.total)){
   const url=`https://huggingface.co/${row.repoId.split('/').map(encodeURIComponent).join('/')}/resolve/${row.revision}/${row.file.split('/').map(encodeURIComponent).join('/')}`
   const headers={...this.headers(),...(offset?{Range:`bytes=${offset}-`,...(row.etag?{'If-Range':row.etag}:{})}:{})}
@@ -80,12 +83,14 @@ export class LocalAiDownloads {
   signal.throwIfAborted()
   if(row.total&&row.received!==row.total)throw new Error('文件大小不完整，可继续下载')
   row.status='verifying';row.speed=0
+  this.onLog?.('info',`正在校验下载：${row.repoId}/${row.file}${row.sha256?'（SHA-256）':'（文件完整性）'}`)
   if(row.sha256){const hash=createHash('sha256');for await(const chunk of createReadStream(partial)){signal.throwIfAborted();hash.update(chunk)}if(hash.digest('hex')!==row.sha256){unlinkSync(partial);row.received=0;throw new Error('SHA-256 校验失败，请重试下载')}}
   signal.throwIfAborted()
   if(existsSync(row.target))throw new Error('目标文件已存在，为保护现有文件，下载未覆盖它')
   renameSync(partial,row.target)
   try{this.completed({id:row.id,repoId:row.repoId,file:row.file,localPath:row.target,size:statSync(row.target).size,downloadedAt:new Date().toISOString()})}catch(error){renameSync(row.target,partial);throw error}
   row.status='completed';row.total=row.received
+  this.onLog?.('info',`下载完成：${row.repoId}/${row.file}（${row.total} bytes）`)
  }
  dispose(){this.disposed=true;if(this.active){const row=this.rows.find(item=>item.id===this.active?.id);if(row){row.status='paused';row.speed=0}this.active.controller.abort()}this.persist()}
 }

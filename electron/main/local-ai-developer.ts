@@ -6,12 +6,13 @@ import {numeric,record,textValue} from './local-ai-utils.js'
 import {developerRoutes,type DeveloperPreferences,type DeveloperPreferencesInput,type DeveloperResponse,type DeveloperRoute} from '../shared/local-ai-developer.js'
 
 type Stored=Partial<DeveloperPreferences>&{encryptedApiKey?:string}
+type DeveloperLogLevel='debug'|'info'|'warn'|'error'
 export class LocalAiDeveloper {
  private stored:Stored
  private readonly file:string
  private requests=new Map<number,AbortController>()
  private logs:string[]=[]
- constructor(root:string){this.file=path.join(root,'local-ai-developer-settings.json');this.stored=readIntegrationJson<Stored>(this.file,{})}
+ constructor(root:string,private readonly onLog?:(level:DeveloperLogLevel,message:string)=>void){this.file=path.join(root,'local-ai-developer-settings.json');this.stored=readIntegrationJson<Stored>(this.file,{})}
  preferences():DeveloperPreferences{return {host:this.stored.host==='0.0.0.0'?'0.0.0.0':'127.0.0.1',parallel:Math.round(numeric(this.stored.parallel,1,16,1)),embedding:this.stored.embedding===true,metrics:this.stored.metrics!==false,hasApiKey:!!this.stored.encryptedApiKey}}
  save(input:unknown){
   const value=record(input) as DeveloperPreferencesInput,next={...this.stored}
@@ -52,7 +53,7 @@ export class LocalAiDeveloper {
    return {status,elapsedMs:Date.now()-start,body:content,contentType:response.headers.get('content-type')||'',truncated}
   }finally{
    sender.removeListener('destroyed',destroyed);this.requests.delete(sender.id)
-   this.logs.push(`${new Date().toLocaleTimeString()} [API] ${definition.method} ${definition.path} ${status||'网络失败/取消'} ${Date.now()-start}ms`);this.logs=this.logs.slice(-100)
+   const message=`${definition.method} ${definition.path} ${status||'网络失败/取消'} ${Date.now()-start}ms`;this.logs.push(`${new Date().toLocaleTimeString()} [API] ${message}`);this.logs=this.logs.slice(-100);this.onLog?.(status>=400||!status?'warn':'debug',message)
   }
  }
  dispose(){for(const request of this.requests.values())request.abort()}

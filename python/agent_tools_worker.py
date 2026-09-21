@@ -250,7 +250,7 @@ def prepare_write(root,tool,args):
             if not re.match(r'^(test|check|lint|build)(:[A-Za-z0-9_-]+)?$',args['script']): raise ValueError('测试脚本名称无效')
             package=json.loads(read_text(root,'package.json'))
             if args['script'] not in package.get('scripts',{}): raise ValueError('项目未定义此脚本')
-        return {'preview':{'command':command,'cwd':str(root),'note':'命令以当前用户权限执行，需要确认。'},'plan':{'kind':'command','command':command,'timeout':max(1,min(300,int(args.get('timeoutSeconds',60))))},'artifact':None}
+        return {'preview':{'command':command,'cwd':str(root),'note':'命令以当前用户权限执行，需要确认。'},'plan':{'kind':'command','command':command,'timeout':max(1,min(300,int(args.get('timeoutSeconds',60)))),'testAction':args.get('script') if tool=='run_test' else None},'artifact':None}
     relative=args['path'];file=resolve(root,relative,True);before=file.read_bytes() if file.exists() else None
     if tool in ('write_file','replace_text') and file.suffix.lower() in BINARY_DOCUMENT_EXT: raise ValueError('通用文本工具不能写入二进制文档；DOCX 请使用 create_document，XLSX 请使用 create_spreadsheet')
     if tool=='write_file': data=args['content'].encode();kind='file';shown=args['content']
@@ -268,8 +268,11 @@ def prepare_write(root,tool,args):
 def execute_plan(root,plan):
     if plan['kind']=='command':
         started=time.time();done=subprocess.run(plan['command'],cwd=root,shell=True,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=plan['timeout'])
-        invalidate(root)
-        return compact({'exitCode':done.returncode,'durationMs':round((time.time()-started)*1000),'output':(done.stdout+done.stderr)[:32000]})
+        invalidate(root);output=done.stdout+done.stderr
+        result={'exitCode':done.returncode,'durationMs':round((time.time()-started)*1000)}
+        if plan.get('testAction'): result['failureAnalysis']=test_failure_analysis(output,done.returncode,plan['testAction'])
+        result['output']=output[:32000];result['truncated']=len(output)>32000
+        return compact(result)
     changes=plan['changes'];prepared=[];seen=set()
     for change in changes:
         file=resolve(root,change['path'],True);identity=os.path.normcase(str(file))
@@ -485,6 +488,38 @@ def parsed_diagnostics(output):
         if len(rows)>=200: break
     return rows
 
+def failed_test_names(output):
+    found=[]
+    patterns=[re.compile(r'^not ok\s+\d+\s+-\s+(.+)$',re.I),re.compile(r'^FAILED\s+([^\s]+(?:::[^\s]+)*)'),re.compile(r'^FAIL\s+(.+?(?:\.[cm]?[jt]sx?|\.py))(?:\s|$)'),re.compile(r'^[×✗]\s+(.+)$')]
+    for raw in output.splitlines():
+        line=raw.strip()
+        for pattern in patterns:
+            match=pattern.match(line)
+            if match:
+                if match.group(1) not in found: found.append(match.group(1))
+                break
+        if len(found)>=25: break
+    return found
+
+def test_failure_analysis(output,exit_code,action='test'):
+    guardrails=['不得通过删除、跳过或弱化测试来制造通过','修改后先复跑失败测试，再运行受影响测试，最后运行回归测试']
+    if exit_code==0:
+        return {'category':'passed','confidence':1,'summary':f'{action} 执行通过；退出码为 0，但只证明本次命令通过。','failedTests':[],'evidence':[],'retryPolicy':{'automatic':False,'controlledRerun':False,'maxAttempts':0,'reason':'测试已经通过，无需重跑。'},'nextActions':['结合改动风险决定是否扩大回归范围。'],'guardrails':guardrails}
+    rules=[
+        ('resource',r'heap out of memory|ENOMEM|ENOSPC|no space left|too many open files|EMFILE|out of memory',.97,'测试受到内存、磁盘或句柄等资源限制。',False,['检查资源使用和未释放的进程、文件或连接。','修复资源问题后再运行原测试。']),
+        ('dependency',r'cannot find (?:module|package)|module not found|ModuleNotFoundError|ImportError|ERR_MODULE_NOT_FOUND|could not resolve|missing dependency',.94,'测试缺少依赖或依赖解析失败。',False,['核对锁文件、依赖声明和当前运行时，不自动修改全局环境。','修复依赖后运行原测试。']),
+        ('configuration',r'no tests? found|configuration error|config(?:uration)? file|unknown option|invalid config|missing (?:environment variable|env)|未找到.*测试|配置.*错误',.88,'测试配置、参数或测试发现过程可能有误。',False,['检查测试脚本、配置文件、工作目录和测试发现规则。','配置修复后运行原测试。']),
+        ('environment',r'command not found|not recognized as an internal|ENOENT|EACCES|permission denied|address already in use|EADDRINUSE|connection refused|ECONNREFUSED|无法启动执行环境',.92,'运行环境、权限、端口或外部服务导致测试无法正常执行。',False,['检查运行时、权限、端口和依赖服务状态。','环境恢复后运行原测试，不修改业务断言。']),
+        ('transient',r'ECONNRESET|socket hang up|temporary failure|temporarily unavailable|service unavailable|HTTP\s+50[234]|rate limit',.75,'输出包含可能的瞬时外部故障；单次失败不能证明测试不稳定。',True,['保留当前日志和随机种子，允许受控重跑一次。','若结果不一致，标记为 flaky 候选并隔离调查；不要持续重试。']),
+        ('test-defect-candidate',r'beforeAll|beforeEach|afterAll|afterEach|fixture.*(?:failed|error)|test setup failed|mock.*(?:not configured|unexpected)',.62,'失败发生在测试夹具、生命周期或 mock 中，可能是测试代码缺陷，也可能由产品代码触发。',False,['核对需求契约和测试前置条件。','只有证据证明预期过期或夹具错误时才修改测试。']),
+        ('assertion',r'AssertionError|assert\.\w+|expected.+(?:received|actual)|\bexpected\b|断言',.82,'测试出现确定性断言失败，需要定位产品实现或测试预期之间的偏差。',False,['读取首个业务相关堆栈、断言期望和实际值。','提出一个根因假设并做最小修改，然后定向复测。'])
+    ]
+    for category,pattern,confidence,summary,rerun,actions in rules:
+        matches=[line.strip()[:500] for line in output.splitlines() if re.search(pattern,line,re.I)][:8]
+        if matches:
+            return {'category':category,'confidence':confidence,'summary':summary,'failedTests':failed_test_names(output),'evidence':matches,'retryPolicy':{'automatic':False,'controlledRerun':rerun,'maxAttempts':1 if rerun else 0,'reason':'仅允许保留证据后的受控重跑；第二次失败必须改变方案。' if rerun else '当前失败需要先增加证据或修复原因，盲目重跑没有价值。'},'nextActions':actions,'guardrails':guardrails}
+    return {'category':'unknown','confidence':.35,'summary':'测试失败，但现有输出不足以可靠分类。','failedTests':failed_test_names(output),'evidence':[],'retryPolicy':{'automatic':False,'controlledRerun':False,'maxAttempts':0,'reason':'证据不足时不得盲目重跑或猜测修改。'},'nextActions':['获取完整日志、首个失败堆栈、运行时版本和随机种子。','缩小到最小失败测试；仍无法分类时停止自动修改并报告。'],'guardrails':guardrails}
+
 def diagnostics(root,args):
     target=resolve(root,args.get('path','.'),False);checker=args.get('checker','auto');timeout=max(1,min(300,int(args.get('timeoutSeconds',120))))
     package=root/'package.json';pyproject=root/'pyproject.toml';command=[]
@@ -515,7 +550,7 @@ def run_test_case(root,args):
         if name: command+=['-t',name]
     started=time.time();done=subprocess.run(command,cwd=root,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout);invalidate(root);output=(done.stdout+done.stderr)
     passed=len(re.findall(r'\b(?:pass(?:ed)?|✓)\b',output,re.I));failed=len(re.findall(r'\b(?:fail(?:ed)?|✗)\b',output,re.I))
-    return compact({'command':command,'exitCode':done.returncode,'durationMs':round((time.time()-started)*1000),'passedMarkers':passed,'failedMarkers':failed,'output':output[:50000],'truncated':len(output)>50000})
+    return compact({'command':command,'exitCode':done.returncode,'durationMs':round((time.time()-started)*1000),'passedMarkers':passed,'failedMarkers':failed,'failureAnalysis':test_failure_analysis(output,done.returncode,'test case'),'output':output[:50000],'truncated':len(output)>50000})
 
 def process_status(args):
     query=str(args.get('query','')).lower();port=args.get('port');limit=max(1,min(100,int(args.get('limit',30))));rows=[];listeners=[]

@@ -7,15 +7,17 @@ import {findVisionProjector} from './local-ai-vision.js'
 import type {StudioRuntime,StudioSettings,StudioLocalModel} from '../shared/local-ai-studio.js'
 import type {DeveloperPreferences,RuntimeLoadOptions} from '../shared/local-ai-developer.js'
 
+type RuntimeLogLevel='debug'|'info'|'warn'|'error'
 export class LocalAiRuntime {
  private child:ChildProcess|undefined
  private timer:ReturnType<typeof setTimeout>|undefined
  private key=''
  private status:StudioRuntime={state:'stopped',modelId:'',modelName:'',endpoint:'',error:'',logs:[]}
+ constructor(private readonly onLog?:(level:RuntimeLogLevel,message:string)=>void){}
  get apiKey(){return this.key}
  snapshot():StudioRuntime{return {...this.status,logs:[...this.status.logs]}}
  clearLogs(){this.status.logs=[]}
- private log(line:string){for(const part of line.split(/\r?\n/).filter(Boolean))this.status.logs.push(`${new Date().toLocaleTimeString()} ${part.replaceAll(this.key||'\0','[REDACTED]').slice(0,2000)}`);this.status.logs=this.status.logs.slice(-160)}
+ private log(line:string,level?:RuntimeLogLevel){for(const part of line.split(/[\r\n]+/).filter(Boolean)){const message=part.replaceAll(this.key||'\0','[REDACTED]').slice(0,2000),severity=level||(/error|fatal|failed|exception|失败|错误/i.test(message)?'error':/warn|警告/i.test(message)?'warn':'debug');this.status.logs.push(`${new Date().toLocaleTimeString()} ${message}`);this.onLog?.(severity,message)}this.status.logs=this.status.logs.slice(-160)}
  async start(settings:StudioSettings,model:StudioLocalModel,options:DeveloperPreferences={host:'127.0.0.1',parallel:1,embedding:false,metrics:true,hasApiKey:false},apiKey='',loadOptions:RuntimeLoadOptions={}){
   if(this.child||this.status.state==='starting')throw new Error('请先卸载当前模型')
   if(!validRuntimeExecutable(settings.runtimePath))throw new Error(`未找到可执行的 ${runtimeExecutableName()}。请在“模型服务 > 本地服务 > 运行时”中自动查找、安装官方运行包，或选择解压后具有执行权限的运行文件`)
@@ -34,15 +36,15 @@ export class LocalAiRuntime {
    env.LLAMA_API_KEY=this.key
    const pathKey=Object.keys(env).find(name=>name.toLowerCase()==='path')||'PATH';env[pathKey]=`${path.dirname(settings.runtimePath)}${path.delimiter}${env[pathKey]||''}`
    const child=spawn(settings.runtimePath,args,{windowsHide:true,shell:false,cwd:path.dirname(settings.runtimePath),env,stdio:['ignore','pipe','pipe']});this.child=child;this.status.pid=child.pid
-   this.log(`正在加载 ${model.file}；上下文 ${settings.contextLength}，GPU 层 ${settings.gpuLayers}`)
-   this.log(projector?`已加载视觉组件：${path.basename(projector)}`:'未加载视觉组件，当前仅支持文字输入')
+   this.log(`正在加载 ${model.file}；上下文 ${settings.contextLength}，GPU 层 ${settings.gpuLayers}`,'info')
+   this.log(projector?`已加载视觉组件：${path.basename(projector)}`:'未加载视觉组件，当前仅支持文字输入','info')
    child.stdout?.on('data',data=>this.log(String(data)));child.stderr?.on('data',data=>this.log(String(data)))
-   child.once('error',error=>{this.status.state='error';this.status.error=error.message;this.log(error.message);this.child=undefined;clearTimeout(this.timer)})
-   child.once('exit',(code,signal)=>{clearTimeout(this.timer);if(this.child===child)this.child=undefined;this.status.pid=undefined;if(this.status.state==='stopping')this.status.state='stopped';else if(this.status.state!=='error'){this.status.state='error';this.status.error=code!==null&&(code>>>0)===0xc0000135?'运行包缺少 DLL，请重新安装完整运行包，不要只复制 llama-server.exe':`模型进程已退出（${code??signal}），请查看日志；检查模型架构、运行包版本、内存和 GPU 参数`};this.log(`进程退出：${code??signal}`)})
+   child.once('error',error=>{this.status.state='error';this.status.error=error.message;this.log(error.message,'error');this.child=undefined;clearTimeout(this.timer)})
+   child.once('exit',(code,signal)=>{clearTimeout(this.timer);if(this.child===child)this.child=undefined;this.status.pid=undefined;if(this.status.state==='stopping')this.status.state='stopped';else if(this.status.state!=='error'){this.status.state='error';this.status.error=code!==null&&(code>>>0)===0xc0000135?'运行包缺少 DLL，请重新安装完整运行包，不要只复制 llama-server.exe':`模型进程已退出（${code??signal}），请查看日志；检查模型架构、运行包版本、内存和 GPU 参数`};this.log(`进程退出：${code??signal}`,this.status.state==='error'?'error':'info')})
    const deadline=Date.now()+300_000
    const poll=async()=>{
     if(this.child!==child||this.status.state!=='starting')return
-    try{const response=await fetch(`${this.status.endpoint}/models`,{headers:{Authorization:`Bearer ${this.key}`},signal:AbortSignal.timeout(2000)});if(response.ok){const json=await response.json() as {data?:{id?:string}[]};if(json.data?.some(item=>item.id===this.status.modelName)&&this.child===child&&this.status.state==='starting'){this.status.state='running';this.log('模型已就绪，OpenAI 兼容服务已启动');return}}}catch{}
+    try{const response=await fetch(`${this.status.endpoint}/models`,{headers:{Authorization:`Bearer ${this.key}`},signal:AbortSignal.timeout(2000)});if(response.ok){const json=await response.json() as {data?:{id?:string}[]};if(json.data?.some(item=>item.id===this.status.modelName)&&this.child===child&&this.status.state==='starting'){this.status.state='running';this.log('模型已就绪，OpenAI 兼容服务已启动','info');return}}}catch{}
     if(this.child!==child||this.status.state!=='starting')return
     if(Date.now()>deadline){this.status.state='error';this.status.error='模型加载超过 5 分钟，请查看日志并尝试降低上下文或 GPU 层数';child.kill();return}
     this.timer=setTimeout(()=>void poll(),1000);this.timer.unref()

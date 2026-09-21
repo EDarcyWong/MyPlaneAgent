@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto'
 import type {AgentWorkspace,PreparedAction} from './workspace.js'
 import {executeProcess,type ProcessRequest} from './execution-supervisor.js'
 import {ToolError} from './registry.js'
+import {analyzeTestResult} from './test-analysis.js'
 
 export type Diagnostic={file?:string;line?:number;column?:number;severity:'error'|'warning';code?:string;message:string}
 export function parseDiagnostics(text:string):Diagnostic[]{
@@ -44,10 +45,13 @@ export function prepareBuild(workspace:AgentWorkspace,args:Record<string,unknown
   // Only fixed manager names and validated manifest script identifiers enter cmd.
   executable=process.env.ComSpec||'cmd.exe';argv=['/d','/s','/c',`${manager} run ${action}`]
  }
- const request:ProcessRequest={executable,args:argv,cwd:workspace.root,shell,timeoutMs:timeout*1000}
- return {preview:{command:[executable,...argv].join(' '),cwd:workspace.root,note:'执行项目已有脚本，可能运行任意项目代码；不自动安装或更新依赖。'},execute:async(signal,onOutput)=>{
+ const request:ProcessRequest={executable,args:argv,cwd:workspace.root,shell,timeoutMs:timeout*1000,sandbox:'prefer',...(profile.kind==='python'?{sandboxImage:process.env.MYPLANE_SANDBOX_PYTHON_IMAGE?.trim()||'python:3.12-slim'}:{})}
+ return {preview:{command:[executable,...argv].join(' '),cwd:workspace.root,note:'优先在本机已有容器沙盒中执行，默认断网并限制资源；沙盒不可用时需用户确认后降级，不自动安装依赖。'},execute:async(signal,onOutput)=>{
   if(inspectBuild(workspace).profileHash!==profile.profileHash)throw new ToolError('BUILD_CONFLICT','构建配置或锁文件在确认期间发生变化，请重新检查')
   const result=await executeProcess(request,signal,onOutput),diagnostics=parseDiagnostics(result.output)
-  return JSON.stringify({...result,profile:{kind:profile.kind,hash:profile.profileHash,action},diagnostics,validation:{passed:result.exitCode===0&&!result.termination,note:'仅确认本次构建/测试命令结果，不代表全部需求通过。'}})
+  const failureAnalysis=analyzeTestResult(result,diagnostics,action)
+  // Put structured, actionable fields before raw output so paged tool results
+  // still expose the diagnosis and retry policy to the model.
+  return JSON.stringify({exitCode:result.exitCode,durationMs:result.durationMs,termination:result.termination,error:result.error,truncated:result.truncated,sandbox:result.sandbox,profile:{kind:profile.kind,hash:profile.profileHash,action},diagnostics,failureAnalysis,validation:{passed:result.exitCode===0&&!result.termination,note:'仅确认本次构建/测试命令结果，不代表全部需求通过。'},output:result.output})
  }}
 }

@@ -8,7 +8,9 @@ import {createServer} from 'node:http'
 import {ExecutionJournal,contentHash} from '../dist-electron/main/agent/execution-journal.js'
 import {AgentWorkspace} from '../dist-electron/main/agent/workspace.js'
 import {inspectBuild,prepareBuild,parseDiagnostics} from '../dist-electron/main/agent/build-profile.js'
+import {analyzeTestResult,parseFailedTests} from '../dist-electron/main/agent/test-analysis.js'
 import {executeProcess} from '../dist-electron/main/agent/execution-supervisor.js'
+import {buildSandboxedRequest,sandboxCapability} from '../dist-electron/main/agent/execution-sandbox.js'
 import {PythonToolRuntime} from '../dist-electron/main/agent/python.js'
 import {AgentToolStore} from '../dist-electron/main/agent/tool-store.js'
 import {LocalAgentService} from '../dist-electron/main/agent/service.js'
@@ -40,11 +42,35 @@ test('build discovery is read-only, captures diagnostic locations and rejects ch
  fs.writeFileSync(path.join(root,'build.cjs'),"console.log('src/main.ts(4,2): error TS2322: Type mismatch');process.exitCode=2")
  const profile=inspectBuild(workspace);assert.equal(profile.kind,'node');assert.deepEqual(profile.scripts,['build'])
  const prepared=prepareBuild(workspace,{action:'build'});const result=JSON.parse(await prepared.execute(signal()))
- assert.equal(result.exitCode,2);assert.deepEqual(result.diagnostics[0],{file:'src/main.ts',line:4,column:2,severity:'error',code:'TS2322',message:'Type mismatch'});assert.equal(result.validation.passed,false)
+ assert.equal(result.exitCode,2);assert.deepEqual(result.diagnostics[0],{file:'src/main.ts',line:4,column:2,severity:'error',code:'TS2322',message:'Type mismatch'});assert.equal(result.validation.passed,false);assert.equal(result.failureAnalysis.category,'unknown');assert.equal(result.failureAnalysis.retryPolicy.automatic,false)
  const stale=prepareBuild(workspace,{action:'build'});fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{build:'node something-else.cjs'}}))
  await assert.rejects(stale.execute(signal()),/配置或锁文件/)
  assert.throws(()=>prepareBuild(workspace,{action:'build & echo BAD'}),/未定义/)
  assert.equal(parseDiagnostics('C:\\src\\a.c:10:2: error: bad')[0].line,10)
+})
+
+test('test failures are classified with evidence and bounded retry policies',()=>{
+ const assertion=analyzeTestResult({exitCode:1,output:'not ok 1 - cancels a paid order\nAssertionError: expected cancelled received paid'},[],'test')
+ assert.equal(assertion.category,'assertion');assert.deepEqual(assertion.failedTests,['cancels a paid order']);assert.equal(assertion.retryPolicy.controlledRerun,false);assert.match(assertion.guardrails[0],/删除、跳过或弱化/)
+ const transient=analyzeTestResult({exitCode:1,output:'socket hang up ECONNRESET'},[],'test')
+ assert.equal(transient.category,'transient');assert.equal(transient.retryPolicy.controlledRerun,true);assert.equal(transient.retryPolicy.maxAttempts,1);assert.equal(transient.retryPolicy.automatic,false)
+ const dependency=analyzeTestResult({exitCode:1,output:"ModuleNotFoundError: No module named 'pytest'"},[],'test')
+ assert.equal(dependency.category,'dependency');assert.equal(dependency.retryPolicy.maxAttempts,0)
+ const timeout=analyzeTestResult({exitCode:null,output:'',termination:'timeout',error:'命令超过运行时间限制'},[],'test')
+ assert.equal(timeout.category,'timeout');assert.equal(timeout.confidence,1);assert.equal(timeout.retryPolicy.controlledRerun,false)
+ assert.deepEqual(parseFailedTests('FAILED tests/test_order.py::test_cancel - AssertionError\nFAIL src/order.test.ts'),['tests/test_order.py::test_cancel','src/order.test.ts'])
+})
+
+test('managed run_test returns failure analysis before its raw output',async t=>{
+ const root=sandbox(t),runtime=new PythonToolRuntime()
+ try{
+  fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{test:'node failing.cjs'}}))
+  fs.writeFileSync(path.join(root,'failing.cjs'),"console.log('not ok 1 - fixture case\\nAssertionError: expected yes received no');process.exit(1)")
+  const store=new AgentToolStore(path.join(root,'tools.json'),runtime),spec=store.specs(root).find(item=>item.definition.function.name==='run_test')
+  const prepared=await spec.prepare({script:'test',timeoutSeconds:10},signal(),{})
+  const result=JSON.parse(await prepared.execute(signal()))
+  assert.equal(result.exitCode,1);assert.equal(result.failureAnalysis.category,'assertion');assert.deepEqual(result.failureAnalysis.failedTests,['fixture case']);assert.equal(result.failureAnalysis.retryPolicy.automatic,false)
+ }finally{await runtime.dispose()}
 })
 
 test('supervisor retains long output and split UTF-8; cancellation and timeout are explicit',async t=>{
@@ -55,6 +81,15 @@ test('supervisor retains long output and split UTF-8; cancellation and timeout a
  const timed=await executeProcess(request,signal());assert.equal(timed.termination,'timeout')
  const controller=new AbortController(),pending=executeProcess({...request,timeoutMs:5000},controller.signal);setTimeout(()=>controller.abort(),50)
  assert.equal((await pending).termination,'cancelled')
+})
+
+test('sandbox wrapper disables network, drops privileges and host fallback uses a temporary home',async t=>{
+ const root=sandbox(t),wrapped=buildSandboxedRequest({executable:'node',args:['-e',"console.log('ok')"],cwd:root},{available:true,runtime:'docker',image:'fixture:latest',reason:'fixture'})
+ assert.equal(wrapped.executable,'docker');assert.ok(wrapped.args.includes('none'));assert.ok(wrapped.args.includes('ALL'));assert.ok(wrapped.args.includes('no-new-privileges'));assert.ok(wrapped.args.includes('fixture:latest'));assert.ok(wrapped.args.some(value=>value===`${path.resolve(root)}:/workspace:rw`))
+ const previous=process.env.MYPLANE_SANDBOX_DISABLE;process.env.MYPLANE_SANDBOX_DISABLE='1';t.after(()=>{if(previous===undefined)delete process.env.MYPLANE_SANDBOX_DISABLE;else process.env.MYPLANE_SANDBOX_DISABLE=previous;sandboxCapability(true)})
+ sandboxCapability(true)
+ const result=await executeProcess({executable:process.execPath,args:['-e','console.log(process.env.HOME)'],cwd:root,timeoutMs:3000,sandbox:'prefer'},signal())
+ const temporary=result.output.trim();assert.equal(result.sandbox.active,false);assert.equal(result.sandbox.home,'temporary');assert.notEqual(temporary,process.env.HOME);assert.equal(fs.existsSync(temporary),false)
 })
 
 test('cancelling one Python invocation does not terminate another invocation',async t=>{
@@ -112,7 +147,7 @@ test('unknown external side effects block further writes across continuation unt
  let executions=0,round=0
  const external=()=>[{definition:{type:'function',function:{name:'external',description:'fixture',parameters:{type:'object',properties:{},additionalProperties:false}}},source:'mcp:test',risk:'high',timeoutMs:1000,execute:async()=>{executions++;throw new Error('connection lost')}}]
  const h=await harness(t,()=>response(null,[round++===0?call('external',{}):call('write_file',{path:'after.txt',content:'done'})]),external)
- const first=h.start();await until(()=>!h.service.active(first.id));let task=h.service.get(first.id)
+ const first=h.start();await until(()=>h.service.get(first.id).status==='waiting');h.service.approve(first.id,h.service.get(first.id).events.at(-1).id,true,7);await until(()=>!h.service.active(first.id));let task=h.service.get(first.id)
  const event=task.events.find(event=>event.tool==='external');assert.equal(event.execution.state,'unknown');assert.equal(executions,1)
  h.start({taskId:first.id,prompt:'继续'});await until(()=>!h.service.active(first.id));assert.equal(fs.existsSync(path.join(h.workspace,'after.txt')),false)
  h.service.resolveExecution(first.id,event.id,'completed','已核对外部服务，提交已完成')
