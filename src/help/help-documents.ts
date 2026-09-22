@@ -3,6 +3,6 @@ import workflow from './workflow.md?raw'
 export const helpDocuments = [{
   id: 'workflow',
   title: '工作流使用指南',
-  description: '从第一个流程到数据组装，了解组件、分支与运行方式。',
+  description: '组件分类与用法、输出内容、变量引用、人工确认、结束范围和错误排查。',
   content: workflow,
 }]
