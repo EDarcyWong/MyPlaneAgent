@@ -12,7 +12,7 @@ export type AgentAnswer=Omit<AgentMessage,'content'>&{content:string|null;reason
 export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean;apiFormat?:RemoteApiFormat}
 export class ModelFormatError extends Error {constructor(message:string){super(message);this.name='ModelFormatError'}}
 export const agentModelTiming={firstResponseMs:10*60*1000,idleMs:5*60*1000,totalMs:30*60*1000}
-type RequestOptions={tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
+type RequestOptions={onResponse?:(text:string)=>void;tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
 const llamaGrammarOnlyKeywords=new Set(['minLength','maxLength','minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf','minItems','maxItems','minProperties','maxProperties','pattern'])
 function llamaSchema(value:unknown):unknown{
  if(Array.isArray(value))return value.map(llamaSchema)
@@ -44,6 +44,7 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
    let content='',reasoning='',characters=0,wireSize=0,finish=''
    const calls=new Map<number,{id:string;type:string;function:{name:string;arguments:string}}>()
    for await(const frame of sseData(response.body,combined)){
+    options.onResponse?.(frame+'\n')
     if(frame==='[DONE]')break
     wireSize+=frame.length;if(wireSize>responseWireLimit)throw new Error('模型响应流过大，请缩小任务')
     let chunk:Record<string,unknown>;try{chunk=record(JSON.parse(frame))}catch{throw new ModelFormatError('模型响应流格式错误，本轮未执行工具')}
@@ -79,7 +80,7 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
    // Some compatible servers return one JSON response even when streaming was requested.
    const reader=response.body.getReader(),parts:Uint8Array[]=[];let size=0
    try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>responseWireLimit)throw new Error('模型响应超过应用单轮容量，请缩小任务');parts.push(value);if(value.length)activity()}}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
-   const text=Buffer.concat(parts).toString('utf8')
+   const text=Buffer.concat(parts).toString('utf8');options.onResponse?.(text)
    if(!response.ok){
     let code='';try{code=String(record(record(JSON.parse(text)).error).code||'')}catch{/* Preserve non-JSON errors below. */}
     if(response.status===404&&code==='model_not_found')throw new Error(`模型不存在或实例已失效（${model}）。请刷新模型列表，重新选择已加载的模型后继续任务。`)
@@ -141,14 +142,15 @@ async function requestAnthropic(connection:AgentConnection,model:string,messages
  const converted=anthropicMessages(messages)
  const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/messages`,{method:'POST',headers:{'Content-Type':'application/json','anthropic-version':'2023-06-01',...(connection.key?{'x-api-key':connection.key}:{})},body:JSON.stringify({model,max_tokens:connection.maxTokens,messages:converted.messages,...(converted.system?{system:converted.system}:{}),...(!tools||!tools.length?{}:{tools:tools.map(tool=>({name:tool.function.name,description:tool.function.description,input_schema:tool.function.parameters}))}),stream:true}),signal})
  if(!response.body)throw new Error('模型响应为空')
- if(!response.ok){const text=(await response.text()).slice(0,1000);throw new Error(`Anthropic 模型请求失败（HTTP ${response.status}）：${text||response.statusText}`)}
+ if(!response.ok){const body=await response.text();options.onResponse?.(body);const text=body.slice(0,1000);throw new Error(`Anthropic 模型请求失败（HTTP ${response.status}）：${text||response.statusText}`)}
  if(!response.headers.get('content-type')?.includes('text/event-stream')){
-  const data=record(await response.json());acceptUsage(data)
+  const text=await response.text();options.onResponse?.(text);const data=record(JSON.parse(text));acceptUsage(data)
   return validateAnthropicAnswer(data,connection.maxTokens,options)
  }
  let content='',reasoning='',characters=0,wireSize=0,stopReason=''
  const calls=new Map<number,{id:string;name:string;arguments:string}>()
  for await(const frame of sseData(response.body,signal)){
+  options.onResponse?.(frame+'\n')
   wireSize+=frame.length;if(wireSize>responseWireLimit)throw new Error('模型响应流过大，请缩小任务')
   let chunk:Record<string,unknown>;try{chunk=record(JSON.parse(frame))}catch{throw new ModelFormatError('Anthropic 响应流格式错误，本轮未执行工具')}
   if(chunk.type==='error')throw new Error(String(record(chunk.error).message||'Anthropic 服务返回错误'))

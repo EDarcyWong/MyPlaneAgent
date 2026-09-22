@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('myplane',{
  onApplicationLogToggle:(callback:()=>void)=>{const listener=()=>callback();ipcRenderer.on('app:toggle-log-output',listener);return()=>ipcRenderer.removeListener('app:toggle-log-output',listener)},
  openAiLink:(url:string):Promise<void>=>ipcRenderer.invoke('ai:open-link',url),
  openWorkflowEditor:(workflowId?:string):Promise<void>=>ipcRenderer.invoke('workflow:open-editor',workflowId),
+ openHelpDocument:(documentId:'workflow'='workflow'):Promise<void>=>ipcRenderer.invoke('help:open-document',documentId),
  closeWorkflowEditor:():Promise<void>=>ipcRenderer.invoke('workflow:editor-close'),
  workflowEditorSaved:(workflowId:string):Promise<void>=>ipcRenderer.invoke('workflow:editor-saved',workflowId),
  onWorkflowSaved:(callback:(workflowId?:string)=>void)=>{const listener=(_event:unknown,workflowId?:string)=>callback(workflowId);ipcRenderer.on('workflow:saved',listener);return()=>ipcRenderer.removeListener('workflow:saved',listener)},

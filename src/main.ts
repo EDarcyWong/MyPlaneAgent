@@ -10,7 +10,10 @@ type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:Wor
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
-if(params.get('surface')==='workflow-editor'){
+if(params.get('surface')==='help'){
+ document.title='工作流使用指南 · MyPlaneAgent'
+ void import('./help/HelpWindow.vue').then(({default:HelpWindow})=>createApp(HelpWindow,{documentId:params.get('document')||'workflow'}).mount('#app'))
+}else if(params.get('surface')==='workflow-editor'){
  void Promise.all([window.myplane.localAiStudio('bootstrap'),window.myplane.localAiStudio('connect',{reason:'startup'})]).then(([bootstrap,connection])=>{
   document.title=params.get('workflowId')?'编辑工作流 · MyPlaneAgent':'新建工作流 · MyPlaneAgent'
   const remoteCache=bootstrap.remoteModelCache.find(item=>item.apiFormat===bootstrap.settings.apiFormat&&item.endpoint===bootstrap.settings.endpoint),

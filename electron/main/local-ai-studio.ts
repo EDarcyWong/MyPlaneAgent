@@ -1,3 +1,4 @@
+import { workflowValidationMessage } from "../shared/workflow-validation.js";
 import {
   compactContext,
   contextMessages,
@@ -245,6 +246,7 @@ export class LocalAiStudioService extends LocalAiService {
           .find((project) => project.id === id);
         return this.toolStore.specs(project?.workspace || process.cwd());
       },
+      message => log?.("error", "ai-conversation", message),
     );
     this.probeFile = path.join(dataRoot, "local-ai-model-profiles.json");
     this.mcp = new AgentMcpManager(
@@ -2104,6 +2106,8 @@ export class LocalAiStudioService extends LocalAiService {
         return this.workflow.resolveApproval(
           required(value.runId, "运行 ID"),
           decision as "approved" | "rejected",
+          textValue(value.nodeId) || undefined,
+          textValue(value.note),
         );
       }
       case "workflowAction": {
@@ -2136,7 +2140,11 @@ export class LocalAiStudioService extends LocalAiService {
           });
           if (result.response !== 1) throw new Error("已取消保存工作流");
         }
-        return this.workflow.save(input);
+        try {
+          return this.workflow.save(input);
+        } catch (error) {
+          throw new Error(workflowValidationMessage(error));
+        }
       }
       case "automationTasks":
         return this.automation.tasks();

@@ -1,3 +1,4 @@
+import { diagnosticText, writeConversationDiagnostic } from './diagnostics.js'
 import type {StudioSession,StudioImage} from '../../shared/local-ai-studio.js'
 import {chatImages,chatMessageContent} from '../../shared/local-ai-chat.js'
 import {emptyTokenUsageTotals,updateTokenUsageTotals,type TokenUsage} from '../../shared/local-ai-usage.js'
@@ -66,12 +67,36 @@ export const AGENT_FAST_MAX_OUTPUT_TOKENS=8192
 export const AGENT_EMERGENCY_MAX_STEPS=500
 export const AGENT_FAILURE_LIMIT=10
 export class LocalAgentService {
+ private conversations=new Map<string,{request:string;response:string;model:string;error?:string;sanitize:(text:string)=>string}>()
  private registryCache?:{key:string;value:ToolRegistry}
  private runs=new Map<string,Run>()
  private compactions=new Map<string,{owner:number;controller:AbortController}>()
- constructor(private directory:string,private connection:()=>AgentConnection,private externalTools:(projectId:string)=>ToolSpec[]=()=>[],private managedTools:(projectId:string)=>ToolSpec[]=()=>builtinSpecs()){
+ constructor(private directory:string,private connection:()=>AgentConnection,private externalTools:(projectId:string)=>ToolSpec[]=()=>[],private managedTools:(projectId:string)=>ToolSpec[]=()=>builtinSpecs(),private diagnosticLog?:(message:string)=>void){
   fs.mkdirSync(directory,{recursive:true})
   for(const file of fs.readdirSync(directory).filter(f=>/^[a-f\d-]{36}\.json$/i.test(f))){try{const task=this.load(file.slice(0,-5));if(task.status==='running'||task.status==='waiting'){task.status='stopped';delete task.modelProgress;task.error='应用关闭或任务中断。可输入补充要求后继续；未确认操作不会自动执行。';for(const event of task.events)if(event.status==='running'||event.status==='waiting'){event.status='failed';event.output='执行被中断，结果未确认；继续前请检查当前文件状态。'}this.reconcileTask(task);this.closePendingCalls(task);this.save(task)}}catch{/* Keep damaged task files available for manual recovery. */}}
+ }
+ private async requestModel(task:AgentTask,connection:AgentConnection,messages:AgentMessage[],signal:AbortSignal,options:Parameters<typeof requestAgentModel>[4]={}):Promise<AgentAnswer>{
+  const diagnostic={request:diagnosticText(JSON.stringify({messages,tools:options.tools}),connection.key),response:'',model:task.model,error:undefined as string|undefined,sanitize:(text:string)=>diagnosticText(text,connection.key)}
+  this.conversations.delete(task.id);this.conversations.set(task.id,diagnostic)
+  while(this.conversations.size>20)this.conversations.delete(this.conversations.keys().next().value!)
+  let response=''
+  try{
+   const answer=await requestAgentModel(connection,task.model,messages,signal,{...options,onResponse:text=>{response+=text;if(response.length>262144)response=response.slice(0,131072)+'\n[响应过长，中间内容已截断]\n'+response.slice(-65536);options.onResponse?.(text)}})
+   diagnostic.response=diagnosticText(JSON.stringify(answer),connection.key)
+   return answer
+  }catch(error){
+   diagnostic.response=diagnosticText(response || '[未收到模型响应]',connection.key)
+   if(!signal.aborted)this.logModelConversation(task.id,error)
+   throw error
+  }
+ }
+ logModelConversation(taskId:string,error:unknown,sink=this.diagnosticLog){
+  const diagnostic=this.conversations.get(taskId)
+  if(!diagnostic || !sink)return
+  const message=diagnostic.sanitize(String(error))
+  if(diagnostic.error===message)return
+  diagnostic.error=message
+  try{writeConversationDiagnostic(sink,{taskId,...diagnostic,error:message})}catch{/* Diagnostics must not change task execution. */}
  }
  private registry(task:AgentTask){
   const controlled=new Set(['load_tool_pack','read_tool_result','inspect_build','build_project','reconcile_execution','web_search','web_fetch'])
@@ -284,7 +309,7 @@ export class LocalAgentService {
     let checkpoint:StoredTask['checkpoint'],recovered=false
     try{checkpoint=await compactContext({history:task.messages,system,checkpoint:task.checkpoint,budget,force,aggressive,signal,summarize:async(messages,maxTokens)=>{
      if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','压缩期间已达到任务 Token 预算，调整预算后可继续');task.usage??={...emptyTokenUsageTotals(),incompleteHistory:true};task.usage.requests++;let reported:TokenUsage|undefined
-     const answer=await requestAgentModel({...connection,maxTokens},task.model,messages as AgentMessage[],signal,{tools:false,summary:true,onUsage:usage=>{updateTokenUsageTotals(task.usage!,reported,usage);reported=usage}})
+     const answer=await this.requestModel(task,{...connection,maxTokens},messages as AgentMessage[],signal,{tools:false,summary:true,onUsage:usage=>{updateTokenUsageTotals(task.usage!,reported,usage);reported=usage}})
      return answer.content||''
     }})}catch(error){
      signal.throwIfAborted()
@@ -376,7 +401,7 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
      task.usage!.requests++;let lastProgress=0,reportedUsage:TokenUsage|undefined
      const event=()=>{if(!streaming){streaming={id:randomUUID(),kind:'assistant',text:'',reasoning:'',status:'running',createdAt:now()};task.events.push(streaming)}return streaming}
      const update=()=>{if(Date.now()-lastProgress>200){lastProgress=Date.now();this.publish(run,false)}}
-     return requestAgentModel(connection,task.model,messages,inferenceSignal,{tools:definitions,thinking:outputRecovery?false:task.mode==='chat'?undefined:task.fastMode===false,onReasoning:text=>{if(!text)return;event().reasoning=(event().reasoning||'')+text;update()},...(task.mode==='chat'?{onContent:(text:string)=>{if(!text)return;event().text+=text;update()}}:{}),onUsage:usage=>{updateTokenUsageTotals(task.usage!,reportedUsage,usage);reportedUsage=usage;if(Date.now()-lastProgress>400){lastProgress=Date.now();this.publish(run,false)}},onProgress:progress=>{if(inferenceSignal.aborted)return;Object.assign(task.modelProgress!,progress);if(Date.now()-lastProgress>400){lastProgress=Date.now();this.publish(run,false)}}}).then(answer=>{
+     return this.requestModel(task,connection,messages,inferenceSignal,{tools:definitions,thinking:outputRecovery?false:task.mode==='chat'?undefined:task.fastMode===false,onReasoning:text=>{if(!text)return;event().reasoning=(event().reasoning||'')+text;update()},...(task.mode==='chat'?{onContent:(text:string)=>{if(!text)return;event().text+=text;update()}}:{}),onUsage:usage=>{updateTokenUsageTotals(task.usage!,reportedUsage,usage);reportedUsage=usage;if(Date.now()-lastProgress>400){lastProgress=Date.now();this.publish(run,false)}},onProgress:progress=>{if(inferenceSignal.aborted)return;Object.assign(task.modelProgress!,progress);if(Date.now()-lastProgress>400){lastProgress=Date.now();this.publish(run,false)}}}).then(answer=>{
       if(task.mode!=='chat'&&connection.contextLength<=8192&&(answer.tool_calls?.length||0)>1)throw new ModelFormatError('小上下文每轮最多调用一个工具；本轮工具均未执行')
       return answer
      })
@@ -551,7 +576,7 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
     }
    }
    task.status='stopped';task.error=task.maxSteps?`已达到本次 ${task.maxSteps} 轮上限。检查进展后可继续任务。`:`已达到 ${AGENT_EMERGENCY_MAX_STEPS} 轮异常循环保护上限。检查进展后可继续任务。`
-  }catch(error){task.status=signal.aborted||error instanceof ModelOutputLimitError||error instanceof ToolError&&['EXECUTION_PAUSED','TOKEN_BUDGET'].includes(error.code)?'stopped':'failed';task.error=signal.aborted?'任务已停止；已保存的文件仍保留。':String(error)}
+  }catch(error){if(!signal.aborted)this.logModelConversation(task.id,error);task.status=signal.aborted||error instanceof ModelOutputLimitError||error instanceof ToolError&&['EXECUTION_PAUSED','TOKEN_BUDGET'].includes(error.code)?'stopped':'failed';task.error=signal.aborted?'任务已停止；已保存的文件仍保留。':String(error)}
   finally{
     delete task.modelProgress;task.runCompletedAt=now();const runUser=[...task.events].reverse().find(event=>event.kind==='user');if(runUser)runUser.durationMs=Math.max(0,Date.parse(task.runCompletedAt)-Date.parse(task.runStartedAt||runUser.createdAt))
    this.updateFacts(task)
@@ -561,5 +586,5 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
    try{this.publish(run)}catch(error){task.error='保存任务失败：'+String(error);task.status='failed';run.emit(this.public(task))}
   }
  }
- dispose(){for(const run of [...this.runs.values(),...this.compactions.values()])run.controller.abort()}
+ dispose(){for(const run of [...this.runs.values(),...this.compactions.values()])run.controller.abort();this.conversations.clear()}
 }

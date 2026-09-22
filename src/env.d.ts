@@ -12,6 +12,7 @@ declare global {
    onApplicationLogToggle(callback:()=>void):()=>void
    openAiLink(url:string):Promise<void>
    openWorkflowEditor(workflowId?:string):Promise<void>
+   openHelpDocument(documentId?:'workflow'):Promise<void>
    closeWorkflowEditor():Promise<void>
    workflowEditorSaved(workflowId:string):Promise<void>
    onWorkflowSaved(callback:(workflowId?:string)=>void):()=>void

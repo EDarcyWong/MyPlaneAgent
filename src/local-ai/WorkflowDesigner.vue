@@ -10,6 +10,12 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Aim,
+  ChatLineSquare,
+  Sort,
+  Checked,
+  Collection,
+  Operation,
+  Switch,
   Bell,
   Check,
   Close,
@@ -23,6 +29,7 @@ import {
   Fold,
   FullScreen,
   Guide,
+  QuestionFilled,
   MagicStick,
   Plus,
   RefreshLeft,
@@ -35,6 +42,14 @@ import {
   ZoomOut,
 } from "@element-plus/icons-vue";
 import type { AgentProject } from "../../electron/shared/local-ai-agent";
+import { ruleOperators, isDecision } from "../../electron/shared/workflow-decisions";
+import type { WorkflowRule } from "../../electron/shared/local-ai-workflow";
+import { mapVariableReferences } from "../../electron/shared/workflow-variable-references";
+import { workflowInputPreview } from "../../electron/shared/workflow-inputs";
+import { readWorkflowValidationError } from "../../electron/shared/workflow-validation";
+import { nextWorkflowNodeName, workflowNodeNameError } from "../../electron/shared/workflow-node-names";
+import { parseWorkflowAiOutput } from "../../electron/shared/workflow-ai-output";
+import { formatWorkflowJson, parseWorkflowJsonTemplate, workflowJsonError } from "../../electron/shared/workflow-json-template";
 import type {
   WorkflowBranch,
   WorkflowDefinition,
@@ -68,6 +83,7 @@ const definitions = ref<WorkflowDefinition[]>([]),
 const canvas = ref<HTMLElement>(),
   canvasHost = ref<HTMLElement>(),
   editorBody = ref<HTMLElement>();
+const saveErrorNodeIds = ref(new Set<string>());
 let timer: ReturnType<typeof setInterval> | undefined,
   autoSaveTimer: ReturnType<typeof setInterval> | undefined,
   historyTimer: ReturnType<typeof setTimeout> | undefined,
@@ -92,8 +108,19 @@ type FormNode = {
   branchMode: "ai" | "rules";
   sourceNodeId: string;
   operator: "succeeded" | "failed";
+  rules: WorkflowRule[];
+  ruleMode: 'all' | 'any';
+  switchValue: string;
+  switchKind: 'text' | 'number' | 'boolean';
+  switchCases: {branchId:string;value:string}[];
+  defaultBranchId: string;
   assignments: WorkflowVariableAssignment[];
   joinMode: "all" | "any";
+  approvalTitle: string;
+  approvalWaitMode: 'forever'|'duration'|'until';
+  approvalDuration: number;
+  approvalDeadline: string;
+  approvalTimeoutAction: 'reject'|'fail';
   approvalPrompt: string;
   approveLabel: string;
   rejectLabel: string;
@@ -101,6 +128,8 @@ type FormNode = {
   body: string;
   endStatus: "succeeded" | "failed";
   endSummary: string;
+  endScope: 'path'|'workflow';
+  endResult: string;
   x: number;
   y: number;
 };
@@ -161,6 +190,7 @@ const connection = ref<ConnectionDraft>(),
     targetId: string;
   }>(),
   selectedNodeIds = ref(new Set<string>(["__start__"]));
+const componentPanelCollapsed = ref(false);
 const inspectorFloating = ref(false),
   inspectorPosition = reactive({ x: 24, y: 18 }),
   inspectorDrag = ref<InspectorDragState>();
@@ -171,15 +201,18 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
   const names: Record<FormNode["type"], string> = {
       agent: "Agent 任务",
       condition: "旧版判断",
-      route: "条件路由",
-      data: "设置数据",
+      route: "旧版路由",
+      judge: "数据判断", predicate: "条件判断", switch: "Switch",
+      data: "数据变量",
       join: "汇合",
       approval: "人工确认",
       notify: "系统通知",
       end: "结束",
     },
     branches: FormBranch[] =
-      type === "agent"
+      isDecision(type)
+        ? ['成立', type === 'switch' ? '默认' : '不成立'].map((name, i) => ({id:`decision_${nodeSequence}_${i}`,name:type === 'switch' && i === 0 ? '匹配 1' : name,condition:'',color:i ? '#d45b68' : '#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'}))
+        : type === "agent"
         ? [
             {
               id: `result_${nodeSequence}`,
@@ -190,19 +223,27 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
               outputValue: '{"result":""}',
             },
           ]
+        : type === "join"
+          ? [{ id: `joined_${nodeSequence}`, name: "汇合完成", condition: "", color: "#347fc5", targetNodeIds: [], outputValue: '{"result":""}' }]
+        : type === "data"
+          ? [{ id: `data_${nodeSequence}`, name: "设置完成", condition: "", color: "#347fc5", targetNodeIds: [], outputValue: '{"result":""}' }]
+        : type === "notify"
+          ? ['发送成功','发送失败'].map((name,i)=>({id:`notify_${nodeSequence}_${i}`,name,condition:'',color:i?'#d45b68':'#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'}))
         : type === "approval"
           ? [
               {
                 id: `approved_${nodeSequence}`,
                 name: "批准",
-                condition: "执行成功",
+                condition: "",
+                outputValue:'{"result":""}',
                 color: "#2f9b74",
                 targetNodeIds: [],
               },
               {
                 id: `rejected_${nodeSequence}`,
                 name: "拒绝",
-                condition: "执行失败",
+                condition: "",
+                outputValue:'{"result":""}',
                 color: "#d45b68",
                 targetNodeIds: [],
               },
@@ -210,7 +251,7 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
           : [];
   return {
     id: `step_${Date.now().toString(36)}_${nodeSequence}`,
-    name: names[type],
+    name: nextWorkflowNodeName(form.nodes, type, names[type]),
     type,
     branches,
     instruction: "",
@@ -224,8 +265,11 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     branchMode: "ai",
     sourceNodeId: "",
     operator: "succeeded",
+    rules: [{kind:'text',left:'',operator:'eq',right:''}], ruleMode:'all',
+    switchValue:'',switchKind:'text',switchCases:type === 'switch' ? [{branchId:branches[0].id,value:''}] : [],defaultBranchId:type === 'switch' ? branches[1].id : '',
     assignments: type === "data" ? [{ name: "result", value: "" }] : [],
     joinMode: "all",
+    approvalTitle:'人工确认',approvalWaitMode:'forever',approvalDuration:60,approvalDeadline:'',approvalTimeoutAction:'reject',
     approvalPrompt: "请确认是否继续执行工作流",
     approveLabel: "批准",
     rejectLabel: "拒绝",
@@ -233,7 +277,8 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     body: "工作流节点执行完成",
     endStatus: "succeeded",
     endSummary: "工作流执行完成",
-    x: 320 + (index % 3) * 290,
+    endScope:"path",endResult:"",
+    x: 430 + (index % 3) * 290,
     y: 110 + Math.floor(index / 3) * 190,
   };
 };
@@ -245,11 +290,37 @@ const fresh = () => ({
   enabled: true,
   timeoutMinutes: 120,
   entryNodeIds: [] as string[],
-  startX: 60,
+  startX: 230,
   startY: 180,
   nodes: [] as FormNode[],
 });
 const form = reactive(fresh());
+type ComponentItem = {label:string;type:FormNode['type'];icon:typeof Cpu;kind?:WorkflowRule['kind']};
+const componentGroups: {name:string;items:ComponentItem[]}[] = [
+  {name:'任务执行',items:[{label:'Agent',type:'agent',icon:Cpu},{label:'系统通知',type:'notify',icon:Bell}]},
+  {name:'数据处理',items:[{label:'数据变量',type:'data',icon:DataAnalysis},{label:'汇合',type:'join',icon:Connection}]},
+  {name:'逻辑判断',items:[...(['text','number','boolean','collection'] as const).map((kind,i)=>({label:['文本判断','数值判断','布尔判断','集合判断'][i],type:'judge' as const,icon:[ChatLineSquare,Sort,Checked,Collection][i],kind})),{label:'条件判断',type:'predicate',icon:Operation},{label:'Switch',type:'switch',icon:Switch}]},
+  {name:'流程控制',items:[{label:'人工确认',type:'approval',icon:UserFilled},{label:'结束',type:'end',icon:Flag}]},
+];
+function addComponent(item: ComponentItem) {
+  addNode(item.type);
+  const node = form.nodes[form.nodes.length - 1];
+  node.name = nextWorkflowNodeName(form.nodes.filter(other => other.id !== node.id), item.type, item.label);
+  if (item.kind) { node.rules[0].kind = item.kind; resetRule(node.rules[0]); }
+}
+function resetRule(rule: WorkflowRule) {
+  rule.operator = ruleOperators[rule.kind][0].value;
+  rule.right = rule.kind === 'boolean' ? 'true' : rule.kind === 'number' ? '0' : '';
+}
+function addSwitchCase(node: FormNode) {
+  const id = `case_${Date.now().toString(36)}_${++nodeSequence}`;
+  node.switchCases.push({branchId:id,value:''});
+  node.branches.splice(node.branches.length-1,0,{id,name:`匹配 ${node.switchCases.length}`,condition:'',color:'#347fc5',targetNodeIds:[],outputValue:'{"result":""}'});
+}
+function removeSwitchCase(node: FormNode, index: number) {
+  const item = node.switchCases.splice(index,1)[0];
+  node.branches = node.branches.filter(branch=>branch.id !== item.branchId);
+}
 const history = ref<string[]>([]),
   historyIndex = ref(-1),
   lastSavedSnapshot = ref(""),
@@ -428,8 +499,9 @@ const nodeType = (type: FormNode["type"]) =>
     ({
       agent: "Agent",
       condition: "旧版判断",
-      route: "路由",
-      data: "数据",
+      route: "旧版路由",
+      judge: "数据判断", predicate: "条件判断", switch: "Switch",
+      data: "数据变量",
       join: "汇合",
       approval: "人工确认",
       notify: "系统通知",
@@ -439,7 +511,8 @@ const nodeType = (type: FormNode["type"]) =>
 const nodeHeight = (node: FormNode) =>
   Math.max(140, 92 + node.branches.length * 28);
 const nodeSummary = (node: FormNode) =>
-  node.type === "agent"
+  isDecision(node.type) ? (node.type === 'switch' ? `${node.switchCases.length} 个匹配值 · 默认分支` : `${node.ruleMode === 'all' ? '全部' : '任一'}满足 · ${node.rules.length} 条规则`)
+    : node.type === "agent"
     ? node.instruction.trim().split("\n")[0] || "点击设置 Agent 执行内容"
     : node.type === "condition"
       ? `${nodeById.value.get(node.sourceNodeId)?.name || "未选择来源"} · ${node.operator === "succeeded" ? "执行成功" : "执行失败"}`
@@ -464,10 +537,6 @@ const incomingSourceCount = (nodeId: string) =>
       )
       .map((source) => source.id),
   ).size;
-const incomingSources = (nodeId: string) =>
-  form.nodes.filter((source) =>
-    source.branches.some((branch) => branch.targetNodeIds?.includes(nodeId)),
-  );
 type UpstreamReference = {
   sourceId: string;
   sourceName: string;
@@ -481,8 +550,8 @@ function jsonLeaves(value: string | undefined) {
     const parsed = JSON.parse(value),
       rows: string[] = [],
       walk = (item: unknown, path: string) => {
+        if (path) rows.push(path);
         if (!item || typeof item !== "object" || Array.isArray(item)) {
-          if (path) rows.push(path);
           return;
         }
         for (const [key, child] of Object.entries(item as Record<string, unknown>))
@@ -494,92 +563,41 @@ function jsonLeaves(value: string | undefined) {
     return [];
   }
 }
-function emptyJsonShape(value: string | undefined) {
-  if (!value?.trim()) return undefined;
-  try {
-    const parsed = JSON.parse(value),
-      shape = (item: unknown): unknown => {
-        if (typeof item === "string") return "";
-        if (!item || typeof item !== "object" || Array.isArray(item))
-          return undefined;
-        const entries = Object.entries(item as Record<string, unknown>).flatMap(
-          ([key, child]) => {
-            const next = shape(child);
-            return next === undefined ? [] : [[key, next]];
-          },
-        );
-        return entries.length ? Object.fromEntries(entries) : undefined;
-      };
-    return shape(parsed);
-  } catch {
-    return undefined;
-  }
-}
-function mergeShape(target: Record<string, unknown>, source: unknown) {
-  if (!source || typeof source !== "object" || Array.isArray(source)) return;
-  for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
-    if (
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      target[key] &&
-      typeof target[key] === "object" &&
-      !Array.isArray(target[key])
-    )
-      mergeShape(target[key] as Record<string, unknown>, value);
-    else target[key] = value;
-  }
-}
 function upstreamOutputReferences(nodeId: string) {
   const rows = new Map<string, UpstreamReference>();
-  for (const source of incomingSources(nodeId)) {
-    if (source.type === "data")
-      for (const assignment of source.assignments) {
-        const name = assignment.name.trim();
-        if (!name) continue;
-        const expression = `{{input.${source.id}.${name}}}`;
-        rows.set(expression, {
-          sourceId: source.id,
-          sourceName: source.name,
-          label: `${source.id}.${name}`,
-          expression,
-          detail: "工作流变量",
-        });
-      }
-    for (const branch of source.branches.filter((item) => item.outputValue?.trim()))
-      for (const path of jsonLeaves(branch.outputValue)) {
-        const expression = `{{input.${source.id}.${path}}}`;
-        rows.set(expression, {
-          sourceId: source.id,
-          sourceName: source.name,
-          label: `${source.id}.${path}`,
-          expression,
-          detail: `分支：${branch.name}`,
-        });
-      }
+  for (const input of workflowInputPreview(form.nodes, nodeId)) {
+    for (const path of jsonLeaves(JSON.stringify(input.value))) {
+      const expression = `{{input.${input.sourceId}.${path}}}`;
+      const existing = rows.get(expression);
+      rows.set(expression, {
+        sourceId: input.sourceId,
+        sourceName: input.sourceName,
+        label: path,
+        expression,
+        detail: existing ? `${existing.detail}、${input.branchName}` : `分支：${input.branchName}`,
+      });
+    }
   }
   return [...rows.values()];
 }
+function dataVariableReferences(): UpstreamReference[] {
+  return form.nodes.filter(node=>node.type === 'data').flatMap(node=>node.assignments.filter(item=>item.name.trim()).map(item=>({sourceId:node.id,sourceName:node.name,label:item.name,expression:`{{${node.name.trim()}.${item.name.trim()}}}`,detail:'组件变量（该组件执行后可用）'})));
+}
+let variableNameBeforeEdit = '';
+function renameVariableReferences(node: FormNode) {
+  if (node.type !== 'data' || !variableNameBeforeEdit || workflowNodeNameError(node,form.nodes)) return;
+  const before = form.nodes.map(item=>({...item,name:item.id === node.id ? variableNameBeforeEdit : item.name}));
+  const updated = mapVariableReferences(mapVariableReferences(form.nodes,before,'store'),form.nodes,'display');
+  form.nodes.forEach((item,index)=>Object.assign(item,updated[index]));
+  variableNameBeforeEdit = node.name;
+}
 const upstreamReferences = computed<UpstreamReference[]>(() => {
   const node = selectedNode.value;
-  return node ? upstreamOutputReferences(node.id) : [];
+  return node ? [...upstreamOutputReferences(node.id),...dataVariableReferences()] : [];
 });
-const upstreamJsonPreview = computed(() => {
+const upstreamJsonPreviews = computed(() => {
   const node = selectedNode.value;
-  if (!node) return "";
-  const output: Record<string, unknown> = {};
-  for (const source of incomingSources(node.id)) {
-    const sourceOutput: Record<string, unknown> = {};
-    if (source.type === "data")
-      for (const assignment of source.assignments) {
-        const name = assignment.name.trim();
-        if (name) sourceOutput[name] = "";
-      }
-    for (const branch of source.branches)
-      mergeShape(sourceOutput, emptyJsonShape(branch.outputValue));
-    output[source.id] = sourceOutput;
-  }
-  return JSON.stringify(output, null, 2);
+  return node ? workflowInputPreview(form.nodes, node.id) : [];
 });
 function bindReference(target: { value?: string }, expression: string) {
   target.value = expression;
@@ -644,40 +662,47 @@ const selectedEdge = computed(() =>
     : undefined,
 );
 function outputJsonError(value?: string) {
-  if (!value?.trim()) return "请填写输出 JSON 格式";
   try {
-    const json = JSON.parse(value);
-    let leaves = 0;
-    const inspect = (item: unknown): boolean => {
-      if (typeof item === "string") {
-        leaves++;
-        return item === "";
-      }
-      if (
-        !item ||
-        typeof item !== "object" ||
-        Array.isArray(item) ||
-        !Object.keys(item).length
-      )
-        return false;
-      return Object.values(item as Record<string, unknown>).every(inspect);
-    };
-    return inspect(json) && leaves ? "" : "JSON 只能包含对象和留空字符串属性";
-  } catch {
-    return "不是有效的 JSON 对象";
+    parseWorkflowAiOutput(value);
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
 }
-const agentBranchOutputErrors = computed(() =>
+function branchOutputError(node: FormNode, branch: FormBranch) {
+  if ((branch.outputValue?.length || 0) > 4000) return "输出内容不能超过 4000 个字符";
+  const syntaxError = workflowJsonError(branch.outputValue);
+  if (syntaxError) return syntaxError;
+  if (node.type === "agent" && node.branchMode === "ai") return outputJsonError(branch.outputValue);
+
+  return "";
+}
+function formatBranchOutput(branch: FormBranch) {
+  if (!branch.outputValue?.trim()) return;
+  try {
+    const formatted = formatWorkflowJson(branch.outputValue);
+    if (formatted.length > 4000) {
+      ElMessage.error("格式化后超过 4000 个字符，请减少输出字段或内容");
+      return;
+    }
+    branch.outputValue = formatted;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+function endResultBranch(node: FormNode): FormBranch {
+  return {id:`end_${node.id}`,name:'最终结果',condition:'',color:'#347fc5',get outputValue(){return node.endResult;},set outputValue(value){node.endResult = value || '';}};
+}
+const endResultErrors = computed(()=>form.nodes.filter(node=>node.type === 'end' && workflowJsonError(node.endResult)).map(node=>({node,message:workflowJsonError(node.endResult)})));
+const branchOutputErrors = computed(() =>
   form.nodes.flatMap((node) =>
-    node.type === "agent" && node.branchMode === "ai"
-      ? node.branches
-          .map((branch) => ({
-            node,
-            branch,
-            message: outputJsonError(branch.outputValue),
-          }))
-          .filter((item) => item.message)
-      : [],
+    node.branches
+      .map((branch) => ({
+        node,
+        branch,
+        message: branchOutputError(node, branch),
+      }))
+      .filter((item) => item.message),
   ),
 );
 const invalidInputEdges = computed(
@@ -687,17 +712,13 @@ const invalidInputEdges = computed(
         .filter((edge) => {
           const source = nodeById.value.get(edge.sourceId),
             branch = source?.branches.find((item) => item.id === edge.branch);
-          return (
-            source?.type === "agent" &&
-            source.branchMode === "ai" &&
-            !!outputJsonError(branch?.outputValue)
-          );
+          return !!source && !!branch && !!branchOutputError(source, branch);
         })
         .map((edge) => edge.id),
     ),
 );
 const inputConnectionErrors = computed(() =>
-  agentBranchOutputErrors.value.map(
+  branchOutputErrors.value.map(
     (item) => `${item.node.name} / ${item.branch.name}：${item.message}`,
   ),
 );
@@ -762,6 +783,7 @@ function addNode(type: FormNode["type"] = "agent") {
   setSelection([node.id], node.id);
 }
 function initializeNew() {
+  saveErrorNodeIds.value = new Set();
   centerCanvas();
   Object.assign(form, fresh(), { projectId: projects.value[0]?.id || "" });
   addNode();
@@ -786,6 +808,7 @@ function fromNode(
   index: number,
   definition: WorkflowDefinition,
 ): FormNode {
+  node = mapVariableReferences(node, definition.nodes, "display");
   const position = definition.layout?.nodes[node.id] || {
       x: 320 + (index % 3) * 290,
       y: 110 + Math.floor(index / 3) * 190,
@@ -828,6 +851,11 @@ function fromNode(
           ]
         : []),
     ];
+  if (node.type === 'notify') {
+    if (branches.length === 2 && ['执行失败','失败','failed','failure'].includes(branches[0].condition)) branches.reverse();
+    if (branches.length === 1 && ['执行失败','失败','failed','failure'].includes(branches[0].condition)) branches.unshift({id:`notify_success_${node.id}`,name:'发送成功',condition:'',color:'#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'});
+    while (branches.length < 2) branches.push({id:`notify_${node.id}_${branches.length}`,name:branches.length ? '发送失败' : '发送成功',condition:'',color:branches.length?'#d45b68':'#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'});
+  }
   return {
     id: node.id,
     name: node.name,
@@ -850,11 +878,22 @@ function fromNode(
         ? node.config.sourceNodeId
         : "",
     operator: node.type === "condition" ? node.config.operator : "succeeded",
+    rules: node.type === 'judge' || node.type === 'predicate' ? node.config.rules.map(item=>({...item})) : [{kind:'text',left:'',operator:'eq',right:''}],
+    ruleMode: node.type === 'judge' || node.type === 'predicate' ? node.config.mode : 'all',
+    switchValue: node.type === 'switch' ? node.config.value : '',
+    switchKind: node.type === 'switch' ? node.config.kind : 'text',
+    switchCases: node.type === 'switch' ? node.config.cases.map(item=>({...item})) : [],
+    defaultBranchId: node.type === 'switch' ? node.config.defaultBranchId : '',
     assignments:
       node.type === "data"
         ? node.config.assignments.map((item) => ({ ...item }))
         : [],
     joinMode: node.type === "join" ? node.config.mode : "all",
+    approvalTitle:node.type === 'approval' ? node.config.title || node.name : '人工确认',
+    approvalWaitMode:node.type === 'approval' ? node.config.wait?.mode || 'forever' : 'forever',
+    approvalDuration:node.type === 'approval' ? node.config.wait?.durationMinutes || 60 : 60,
+    approvalDeadline:node.type === 'approval' && node.config.wait?.deadline ? localDateTime(node.config.wait.deadline) : '',
+    approvalTimeoutAction:node.type === 'approval' ? node.config.wait?.onTimeout || 'reject' : 'reject',
     approvalPrompt:
       node.type === "approval"
         ? node.config.prompt
@@ -865,6 +904,8 @@ function fromNode(
     body: node.type === "notify" ? node.config.body : "",
     endStatus: node.type === "end" ? node.config.status : "succeeded",
     endSummary: node.type === "end" ? node.config.summary : "工作流执行完成",
+    endScope:node.type === "end" ? node.config.scope || (node.config.status === "failed" ? "workflow" : "path") : "path",
+    endResult:node.type === "end" ? node.config.resultJson || "" : "",
     x: position.x,
     y: position.y,
   };
@@ -892,14 +933,18 @@ function initializeEdit(item: WorkflowDefinition) {
   markSaved();
 }
 function edit(item: WorkflowDefinition) {
+  saveErrorNodeIds.value = new Set();
   if (!props.windowMode) {
     void window.myplane.openWorkflowEditor(item.id);
     return;
   }
   initializeEdit(item);
 }
-function removeNode(node: FormNode) {
-  form.nodes.splice(form.nodes.indexOf(node), 1);
+const confirmingNodeDeletion = ref(false);
+function removeNodeFromForm(node: FormNode) {
+  const index = form.nodes.indexOf(node);
+  if (index < 0) return;
+  form.nodes.splice(index, 1);
   for (const item of form.nodes) {
     for (const branch of item.branches) {
       branch.targetNodeIds = (branch.targetNodeIds || []).filter(
@@ -914,13 +959,36 @@ function removeNode(node: FormNode) {
     form.entryNodeIds = [form.nodes[0].id];
   setSelection(["__start__"], "__start__");
 }
+async function confirmDeleteNodes(nodes: FormNode[]) {
+  if (!nodes.length || confirmingNodeDeletion.value) return;
+  confirmingNodeDeletion.value = true;
+  try {
+    await ElMessageBox.confirm(
+      nodes.length === 1
+        ? `确定删除组件“${nodes[0].name}”？相关连线也会一并移除。`
+        : `确定删除选中的 ${nodes.length} 个组件？相关连线也会一并移除。`,
+      "删除组件",
+      {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消",
+        closeOnClickModal: false,
+        modalClass: "workflow-node-delete-modal",
+      },
+    );
+    for (const node of nodes) removeNodeFromForm(node);
+  } catch (cause) {
+    if (cause !== "cancel" && cause !== "close") ElMessage.error(String(cause));
+  } finally {
+    confirmingNodeDeletion.value = false;
+  }
+}
 function deleteSelected() {
   const ids = new Set(
     [...selectedNodeIds.value].filter((id) => id !== "__start__"),
   );
   if (!ids.size) return;
-  for (const node of [...form.nodes]) if (ids.has(node.id)) removeNode(node);
-  setSelection(["__start__"], "__start__");
+  void confirmDeleteNodes(form.nodes.filter((node) => ids.has(node.id)));
 }
 function payload(): WorkflowDefinitionInput {
   const nodes = form.nodes.map((node) => {
@@ -953,6 +1021,8 @@ function payload(): WorkflowDefinitionInput {
           branchMode: node.branchMode,
         },
       };
+    if (node.type === 'judge' || node.type === 'predicate') return {...base,type:node.type,config:{rules:node.rules.map(rule=>({...rule})),mode:node.ruleMode}};
+    if (node.type === 'switch') return {...base,type:'switch' as const,config:{value:node.switchValue,kind:node.switchKind,cases:node.switchCases.map(item=>({...item})),defaultBranchId:node.defaultBranchId}};
     if (node.type === "condition")
       return {
         ...base,
@@ -982,6 +1052,8 @@ function payload(): WorkflowDefinitionInput {
         ...base,
         type: "approval" as const,
         config: {
+          title:node.approvalTitle,
+          wait:{mode:node.approvalWaitMode,onTimeout:node.approvalTimeoutAction,...(node.approvalWaitMode === 'duration' ? {durationMinutes:Number(node.approvalDuration)} : {}),...(node.approvalWaitMode === 'until' ? {deadline:node.approvalDeadline && Number.isFinite(Date.parse(node.approvalDeadline)) ? new Date(node.approvalDeadline).toISOString() : ''} : {})},
           prompt: node.approvalPrompt,
           approveLabel: node.approveLabel,
           rejectLabel: node.rejectLabel,
@@ -992,12 +1064,12 @@ function payload(): WorkflowDefinitionInput {
         ...base,
         type: "end" as const,
         branches: [],
-        config: { status: node.endStatus, summary: node.endSummary },
+        config: { status: node.endStatus, summary: node.endSummary, scope:node.endScope, resultJson:node.endResult },
       };
     return {
       ...base,
       type: "notify" as const,
-      config: { title: node.title, body: node.body },
+      config: { title: node.title, body: node.body, fixedBranches:true },
     };
   });
   return {
@@ -1025,17 +1097,37 @@ async function save(manual = true) {
   if (!manual) lastAutoSaveAttempt.value = snapshot;
   error.value = "";
   if (!form.name.trim()) {
+    saveErrorNodeIds.value = new Set(["__start__"]);
     error.value = "请先填写工作流名称";
     setSelection(["__start__"], "__start__");
     return;
   }
-  if (inputConnectionErrors.value.length) {
-    error.value = "请先修复 Agent 分支的输出 JSON 格式";
+  if (!form.entryNodeIds.length) {
+    error.value = "请连接开始节点，设置工作流入口";
+    saveErrorNodeIds.value = new Set(["__start__"]);
+    if (manual) setSelection(["__start__"]);
+    return;
+  }
+  saveErrorNodeIds.value = new Set([
+    ...form.nodes.filter(node => workflowNodeNameError(node, form.nodes)).map(node => node.id),
+    ...branchOutputErrors.value.map(item => item.node.id),
+    ...endResultErrors.value.map(item=>item.node.id),
+  ]);
+  const invalidNameNode = form.nodes.find(node => workflowNodeNameError(node, form.nodes));
+  if (invalidNameNode) {
+    error.value = workflowNodeNameError(invalidNameNode, form.nodes);
+    if (manual) setSelection([invalidNameNode.id], invalidNameNode.id);
+    return;
+  }
+  if (inputConnectionErrors.value.length || endResultErrors.value.length) {
+    error.value = "请先修复输出或最终结果的 JSON 格式";
+    if (manual) setSelection([(branchOutputErrors.value[0]?.node || endResultErrors.value[0].node).id]);
     return;
   }
   busy.value = "save";
   try {
     const item = await api("workflowSave", payload());
+    saveErrorNodeIds.value = new Set();
     form.id = item.id;
     selectedId.value = item.id;
     markSaved();
@@ -1048,7 +1140,10 @@ async function save(manual = true) {
       ElMessage.success(`工作流 v${item.version} 已保存`);
     }
   } catch (cause) {
-    error.value = String(cause).replace(/^Error: /, "");
+    const failure = readWorkflowValidationError(cause);
+    error.value = failure.message;
+    saveErrorNodeIds.value = new Set(failure.nodeIds);
+    if (manual && failure.nodeIds.length) setSelection([failure.nodeIds[0]]);
   } finally {
     busy.value = "";
   }
@@ -1090,15 +1185,22 @@ async function retry(run: WorkflowRun, nodeId: string) {
   await load();
   ElMessage.success("已从失败节点创建新的运行");
 }
-async function resolveApproval(
-  run: WorkflowRun,
-  decision: "approved" | "rejected",
-) {
-  await api("workflowResolveApproval", { runId: run.id, decision });
-  await load();
-  ElMessage.success(
-    decision === "approved" ? "已批准继续执行" : "已拒绝继续执行",
-  );
+const approvalNotes = reactive<Record<string,string>>({});
+const approvalSubmitting = reactive(new Set<string>());
+function localDateTime(value: string) {
+  const date = new Date(value);
+  return new Date(date.getTime()-date.getTimezoneOffset()*60_000).toISOString().slice(0,16);
+}
+async function resolveApproval(run: WorkflowRun, nodeId: string, decision: 'approved'|'rejected') {
+  const key = `${run.id}:${nodeId}`;
+  if (approvalSubmitting.has(key)) return;
+  approvalSubmitting.add(key);
+  try {
+    await api('workflowResolveApproval',{runId:run.id,nodeId,decision,note:approvalNotes[key] || ''});
+    delete approvalNotes[key];await load();
+    ElMessage.success(decision === 'approved' ? '已批准继续执行' : '已进入拒绝分支');
+  } catch (cause) { ElMessage.error(String(cause));await load(); }
+  finally {approvalSubmitting.delete(key);}
 }
 function canvasPoint(event: PointerEvent) {
   const box = canvas.value?.getBoundingClientRect();
@@ -1304,25 +1406,55 @@ const branchColors = [
   "#6677cc",
 ];
 function addBranch(node: FormNode) {
+  if ((node.type === "join" || node.type === "data") && node.branches.length) return;
   const index = node.branches.length,
     used = new Set(node.branches.map((branch) => branch.color.toLowerCase())),
     color =
       branchColors.find((value) => !used.has(value.toLowerCase())) ||
       branchColors[index % branchColors.length],
     output =
-      node.type === "agent" && node.branchMode === "ai"
+      node.type === "join" || node.type === "data" || (node.type === "agent" && node.branchMode === "ai")
         ? '{"result":""}'
         : undefined;
   node.branches.push({
     id: `branch_${Date.now().toString(36)}_${++nodeSequence}`,
-    name: `分支 ${index + 1}`,
+    name: node.type === "join" ? "汇合完成" : node.type === "data" ? "设置完成" : `分支 ${index + 1}`,
     condition: "",
     color,
     targetNodeIds: [],
     ...(output ? { outputValue: output } : {}),
   });
 }
+async function openWorkflowHelp() {
+  try {
+    await window.myplane.openHelpDocument('workflow');
+  } catch (cause) {
+    ElMessage.error(`无法打开帮助文档：${String(cause)}`);
+  }
+}
+function insertOutputReference(branch: FormBranch, item: UpstreamReference) {
+  const editor = document.getElementById(`workflow-output-${branch.id}`) as HTMLTextAreaElement | null;
+  const source = branch.outputValue || "{}";
+  const start = editor?.selectionStart || 0, end = editor?.selectionEnd || start;
+  for (const match of source.matchAll(/"(?:\\[\s\S]|[^"\\])*"/g)) {
+    const index = match.index!;
+    if (start > index && end < index + match[0].length && !source.slice(index + match[0].length).trimStart().startsWith(":")) {
+      branch.outputValue = source.slice(0, start) + item.expression + source.slice(end);
+      return;
+    }
+  }
+  try {
+    const output = parseWorkflowJsonTemplate(source);
+    const base = item.label.split(".").at(-1) || "value";
+    let key = base, suffix = 2;
+    while (Object.hasOwn(output, key)) key = `${base}_${suffix++}`;
+    branch.outputValue = JSON.stringify({ ...output, [key]: item.expression }, null, 2);
+  } catch (error) {
+    ElMessage.error(String(error));
+  }
+}
 function removeBranch(node: FormNode, branch: FormBranch) {
+  if ((node.type === "join" || node.type === "data") && node.branches.length === 1) return;
   node.branches.splice(node.branches.indexOf(branch), 1);
   if (
     selectedEdgeKey.value?.sourceId === node.id &&
@@ -1463,6 +1595,7 @@ function isEditableTarget(target: EventTarget | null) {
   return !!element?.closest('input,textarea,select,[contenteditable="true"]');
 }
 function keyDown(event: KeyboardEvent) {
+  if (confirmingNodeDeletion.value) return;
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
     event.preventDefault();
     event.shiftKey ? redo() : undo();
@@ -1704,23 +1837,28 @@ onBeforeUnmount(() => {
                     >{{ status(node.status) }} · {{ node.type }} ·
                     {{ date(node.finishedAt || node.startedAt) }}</small
                   >
+                  <h4 v-if="node.approval?.title">{{ node.approval.title }}</h4>
+                  <small v-if="node.approval && node.status === 'waiting'">{{ node.approval.deadline ? '截止：' + date(node.approval.deadline) : '一直等待人工确认' }}</small>
+                  <p v-if="node.approval?.decision">确认记录：{{ node.approval.decision === 'approved' ? '批准' : node.approval.decision === 'rejected' ? '拒绝' : '超时' }} · {{ date(node.approval.decidedAt) }}<span v-if="node.approval.note"> · 备注：{{ node.approval.note }}</span></p>
+                  <label v-if="node.type === 'approval' && node.status === 'waiting' && ['running','waiting'].includes(run.status)" class="workflow-approval-note">备注（可选）<textarea v-model="approvalNotes[run.id+':'+node.nodeId]" maxlength="1000" rows="2" placeholder="填写确认原因或处理说明"></textarea></label>
                   <p v-if="node.summary">{{ node.summary }}</p>
+                  <details v-if="node.type === 'end' && node.outputValue !== undefined" class="workflow-final-result"><summary>最终结果 JSON</summary><pre>{{ node.outputValue }}</pre></details>
                   <p v-if="node.error" class="danger">{{ node.error }}</p>
                   <div
                     v-if="
                       node.type === 'approval' &&
                       node.status === 'waiting' &&
-                      run.status === 'waiting'
+                      ['running','waiting'].includes(run.status)
                     "
                     class="workflow-approval-actions"
                   >
-                    <button @click="resolveApproval(run, 'approved')">
+                    <button :disabled="approvalSubmitting.has(run.id+':'+node.nodeId)" @click="resolveApproval(run, node.nodeId, 'approved')">
                       <Check />{{
                         node.approval?.approveLabel || "批准继续"
                       }}</button
                     ><button
                       class="danger"
-                      @click="resolveApproval(run, 'rejected')"
+                      :disabled="approvalSubmitting.has(run.id+':'+node.nodeId)" @click="resolveApproval(run, node.nodeId, 'rejected')"
                     >
                       <Close />{{ node.approval?.rejectLabel || "拒绝" }}
                     </button>
@@ -1772,6 +1910,7 @@ onBeforeUnmount(() => {
       role="dialog"
       aria-modal="true"
       aria-label="工作流画布编辑器"
+      novalidate
       @submit.prevent="save()"
       @keydown.esc.prevent="closeEditor"
     >
@@ -1782,6 +1921,9 @@ onBeforeUnmount(() => {
           ><small>端口拖动创建连线；已有连线左拖新增目标、右拖切换目标</small>
         </div>
         <div class="workflow-editor-actions">
+          <button type="button" class="workflow-help-button" aria-label="工作流帮助" title="打开工作流使用指南" @click="openWorkflowHelp">
+            <QuestionFilled />帮助
+          </button>
           <span class="workflow-save-state" :class="{ dirty: hasUnsavedChanges }"
             >{{ saveStateText }} · {{ form.nodes.length }} 个节点</span
           ><div class="workflow-header-history">
@@ -1821,7 +1963,7 @@ onBeforeUnmount(() => {
         class="workflow-editor-error workflow-connection-errors"
       >
         <div>
-          <strong>发现 {{ inputConnectionErrors.length }} 条输入连线错误</strong
+          <strong>发现 {{ inputConnectionErrors.length }} 处输出内容 JSON 格式错误</strong
           ><span v-for="message in inputConnectionErrors" :key="message">{{
             message
           }}</span>
@@ -1830,62 +1972,19 @@ onBeforeUnmount(() => {
       <div ref="editorBody" class="workflow-editor-body">
         <section class="workflow-canvas-pane">
           <div class="workflow-canvas-toolbar">
-            <div class="workflow-component-buttons">
-              <button
-                type="button"
-                class="agent"
-                title="添加智能任务"
-                @click="addNode('agent')"
-              >
-                <Cpu />Agent</button
-              ><button
-                type="button"
-                class="route"
-                title="添加确定性条件路由"
-                @click="addNode('route')"
-              >
-                <Guide />路由</button
-              ><button
-                type="button"
-                class="data"
-                title="添加变量与数据映射"
-                @click="addNode('data')"
-              >
-                <DataAnalysis />数据</button
-              ><button
-                type="button"
-                class="join"
-                title="汇合多个上游分支"
-                @click="addNode('join')"
-              >
-                <Connection />汇合</button
-              ><button
-                type="button"
-                class="approval"
-                title="等待人工批准或拒绝"
-                @click="addNode('approval')"
-              >
-                <UserFilled />确认</button
-              ><button
-                type="button"
-                class="notify"
-                title="发送系统桌面通知"
-                @click="addNode('notify')"
-              >
-                <Bell />通知</button
-              ><button
-                type="button"
-                class="end"
-                title="明确流程结束状态"
-                @click="addNode('end')"
-              >
-                <Flag />结束
-              </button>
-            </div>
             <span class="workflow-canvas-tip"
               >左拖框选 · Shift 追加 · Alt 减选 · 空格或右键拖动画布</span
             >
           </div>
+          <aside class="workflow-component-panel" :class="{collapsed:componentPanelCollapsed}" aria-label="组件库" @pointerdown.stop>
+            <header><strong>组件库 <button type="button" @click="componentPanelCollapsed = !componentPanelCollapsed" :aria-expanded="!componentPanelCollapsed">{{ componentPanelCollapsed ? '展开' : '收起' }}</button></strong><small v-if="!componentPanelCollapsed">点击添加到画布</small></header>
+            <section v-for="group in componentGroups" v-show="!componentPanelCollapsed" :key="group.name">
+              <h3>{{ group.name }}</h3>
+              <div class="workflow-component-buttons">
+                <button v-for="item in group.items" :key="item.label" type="button" :class="item.type" :title="item.label" :aria-label="item.label" @click="addComponent(item)"><component :is="item.icon" aria-hidden="true" /></button>
+              </div>
+            </section>
+          </aside>
           <div class="workflow-canvas-float-controls" aria-label="画布视图控制">
               <div class="workflow-zoom-control">
                 <button
@@ -2030,7 +2129,8 @@ onBeforeUnmount(() => {
               </svg>
               <article
                 class="workflow-start-node"
-                :class="{ selected: isSelected('__start__') }"
+                :class="{ selected: isSelected('__start__'), 'has-save-error': saveErrorNodeIds.has('__start__') }"
+                :aria-invalid="saveErrorNodeIds.has('__start__')"
                 :style="{ left: form.startX + 'px', top: form.startY + 'px' }"
                 @pointerdown.stop="beginStartDrag"
               >
@@ -2051,7 +2151,8 @@ onBeforeUnmount(() => {
                 v-for="node in form.nodes"
                 :key="node.id"
                 class="workflow-canvas-node"
-                :class="[node.type, { selected: isSelected(node.id) }]"
+                :class="[node.type, { selected: isSelected(node.id), 'has-save-error': saveErrorNodeIds.has(node.id) }]"
+                :aria-invalid="saveErrorNodeIds.has(node.id)"
                 :style="{
                   left: node.x + 'px',
                   top: node.y + 'px',
@@ -2250,9 +2351,13 @@ onBeforeUnmount(() => {
             <label
               >节点名称<input
                 v-model="selectedNode.name"
+                @focus="variableNameBeforeEdit = selectedNode.name"
+                @change="renameVariableReferences(selectedNode)"
                 required
+                :aria-invalid="!!workflowNodeNameError(selectedNode, form.nodes)"
+                aria-describedby="workflow-node-name-error"
                 maxlength="100" /></label
-            ><label
+            ><p v-if="workflowNodeNameError(selectedNode, form.nodes)" id="workflow-node-name-error" class="workflow-field-note danger" aria-live="polite">{{ workflowNodeNameError(selectedNode, form.nodes) }}</p><label
               >节点类型<input
                 :value="nodeType(selectedNode.type)"
                 disabled
@@ -2265,18 +2370,21 @@ onBeforeUnmount(() => {
               <header>
                 <div>
                   <strong>预计接收结构</strong
-                  ><small>根据上游组件输出 JSON 自动推导，运行后才会产生实际值</small>
+                  ><small>逐条展示相连分支定义的 JSON，运行时按命中分支原样接收。字段引用中的节点 ID 仅用于选择来源。</small>
                 </div>
               </header>
-              <textarea
-                :value="upstreamJsonPreview"
-                rows="5"
-                readonly
-                aria-label="接收的上游 JSON 数据结构"
-              ></textarea>
+              <div v-for="input in upstreamJsonPreviews" :key="input.sourceId + ':' + input.branchId">
+                <span>{{ input.sourceName }} · {{ input.branchName }}</span>
+                <textarea
+                  :value="JSON.stringify(input.value, null, 2)"
+                  rows="5"
+                  readonly
+                  aria-label="接收的上游 JSON 数据结构"
+                ></textarea>
+              </div>
               <article
                 v-for="item in upstreamReferences"
-                :key="item.sourceId + item.expression + item.label"
+                :key="item.sourceId + item.expression + item.detail"
               >
                 <span>{{ item.sourceName }} · {{ item.label }}</span>
                 <code>{{ item.expression }}</code>
@@ -2289,7 +2397,7 @@ onBeforeUnmount(() => {
                   v-model="selectedNode.instruction"
                   rows="8"
                   required
-	                  placeholder="描述任务；可引用 {{input.上游节点ID.name}} 或 {{variables.name}}"
+	                  placeholder="描述任务；可引用 {{input.上游节点ID.name}} 或 {{数据变量 1.result}}"
                 ></textarea>
               </label>
               <p class="workflow-field-note">
@@ -2342,6 +2450,35 @@ onBeforeUnmount(() => {
                 </select></label
               ></template
             >
+            <template v-else-if="selectedNode.type === 'judge' || selectedNode.type === 'predicate'">
+              <section class="workflow-decision-rules">
+                <h3>判断规则</h3>
+                <p>字段可输入固定值，或引用上游字段和工作流变量。字段缺失或类型错误会停止执行。</p>
+                <label v-if="selectedNode.type === 'predicate'">组合方式<select v-model="selectedNode.ruleMode"><option value="all">全部满足（AND）</option><option value="any">任一满足（OR）</option></select></label>
+                <article v-for="(rule,index) in selectedNode.rules" :key="index">
+                  <header>规则 {{ index + 1 }}<button v-if="selectedNode.type === 'predicate' && selectedNode.rules.length > 1" type="button" @click="selectedNode.rules.splice(index,1)">删除</button></header>
+                  <label>数据类型<select v-model="rule.kind" @change="resetRule(rule)"><option value="text">文本</option><option value="number">数值</option><option value="boolean">布尔值</option><option value="collection">集合（数组／对象）</option></select></label>
+                  <label>判断字段<input v-model="rule.left" list="workflow-decision-fields" placeholder="输入值或选择上游字段" maxlength="4000" /></label>
+                  <label>运算符<select v-model="rule.operator"><option v-for="option in ruleOperators[rule.kind]" :key="option.value" :value="option.value">{{ option.label }}</option></select></label>
+                  <label v-if="!['empty','notEmpty'].includes(rule.operator)">比较值<input v-model="rule.right" list="workflow-decision-fields" :placeholder="rule.kind === 'boolean' ? 'true 或 false' : rule.kind === 'collection' && rule.operator === 'contains' ? 'JSON 元素，例如 1 或 &quot;high&quot;' : '固定值或字段引用'" maxlength="4000" /></label>
+                </article>
+                <button v-if="selectedNode.type === 'predicate'" type="button" :disabled="selectedNode.rules.length >= 50" @click="selectedNode.rules.push({kind:'text',left:'',operator:'eq',right:''})">添加规则</button>
+                <small>第一条输出分支：成立；第二条输出分支：不成立。每次仅执行其中一条。</small>
+              </section>
+            </template>
+            <template v-else-if="selectedNode.type === 'switch'">
+              <section class="workflow-decision-rules">
+                <h3>Switch 多路选择</h3>
+                <label>判断值<input v-model="selectedNode.switchValue" list="workflow-decision-fields" placeholder="固定值或上游字段引用" maxlength="4000" /></label>
+                <label>数据类型<select v-model="selectedNode.switchKind"><option value="text">文本（区分大小写）</option><option value="number">数值</option><option value="boolean">布尔值</option></select></label>
+                <article v-for="(item,index) in selectedNode.switchCases" :key="item.branchId">
+                  <header>{{ selectedNode.branches.find(branch=>branch.id === item.branchId)?.name }}<button v-if="selectedNode.switchCases.length > 1" type="button" @click="removeSwitchCase(selectedNode,index)">删除</button></header>
+                  <label>等于固定值<input v-model="item.value" maxlength="4000" placeholder="精确匹配，值不能重复" /></label>
+                </article>
+                <button type="button" :disabled="selectedNode.switchCases.length >= 50" @click="addSwitchCase(selectedNode)">添加匹配分支</button>
+                <small>仅选择一个匹配分支；均不匹配时走默认分支。默认分支始终保留。</small>
+              </section>
+            </template>
             <template v-else-if="selectedNode.type === 'condition'"
               ><p class="workflow-legacy-note">
                 这是旧版判断节点。建议改用路由节点。
@@ -2388,7 +2525,7 @@ onBeforeUnmount(() => {
                     <strong>工作流变量</strong
                     ><small
                       >后续节点通过
-                      <code v-text="'{{variables.name}}'"></code> 引用</small
+                      <code v-text="'{{数据变量 1.result}}'"></code> 引用</small
                     >
                   </div>
                   <button type="button" @click="addAssignment(selectedNode)">
@@ -2420,7 +2557,7 @@ onBeforeUnmount(() => {
                       v-model="assignment.value"
                       rows="3"
                       maxlength="4000"
-	                      placeholder="支持 {{input.上游节点ID.name}} 和 {{variables.name}}"
+	                      placeholder="支持 {{input.上游节点ID.name}} 和 {{数据变量 1.result}}"
                     ></textarea>
                   </label>
                   <div
@@ -2450,7 +2587,7 @@ onBeforeUnmount(() => {
               ></template
             >
             <template v-else-if="selectedNode.type === 'approval'"
-              ><label
+              ><label>确认标题<input v-model="selectedNode.approvalTitle" maxlength="120" placeholder="支持上游字段和数据变量引用" /></label><label
                 >确认内容<textarea
                   v-model="selectedNode.approvalPrompt"
                   required
@@ -2472,8 +2609,12 @@ onBeforeUnmount(() => {
                     maxlength="30"
                 /></label>
               </div>
+              <label>等待方式<select v-model="selectedNode.approvalWaitMode"><option value="forever">一直等待（默认）</option><option value="duration">等待指定时长</option><option value="until">等待至指定时间</option></select></label>
+              <label v-if="selectedNode.approvalWaitMode === 'duration'">等待时长（分钟）<input v-model.number="selectedNode.approvalDuration" type="number" min="0.01" max="525600" step="any" /><small>从该确认节点开始等待时计时，60 分钟为 1 小时。</small></label>
+              <label v-if="selectedNode.approvalWaitMode === 'until'">截止时间（本地时区）<input v-model="selectedNode.approvalDeadline" type="datetime-local" /><small>到达已过期的截止时间时，立即执行超时策略。</small></label>
+              <label v-if="selectedNode.approvalWaitMode !== 'forever'">超时处理<select v-model="selectedNode.approvalTimeoutAction"><option value="reject">进入拒绝分支</option><option value="fail">结束工作流并标记失败</option></select></label>
               <p class="workflow-field-note">
-                运行会暂停并在运行历史中等待处理。批准匹配“执行成功”，拒绝匹配“执行失败”。
+                当前路径等待人工处理，其他路径继续运行。批准、拒绝分支各自配置输出内容，可连接多个下游。
               </p></template
             >
             <template v-else-if="selectedNode.type === 'notify'"
@@ -2482,7 +2623,7 @@ onBeforeUnmount(() => {
                   v-model="selectedNode.title"
                   required
                   maxlength="120"
-	                  placeholder="支持 {{input.上游节点ID.name}} 或 {{variables.name}}" /></label
+	                  placeholder="支持 {{input.上游节点ID.name}} 或 {{数据变量 1.result}}" /></label
               ><label
                 >通知内容<textarea
                   v-model="selectedNode.body"
@@ -2494,7 +2635,7 @@ onBeforeUnmount(() => {
               </label>
               <p class="workflow-field-note">
                 系统通知用于用户未停留在应用中时提醒关键结果。
-              </p></template
+              </p><details v-if="upstreamReferences.length" class="workflow-text-references"><summary>插入引用值</summary><div v-for="item in upstreamReferences" :key="item.expression"><span>{{ item.sourceName }} · {{ item.label }}</span><button type="button" @click="selectedNode.title += item.expression">插入标题</button><button type="button" @click="selectedNode.body += item.expression">插入正文</button></div></details></template
             >
             <template v-else-if="selectedNode.type === 'end'"
               ><label
@@ -2502,14 +2643,20 @@ onBeforeUnmount(() => {
                   <option value="succeeded">成功结束</option>
                   <option value="failed">失败结束</option>
                 </select></label
-              ><label
-                >最终摘要<textarea
+              ><label>结束范围<select v-model="selectedNode.endScope"><option value="path">当前路径（默认）</option><option value="workflow">整个工作流</option></select><small>{{ selectedNode.endScope === 'path' ? '其他路径继续执行；存在失败路径时，流程最终记为失败。' : '立即停止其他任务并清理人工确认待办，按所选状态结束整个流程。' }}</small></label><label
+                >结束摘要<textarea
                   v-model="selectedNode.endSummary"
                   rows="5"
                   maxlength="1000"
                   placeholder="支持工作流变量模板"
-                ></textarea></label
-            ></template>
+                ></textarea></label>
+              <label>最终结果 JSON（可选）<textarea :id="'workflow-output-end_'+selectedNode.id" v-model="selectedNode.endResult" rows="5" maxlength="4000" placeholder='{"result":""}' :aria-invalid="!!workflowJsonError(selectedNode.endResult)"></textarea></label>
+              <p v-if="workflowJsonError(selectedNode.endResult)" class="workflow-field-note danger" aria-live="polite">{{ workflowJsonError(selectedNode.endResult) }}</p>
+              <button class="workflow-format-result" type="button" :disabled="!selectedNode.endResult.trim()" @click="formatBranchOutput(endResultBranch(selectedNode))">格式化 JSON</button>
+              <div class="workflow-end-references"><button v-for="item in upstreamReferences" :key="item.expression" type="button" @click="insertOutputReference(endResultBranch(selectedNode),item)">插入 {{ item.sourceName }} · {{ item.label }}</button></div>
+              <p class="workflow-field-note">摘要用于说明结果，JSON 用于保存业务数据；均显示在运行记录中。结束组件没有输出分支。</p>
+            </template>
+            <datalist id="workflow-decision-fields"><option v-for="item in upstreamOutputReferences(selectedNode.id)" :key="item.expression" :value="item.expression">{{ item.label }}</option><option v-for="item in dataVariableReferences()" :key="item.expression" :value="item.expression">{{ item.sourceName }}：{{ item.label }}</option></datalist>
             <section
               v-if="selectedNode.type !== 'end'"
               class="workflow-branches"
@@ -2522,13 +2669,17 @@ onBeforeUnmount(() => {
                     }}
                   </h3>
                   <small>{{
-                    selectedNode.type === "agent" &&
+                    selectedNode.type === "notify" ? "由实际发送结果选择成功或失败分支，不代表用户已阅读" : selectedNode.type === "approval" ? "固定批准和拒绝分支，由人工选择或超时策略决定" : isDecision(selectedNode.type) ? "由上方规则选择分支；各分支独立定义输出内容" : selectedNode.type === "join"
+                      ? "汇合完成后直接输出；一个输出分支可连接多个下游"
+                      : selectedNode.type === "data"
+                        ? "变量设置完成后直接输出；一个输出分支可连接多个下游"
+                      : selectedNode.type === "agent" &&
                     selectedNode.branchMode === "ai"
                       ? "分支之间为或关系；每次只选择一个"
                       : "按顺序匹配第一条规则"
                   }}</small>
                 </div>
-                <button type="button" @click="addBranch(selectedNode)">
+                <button v-if="!isDecision(selectedNode.type) && !['approval','notify'].includes(selectedNode.type) && selectedNode.type !== 'join' && (selectedNode.type !== 'data' || !selectedNode.branches.length)" type="button" @click="addBranch(selectedNode)">
                   <Plus />添加分支
                 </button>
               </header>
@@ -2543,8 +2694,9 @@ onBeforeUnmount(() => {
                 :key="branch.id"
               >
                 <header>
-                  <strong>分支 {{ index + 1 }}</strong
+                  <strong>{{ selectedNode.type === 'notify' ? (index === 0 ? '发送成功分支' : index === 1 ? '发送失败分支' : '旧版多余分支，请删除') : selectedNode.type === 'approval' ? (index === 0 ? '批准分支' : '拒绝分支') : selectedNode.type === 'switch' ? (branch.id === selectedNode.defaultBranchId ? '默认分支' : '匹配分支 ' + (index + 1)) : ['judge','predicate'].includes(selectedNode.type) ? (index === 0 ? '成立分支' : '不成立分支') : '分支 ' + (index + 1) }}</strong
                   ><button
+                    v-if="!isDecision(selectedNode.type) && selectedNode.type !== 'approval' && (selectedNode.type !== 'notify' || selectedNode.branches.length > 2) && (!['join', 'data'].includes(selectedNode.type) || selectedNode.branches.length > 1)"
                     type="button"
                     title="删除分支"
                     @click="removeBranch(selectedNode, branch)"
@@ -2562,7 +2714,7 @@ onBeforeUnmount(() => {
                     >颜色<input v-model="branch.color" type="color" required
                   /></label>
                 </div>
-                <label
+                <label v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)"
                   >{{
                     selectedNode.type === "agent" &&
                     selectedNode.branchMode === "ai"
@@ -2586,58 +2738,45 @@ onBeforeUnmount(() => {
                     maxlength="500"
                     list="workflow-branch-conditions"
                     placeholder="例如 变量：risk 等于：high" /></label
-                ><small>{{
+                ><small v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)">{{
                   selectedNode.type === "agent" &&
                   selectedNode.branchMode === "ai"
                     ? "描述业务语义，AI 将在所有分支中选择唯一最符合的一条。"
                     : "支持执行状态、摘要/错误包含，以及变量等于、不等于、包含、大小或为空。"
                 }}</small
-                ><template
-                  v-if="
-                    selectedNode.type === 'agent' &&
-                    selectedNode.branchMode === 'ai'
-                  "
-                  ><label
-                    >输出 JSON 格式<textarea
-                      v-model="branch.outputValue"
-                      rows="4"
-                      maxlength="4000"
-                      placeholder='{"result":"","reason":""}'
-                    ></textarea></label
-                  ><small
-                    :class="{ danger: outputJsonError(branch.outputValue) }"
-                    >{{
-                      outputJsonError(branch.outputValue) ||
-                      "JSON 有效；所有属性值保持留空字符串，AI 会填充实际值。"
-                    }}</small
-                  ></template
-                ><label v-else
-                  >输出值（可选）<textarea
+                ><div class="workflow-json-toolbar">
+                  <label :for="`workflow-output-${branch.id}`">输出内容</label>
+                  <button type="button" :disabled="!branch.outputValue?.trim()" @click="formatBranchOutput(branch)">格式化</button>
+                </div>
+                <textarea
+                    :id="`workflow-output-${branch.id}`"
                     v-model="branch.outputValue"
-                    rows="2"
+                    :rows="selectedNode.type === 'join' ? 6 : 4"
                     maxlength="4000"
-                    placeholder="支持模板变量"
-                  ></textarea>
-                </label>
+                    :aria-invalid="!!branchOutputError(selectedNode, branch)"
+                    :aria-describedby="`workflow-output-error-${branch.id}`"
+                    placeholder='{"result":""}'
+                ></textarea>
+                <small :id="`workflow-output-error-${branch.id}`" :class="{ danger: branchOutputError(selectedNode, branch) }" aria-live="polite">{{
+                  branchOutputError(selectedNode, branch) ||
+                  (selectedNode.type === 'agent' && selectedNode.branchMode === 'ai'
+                    ? '填写合法 JSON：固定值原样保留，空字符串由 AI 填写，引用值由程序自动填入。'
+                    : selectedNode.type === 'join'
+                      ? '填写合法 JSON，固定值原样输出；引用值保留原始类型。引用缺失或不唯一时会报错。'
+                      : branch.outputValue?.trim() ? 'JSON 格式正确；固定值原样输出，支持引用上游字段或数据变量。' : '输出内容可留空；填写时请使用合法 JSON，可包含固定值或引用值。')
+                }}</small>
                 <div
-                  v-if="
-                    upstreamReferences.length &&
-                    !(
-                      selectedNode.type === 'agent' &&
-                      selectedNode.branchMode === 'ai'
-                    )
-                  "
+                  v-if="upstreamReferences.length"
                   class="workflow-reference-actions"
                 >
                   <button
                     v-for="item in upstreamReferences"
                     :key="item.expression"
                     type="button"
-                    @click="
-                      branch.outputValue = `${branch.outputValue || ''}${branch.outputValue ? ' ' : ''}${item.expression}`
-                    "
+                    :title="item.expression"
+                    @click="insertOutputReference(branch, item)"
                   >
-                    插入 {{ item.label }}
+                    插入 {{ item.sourceName }} · {{ item.label }}
                   </button>
                 </div>
               </article>
@@ -2645,7 +2784,8 @@ onBeforeUnmount(() => {
             <button
               type="button"
               class="workflow-delete-node"
-              @click="removeNode(selectedNode)"
+              :disabled="confirmingNodeDeletion"
+              @click="confirmDeleteNodes([selectedNode])"
             >
               <Delete />删除此节点
             </button>

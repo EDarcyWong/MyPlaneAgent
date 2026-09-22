@@ -16,6 +16,7 @@ const developmentUrl=!app.isPackaged?process.env.VITE_DEV_SERVER_URL:undefined
 const appIcon=path.join(directory,developmentUrl?'../../public/myplane-icon.png':'../../dist/myplane-icon.png')
 let window:BrowserWindow|undefined
 let workflowEditorWindow:BrowserWindow|undefined
+let helpWindow:BrowserWindow|undefined
 let service:LocalAiStudioService|undefined
 let tray:Tray|undefined
 function focus(){if(window&&!window.isDestroyed()){if(window.isMinimized())window.restore();window.show();window.focus()}}
@@ -60,6 +61,8 @@ function installApplicationMenu(){
    ...(process.platform==='darwin'?[{type:'separator' as const},{label:'前置全部窗体',role:'front' as const}]:[]),
   ]},
   {label:'帮助',submenu:[
+   {label:'工作流使用指南',click:()=>void openHelpDocument().catch(error=>logger.error('help','打开帮助失败',error))},
+   {type:'separator'},
    {label:'打开日志目录',click:async()=>{const error=await shell.openPath(logger.directory);if(error)logger.warn('menu','无法打开日志目录',error)}},
    {type:'separator'},
    {label:`关于 ${app.name}`,click:()=>showAbout()},
@@ -115,6 +118,27 @@ async function openWorkflowEditor(workflowId=''){
  editor.show();editor.focus()
 }
 
+async function openHelpDocument(documentId='workflow'){
+ if(documentId!=='workflow')throw new Error('帮助文档不存在')
+ if(helpWindow&&!helpWindow.isDestroyed()){
+  if(helpWindow.isMinimized())helpWindow.restore()
+  helpWindow.show();helpWindow.focus();return
+ }
+ const next=new BrowserWindow({title:'工作流使用指南 · MyPlaneAgent',width:1160,height:840,minWidth:760,minHeight:560,show:false,backgroundColor:'#f7faf8',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ helpWindow=next
+ next.on('closed',()=>{if(helpWindow===next)helpWindow=undefined})
+ next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
+ next.webContents.on('will-navigate',event=>event.preventDefault())
+ next.webContents.on('will-attach-webview',event=>event.preventDefault())
+ next.webContents.on('console-message',event=>{if(event.level==='error')logger.error('help',event.message)})
+ trackAuthWindow(next.webContents,true,developmentUrl)
+ try{
+  if(developmentUrl){const url=new URL(developmentUrl);url.searchParams.set('surface','help');url.searchParams.set('document',documentId);await next.loadURL(url.href)}
+  else await next.loadFile(path.join(directory,'../../dist/index.html'),{query:{surface:'help',document:documentId}})
+  next.show();next.focus()
+ }catch(error){if(!next.isDestroyed())next.destroy();throw error}
+}
+
 process.on('uncaughtExceptionMonitor',error=>logger.error('process','未捕获异常',error))
 process.on('unhandledRejection',reason=>logger.error('process','未处理的 Promise 拒绝',reason))
 logger.info('app','应用启动',{version:app.getVersion(),platform:process.platform,arch:process.arch,packaged:app.isPackaged})
@@ -140,6 +164,10 @@ else{
   protectedHandle('workflow:open-editor',async(_event,value:unknown)=>{
    if(value!==undefined&&typeof value!=='string')throw new Error('工作流标识无效')
    await openWorkflowEditor(typeof value==='string'?value:'')
+  })
+  protectedHandle('help:open-document',async(_event,value:unknown)=>{
+   if(value!==undefined&&value!=='workflow')throw new Error('帮助文档不存在')
+   await openHelpDocument('workflow')
   })
   protectedHandle('workflow:editor-close',async event=>{const owner=BrowserWindow.fromWebContents(event.sender);if(owner&&owner===workflowEditorWindow)setTimeout(()=>{if(!owner.isDestroyed())owner.close()},0)})
   protectedHandle('workflow:editor-saved',async(_event,value:unknown)=>{
