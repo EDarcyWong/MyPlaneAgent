@@ -1,10 +1,12 @@
 import type {AgentApprovalMode,AgentMode} from './local-ai-agent.js'
+import type {RemoteApiFormat} from './local-ai.js'
 
 export type WorkflowBranch={id:string;name:string;condition:string;color:string;targetNodeIds?:string[];targetNodeId?:string;outputValue?:string}
-export type WorkflowInputParameter={name:string;description:string}
+export type WorkflowInputParameter={name:string;description:string;value?:string}
 export type WorkflowVariableAssignment={name:string;value:string}
+export type WorkflowModelRef={source:'current';id?:string;name?:string}|{source:'local';id:string;name?:string}|{source:'remote';id:string;name?:string;apiFormat:RemoteApiFormat;endpoint:string;profileId?:string;contextLength?:number}
 export type WorkflowNodeBase={id:string;name:string;branches?:WorkflowBranch[];onSuccess?:string;onFailure?:string}
-export type WorkflowAgentNode=WorkflowNodeBase&{type:'agent';config:{instruction:string;model?:string;modelSource?:'current'|'specified';mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode;inputs?:WorkflowInputParameter[];inputSignalMode?:'all'|'any';branchMode?:'ai'|'rules'}}
+export type WorkflowAgentNode=WorkflowNodeBase&{type:'agent';config:{instruction:string;model?:string;modelRef?:WorkflowModelRef;modelSource?:'current'|'specified';mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode;inputs?:WorkflowInputParameter[];inputSignalMode?:'all'|'any';branchMode?:'ai'|'rules'}}
 export type WorkflowConditionNode=WorkflowNodeBase&{type:'condition';config:{sourceNodeId:string;operator:'succeeded'|'failed'}}
 export type WorkflowRouteNode=WorkflowNodeBase&{type:'route';config:{sourceNodeId:string}}
 export type WorkflowDataNode=WorkflowNodeBase&{type:'data';config:{assignments:WorkflowVariableAssignment[]}}

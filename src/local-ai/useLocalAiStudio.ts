@@ -7,7 +7,10 @@ import {clipboardImageFiles,readChatImages} from './chat-images'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
 import {builtinCatalog,type StudioCatalog,type StudioDiscoveryModel} from '../../electron/shared/local-ai-catalog'
 import type {StudioModelDetails} from '../../electron/shared/local-ai-studio'
+import type {WorkflowModelRef} from '../../electron/shared/local-ai-workflow'
 import {showServiceStartError,showServiceValidationError} from './service-error-dialog'
+
+type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:WorkflowModelRef}
 
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
@@ -26,6 +29,10 @@ export function useLocalAiStudio(){
  const activeDownloads=computed(()=>downloads.value.filter(item=>['queued','downloading','verifying'].includes(item.status)))
  const totalSize=computed(()=>(data.value?.models||[]).filter(item=>item.exists).reduce((sum,item)=>sum+item.size,0))
  const localModels=computed(()=>(data.value?.models||[]).filter(item=>(showMissing.value||item.exists)&&`${item.file} ${item.repoId}`.toLowerCase().includes(modelFilter.value.toLowerCase())))
+ const isVisionProjector=(item:{file:string})=>/^mmproj(?:[-_.].*)?\.gguf$/i.test(item.file.split('/').at(-1)||item.file)
+ const localModelKind=(item:StudioLocalModel)=>isVisionProjector(item)?'视觉组件':item.format==='GGUF'?'主模型':item.format
+ const localModelState=(item:StudioLocalModel)=>!item.exists?'文件缺失':isVisionProjector(item)?'配套组件':runtime.value?.modelId===item.id&&runtime.value.state==='running'?'已加载':runtime.value?.modelId===item.id&&runtime.value.state==='starting'?'加载中':'在硬盘中'
+ const canStartLocalModel=(item:StudioLocalModel)=>!!item.exists&&item.format==='GGUF'&&!isVisionProjector(item)&&!sending.value&&!['running','starting','stopping'].includes(runtime.value?.state||'')
  const visibleSessions=computed(()=>sessions.value.filter(item=>item.title.toLowerCase().includes(sessionFilter.value.toLowerCase())))
  const visibleFiles=computed(()=>files.value.filter(item=>(!ggufOnly.value||item.format==='GGUF')&&item.file.toLowerCase().includes(fileFilter.value.toLowerCase())))
  const downloadChoices=computed(()=>visibleFiles.value.filter(item=>!/-\d{5}-of-\d{5}\.gguf$/i.test(item.file)||/-00001-of-\d{5}\.gguf$/i.test(item.file)))
@@ -48,6 +55,26 @@ export function useLocalAiStudio(){
   const activeId=settings.source==='managed'&&runtime.value?.state==='running'?runtime.value.modelName:settings.source==='external'?settings.model:''
   if(!activeId||reported.some(item=>item.id===activeId||item.instanceId===activeId))return reported
   return [{id:activeId,name:activeId},...reported]
+ })
+ const cachedRemoteModels=computed(()=>{
+  const cache=data.value?.remoteModelCache.find(item=>item.apiFormat===settings.apiFormat&&item.endpoint===settings.endpoint)
+  return cache?.models||[]
+ })
+ const workflowModels=computed(()=>{
+  const localRows:WorkflowModelOption[]=(data.value?.models||[])
+    .filter(item=>item.exists&&item.format==='GGUF'&&!isVisionProjector(item))
+    .map(item=>({id:item.id,name:`本地 · ${item.file}`,instanceId:runtime.value?.modelId===item.id&&runtime.value.modelName?runtime.value.modelName:undefined,modelRef:{source:'local',id:item.id,name:item.file} satisfies WorkflowModelRef}))
+  const remoteRows:WorkflowModelOption[]=(data.value?.remoteModelCache||[]).flatMap(cache=>{
+   const profile=remoteProfiles.value.find(item=>item.apiFormat===cache.apiFormat&&item.endpoint===cache.endpoint)
+   return cache.models.map(item=>{
+    const id=item.instanceId||item.id,name=item.name||item.id
+    return {id,name:`远程 · ${profile?.name||cache.endpoint} · ${name}`,instanceId:item.instanceId,modelRef:{source:'remote',id,name,apiFormat:cache.apiFormat==='anthropic'?'anthropic':'openai',endpoint:cache.endpoint,...(profile?.id?{profileId:profile.id}:{}),...(profile?.contextLength?{contextLength:profile.contextLength}:{})} satisfies WorkflowModelRef}
+   })
+  })
+  const rows=settings.source==='managed'?[...localRows,...remoteRows]:[...remoteRows,...localRows]
+  const fallback=settings.source==='managed'?runtime.value?.modelName:settings.model
+  if(fallback&&!rows.some(item=>item.id===fallback||item.instanceId===fallback))rows.unshift({id:fallback,name:fallback,instanceId:undefined,modelRef:settings.source==='external'?{source:'remote',id:fallback,name:fallback,apiFormat:settings.apiFormat,endpoint:settings.endpoint}:{source:'current',id:fallback,name:fallback}})
+  return rows
  })
  watch([model,()=>settings.source,()=>runtime.value?.state,()=>runtime.value?.modelName,sending,sessionBusy],()=>{
   if(!sending.value&&!sessionBusy.value)model.value=currentModelSelection(model.value,settings.source,runtime.value)
@@ -72,7 +99,7 @@ export function useLocalAiStudio(){
   try{const models=await api('models');if(!disposed&&data.value)data.value.models=models}
   finally{modelsBusy.value=false}
  }
- watch([tab,ready],()=>{if(tab.value==='models'&&ready.value)void refreshModels().catch(report)})
+ watch([tab,ready],()=>{if((tab.value==='models'||tab.value==='workflow')&&ready.value)void refreshModels().catch(report)})
  async function refreshSessions(){sessions.value=await api('sessions')}
  function activeServiceModel(){return settings.source==='external'?settings.model:runtime.value?.state==='running'?runtime.value.modelName:''}
  function hydrate(next:StudioSession){composerRevision++;images.value=[];session.value=next;model.value=activeServiceModel()||next.model||serverModels.value[0]?.id||'';systemPrompt.value=next.systemPrompt;input.value='';pending.value=undefined;followBottom.value=true;void scroll(true)}
@@ -99,6 +126,10 @@ export function useLocalAiStudio(){
   try{
    const result=await api('connect',silent===true?{reason:'startup'}:{reason:'manual'});if(source!==settings.source)return
    connection.value=result
+   if(result.ok&&source==='external'&&data.value){
+    const next={apiFormat:settings.apiFormat,endpoint:settings.endpoint,updatedAt:new Date().toISOString(),models:result.models}
+    data.value.remoteModelCache=[next,...data.value.remoteModelCache.filter(item=>!(item.apiFormat===next.apiFormat&&item.endpoint===next.endpoint))].slice(0,20)
+   }
    if(result.ok&&model.value===selection){
     const first=result.models[0]?.instanceId||result.models[0]?.id||''
     if(source==='external'){
@@ -154,6 +185,7 @@ export function useLocalAiStudio(){
  async function importModels(){await run('import',async()=>{if(data.value)data.value.models=await api('importModels')})}
  async function removeModel(item:StudioLocalModel,deleteFile=false){try{await ElMessageBox.confirm(deleteFile?`永久删除文件 ${item.file}？`:`从模型库移除 ${item.file}？原文件会保留；如果文件位于设置的下载目录中，下次扫描时会重新出现在列表中。`,deleteFile?'删除模型文件':'移除模型记录',{type:'warning'});if(data.value)data.value.models=await api('removeModel',{id:item.id,deleteFile})}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function startModel(item:StudioLocalModel){
+  if(isVisionProjector(item)){await showServiceStartError('视觉组件不能单独运行。请加载同目录里的主模型，它会自动配套使用这个 mmproj 文件。');return}
   if(!settings.runtimePath){tab.value='server';await showServiceStartError('未配置 llama-server。请在“模型服务 > 本地服务 > 运行时”中查找或安装运行时，再启动模型服务。');return}
   if(busy.value)return
   busy.value='load';error.value=''
@@ -222,5 +254,5 @@ export function useLocalAiStudio(){
   }catch(cause){report(cause)}
  })
  onBeforeUnmount(()=>{disposed=true;clearTimeout(pollTimer);unlisten?.();if(requestId.value)void api('stopChat',{requestId:requestId.value}).catch(()=>{})})
- return {modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,visibleSessions,visibleFiles,messages,serverModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
+ return {modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
 }

@@ -32,7 +32,7 @@ async function main(){let code=0;try{
  const workflowEditor=BrowserWindow.getAllWindows().find(item=>item!==win&&item.webContents.getURL().includes('surface=workflow-editor'))
  await until(()=>workflowEditor.webContents.executeJavaScript("!!document.querySelector('.workflow-editor-window.is-native-window')",true),'workflow editor canvas loaded')
  assert.equal(workflowEditor.getTitle(),'新建工作流 · MyPlaneAgent')
- assert.equal(workflowEditor.getParentWindow(),win)
+ assert.equal(workflowEditor.getParentWindow(),null)
  await workflowEditor.webContents.executeJavaScript('window.myplane.closeWorkflowEditor()',true)
  await until(()=>BrowserWindow.getAllWindows().length===1,'workflow editor window closed')
  for(const label of ['工作流','定时任务','我的模型','模型服务','工具','设置','工作台']){

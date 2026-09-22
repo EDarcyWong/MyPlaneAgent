@@ -5,10 +5,12 @@ import {
   writeIntegrationJson,
 } from "../integration-store.js";
 import type { AgentTask } from "../../shared/local-ai-agent.js";
+import type { AgentConnection } from "./model.js";
 import type {
   WorkflowBranch,
   WorkflowDefinition,
   WorkflowDefinitionInput,
+  WorkflowModelRef,
   WorkflowNode,
   WorkflowNodeRun,
   WorkflowRun,
@@ -28,6 +30,12 @@ const integer = (value: unknown, label: string, min: number, max: number) => {
     throw new Error(`${label}需要 ${min}–${max} 的整数`);
   return result;
 };
+type WorkflowModelPlan = {
+  model: string;
+  source?: "current" | "local" | "remote";
+  label?: string;
+  connection?: AgentConnection;
+};
 
 export class WorkflowService {
   private readonly definitionsFile: string;
@@ -44,11 +52,71 @@ export class WorkflowService {
     private notify?: (title: string, body: string) => void | boolean,
     private currentModel?: () => string | Promise<string>,
     private isLocalModel?: () => boolean,
+    private prepareModel?: (
+      ref: WorkflowModelRef | undefined,
+      legacyModel: string | undefined,
+    ) => Promise<WorkflowModelPlan>,
   ) {
     this.definitionsFile = path.join(directory, "definitions.json");
     this.versionsFile = path.join(directory, "versions.json");
     this.runsFile = path.join(directory, "runs.json");
     this.recover();
+  }
+  private modelRef(input: unknown, label: string): WorkflowModelRef | undefined {
+    if (!input || typeof input !== "object") return;
+    const row = input as Record<string, unknown>,
+      source = row.source;
+    if (source === "current")
+      return {
+        source,
+        ...(typeof row.id === "string" && row.id.trim()
+          ? { id: text(row.id, `${label} ID`, 500) }
+          : {}),
+        ...(typeof row.name === "string" && row.name.trim()
+          ? { name: text(row.name, `${label}名称`, 500) }
+          : {}),
+      };
+    if (source === "local")
+      return {
+        source,
+        id: text(row.id, `${label} ID`, 500),
+        ...(typeof row.name === "string" && row.name.trim()
+          ? { name: text(row.name, `${label}名称`, 500) }
+          : {}),
+      };
+    if (source === "remote") {
+      const apiFormat = row.apiFormat === "anthropic" ? "anthropic" : "openai",
+        endpoint = text(row.endpoint, `${label}服务地址`, 1000);
+      try {
+        const url = new URL(endpoint);
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+      } catch {
+        throw new Error(`${label}服务地址无效`);
+      }
+      return {
+        source,
+        id: text(row.id, `${label} ID`, 500),
+        apiFormat,
+        endpoint: endpoint.endsWith("/") ? endpoint.slice(0, -1) : endpoint,
+        ...(typeof row.name === "string" && row.name.trim()
+          ? { name: text(row.name, `${label}名称`, 500) }
+          : {}),
+        ...(typeof row.profileId === "string" && row.profileId.trim()
+          ? { profileId: text(row.profileId, `${label}配置`, 100) }
+          : {}),
+        ...(Number.isFinite(Number(row.contextLength))
+          ? {
+              contextLength: integer(
+                row.contextLength,
+                `${label}上下文`,
+                512,
+                1_000_000,
+              ),
+            }
+          : {}),
+      };
+    }
+    throw new Error(`${label}来源无效`);
   }
   definitions() {
     const rows = readIntegrationJson<WorkflowDefinition[]>(
@@ -169,7 +237,12 @@ export class WorkflowService {
     const base = { id: text(input.id, "节点 ID", 80), name, branches };
     if (input.type === "agent") {
       const branchMode = input.config?.branchMode || "ai",
-        modelSource = input.config?.modelSource || (input.config?.model ? "specified" : "current");
+        modelRef = this.modelRef(input.config?.modelRef, `节点“${base.name}”的模型`),
+        modelSource =
+          input.config?.modelSource ||
+          (input.config?.model || (modelRef && modelRef.source !== "current")
+            ? "specified"
+            : "current");
       if (
         !["general", "coding", "documents"].includes(input.config?.mode) ||
         !["ask", "auto", "full", "unrestricted"].includes(
@@ -178,7 +251,8 @@ export class WorkflowService {
         !["all", "any"].includes(input.config?.inputSignalMode || "all") ||
         !["ai", "rules"].includes(branchMode) ||
         !["current", "specified"].includes(modelSource) ||
-        (modelSource === "specified" && !String(input.config?.model || "").trim())
+        (modelSource === "specified" &&
+          !String(input.config?.model || modelRef?.id || "").trim())
       )
         throw new Error(`节点“${base.name}”的 Agent 配置无效`);
       const inputNames = new Set<string>(),
@@ -199,11 +273,17 @@ export class WorkflowService {
               `输入参数“${parameterName}”的说明`,
               4000,
               true,
+            ),
+            value = text(
+              legacy.value,
+              `输入参数“${parameterName}”的绑定值`,
+              4000,
+              true,
             );
           if (inputNames.has(parameterName))
             throw new Error(`节点“${base.name}”的输入参数名称不能重复`);
           inputNames.add(parameterName);
-          return { name: parameterName, description };
+          return { name: parameterName, description, ...(value ? { value } : {}) };
         });
       if (branchMode === "ai") {
         if (!branches.length)
@@ -222,6 +302,7 @@ export class WorkflowService {
           ...(input.config.model
             ? { model: text(input.config.model, "模型", 500) }
             : {}),
+          ...(modelRef ? { modelRef } : {}),
           modelSource,
           mode: input.config.mode,
           maxSteps: integer(input.config.maxSteps, "最大步骤", 1, 500),
@@ -711,14 +792,72 @@ export class WorkflowService {
     if (run.logs.length > 300) run.logs.splice(0, run.logs.length - 300);
     this.log?.(level, `工作流“${run.workflowName}”${message}`);
   }
-  private render(value: string, run: WorkflowRun) {
+  private inputPath(
+    inputs: Record<string, unknown>,
+    path: string,
+  ): string | undefined {
+    let value: unknown = inputs;
+    for (const part of path.split(".")) {
+      if (!part) return undefined;
+      if (Array.isArray(value) && /^\d+$/.test(part)) value = value[Number(part)];
+      else if (value && typeof value === "object")
+        value = (value as Record<string, unknown>)[part];
+      else return undefined;
+    }
+    if (value === undefined || value === null) return "";
+    return typeof value === "object" ? JSON.stringify(value) : String(value);
+  }
+  private canReadNodeOutput(
+    sourceId: string,
+    scope?: { definition: WorkflowDefinition; node: WorkflowNode },
+    run?: WorkflowRun,
+  ) {
+    if (!scope || !run) return true;
+    return (run.nodeInputSignals?.[scope.node.id] || []).includes(sourceId);
+  }
+  private render(
+    value: string,
+    run: WorkflowRun,
+    scope?: { definition: WorkflowDefinition; node: WorkflowNode },
+  ) {
     return value.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (_match, key: string) => {
       const name = key.trim();
+      const inputPath = name.match(/^inputs?\.(.+)$/);
+      if (inputPath && scope)
+        return (
+          this.inputPath(
+            this.upstreamInputs(scope.definition, scope.node, run),
+            inputPath[1],
+          ) ?? _match
+        );
       if (name.startsWith("variables."))
         return run.variables?.[name.slice(10)] ?? _match;
       if (run.variables && name in run.variables) return run.variables[name];
+      const outputPath = name.match(/^([^.]+)\.output(?:\.(.+))?$/);
+      if (outputPath) {
+        if (!this.canReadNodeOutput(outputPath[1], scope, run)) return _match;
+        const node = run.nodeRuns.find((item) => item.nodeId === outputPath[1]);
+        if (!node) return _match;
+        if (!outputPath[2]) return node.outputValue ?? "";
+        try {
+          let value: unknown = JSON.parse(node.outputValue || "null");
+          for (const part of outputPath[2].split(".")) {
+            if (!part) return _match;
+            if (Array.isArray(value) && /^\d+$/.test(part)) value = value[Number(part)];
+            else if (value && typeof value === "object")
+              value = (value as Record<string, unknown>)[part];
+            else return _match;
+          }
+          if (value === undefined || value === null) return "";
+          return typeof value === "object" ? JSON.stringify(value) : String(value);
+        } catch {
+          return _match;
+        }
+      }
       const split = name.lastIndexOf(".");
       if (split > 0) {
+        if (!this.canReadNodeOutput(name.slice(0, split), scope, run))
+          return _match;
         const node = run.nodeRuns.find(
             (item) => item.nodeId === name.slice(0, split),
           ),
@@ -787,6 +926,131 @@ export class WorkflowService {
       )
     );
   }
+  private compactJson(value: unknown, max = 3000) {
+    const source = JSON.stringify(value, null, 2);
+    return source.length > max
+      ? source.slice(0, max) + "\n...（内容过长，已截断）"
+      : source;
+  }
+  private objectOutput(value?: string): Record<string, unknown> | undefined {
+    if (!value) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+        return parsed as Record<string, unknown>;
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  private mergeInputObject(
+    target: Record<string, unknown>,
+    source: Record<string, unknown>,
+  ) {
+    for (const [key, value] of Object.entries(source)) {
+      const current = target[key];
+      if (
+        current &&
+        typeof current === "object" &&
+        !Array.isArray(current) &&
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value)
+      )
+        this.mergeInputObject(
+          current as Record<string, unknown>,
+          value as Record<string, unknown>,
+        );
+      else target[key] = value;
+    }
+  }
+  private upstreamInputs(
+    definition: WorkflowDefinition,
+    node: WorkflowNode,
+    run: WorkflowRun,
+  ) {
+    const inputs: Record<string, unknown> = {};
+    for (const sourceId of run.nodeInputSignals?.[node.id] || []) {
+      const source = definition.nodes.find((item) => item.id === sourceId),
+        sourceInput: Record<string, unknown> = {};
+      if (source?.type === "data")
+        for (const assignment of source.config.assignments) {
+          const name = assignment.name.trim();
+          if (name && run.variables && name in run.variables)
+            sourceInput[name] = run.variables[name];
+        }
+      const sourceRun = [...run.nodeRuns]
+        .reverse()
+        .find(
+          (item) =>
+            item.nodeId === sourceId &&
+            item.status === "succeeded" &&
+            item.outputValue !== undefined,
+        );
+      if (sourceRun?.outputValue) {
+        const output = this.objectOutput(sourceRun.outputValue);
+        if (output) this.mergeInputObject(sourceInput, output);
+        else sourceInput.output = sourceRun.outputValue;
+      }
+      inputs[sourceId] = sourceInput;
+    }
+    return inputs;
+  }
+  private agentPrompt(
+    definition: WorkflowDefinition,
+    node: Extract<WorkflowNode, { type: "agent" }>,
+    run: WorkflowRun,
+  ) {
+    const inputs = this.upstreamInputs(definition, node, run),
+      context = {
+        variables: run.variables || {},
+        previousNodes: run.nodeRuns
+          .filter((item) => item.nodeId !== node.id || item.status !== "running")
+          .map((item) => ({
+            id: item.nodeId,
+            name: item.nodeName,
+            type: item.type,
+            status: item.status,
+            summary: item.summary,
+            error: item.error,
+            branchId: item.branchId,
+            branchName: item.branchName,
+            output: item.outputValue,
+            outputJson: this.objectOutput(item.outputValue),
+          })),
+      },
+      expanded = this.render(node.config.instruction, run, { definition, node });
+    if (node.config.branchMode !== "ai")
+      return `${expanded}\n\n输入 JSON：\n${this.compactJson(inputs)}\n\n工作流上下文：\n${this.compactJson(context)}`;
+    const branches = (node.branches || []).map((branch, index) => ({
+        order: index + 1,
+        id: branch.id,
+        name: branch.name,
+        judgement: branch.condition,
+        outputFormat: this.outputTemplate(
+          branch.outputValue,
+          `Agent“${node.name}”分支“${branch.name}”的输出 JSON`,
+        ),
+      })),
+      protocol = `你正在执行工作流 Agent 节点“${node.name}”。必须严格遵守以下协议：
+1. 先完成“任务要求”，再只根据“输出分支”的 judgement 判断方式选择分支。
+2. 按输出分支 order 从小到大评估；选择第一条判断方式成立的分支。不得改写、放宽、忽略判断方式，不得编造未配置分支。
+3. 如果没有任何判断方式成立，且没有 judgement 明确表示“始终 / 总是 / always / 默认 / 兜底”的分支，返回 {"branchId":"__NO_MATCH__","output":{}}。
+4. 最终回答只能是一个 JSON 对象，不能包含 Markdown、解释、代码块或额外文字。
+5. JSON 对象只能包含 branchId 和 output 两个属性。branchId 必须是所选分支 id；output 必须严格匹配该分支 outputFormat：属性名、层级、属性数量完全一致，所有叶子值都必须是字符串。`;
+    if (protocol.length > 6000)
+      throw new Error(`Agent“${node.name}”的分支配置过长`);
+    const fixed = `${protocol}\n\n输入 JSON：\n${this.compactJson(inputs)}\n\n工作流上下文：\n${this.compactJson(context)}\n\n输出分支：\n${this.compactJson(branches, 7000)}\n\n任务要求：\n`,
+      room = 15800 - fixed.length;
+    if (room < 1000)
+      throw new Error(`Agent“${node.name}”的分支配置过长，请减少分支或输出字段`);
+    return (
+      fixed +
+      (expanded.length > room
+        ? expanded.slice(0, room) + "\n...（任务要求过长，已截断）"
+        : expanded)
+    );
+  }
   private aiDecision(
     source: string,
     node: Extract<WorkflowNode, { type: "agent" }>,
@@ -802,14 +1066,23 @@ export class WorkflowService {
       );
     } catch {
       throw new Error(
-        'AI 返回的结果不是有效 JSON；应只返回 {"branchId":"分支 ID","output":{...}}`',
+        'AI 返回的结果不是有效 JSON；应只返回 {"branchId":"分支 ID","output":{...}}',
       );
     }
     if (!response || typeof response !== "object" || Array.isArray(response))
       throw new Error("AI 返回的结果必须是 JSON 对象");
     const value = response as Record<string, unknown>,
-      branch = node.branches?.find((item) => item.id === value.branchId);
+      keys = Object.keys(value).sort();
+    if (keys.join(",") !== "branchId,output")
+      throw new Error("AI 返回 JSON 只能包含 branchId 和 output 两个属性");
+    if (value.branchId === "__NO_MATCH__")
+      throw new Error("AI 严格判断后没有命中任何输出分支");
+    if (typeof value.branchId !== "string")
+      throw new Error("AI 返回的 branchId 必须是字符串");
+    const branch = node.branches?.find((item) => item.id === value.branchId);
     if (!branch) throw new Error("AI 返回了不存在的输出分支");
+    if (!value.output || typeof value.output !== "object" || Array.isArray(value.output))
+      throw new Error("AI 返回的 output 必须是 JSON 对象");
     const template = this.outputTemplate(
       branch.outputValue,
       `Agent“${node.name}”分支“${branch.name}”的输出 JSON`,
@@ -840,55 +1113,40 @@ export class WorkflowService {
     this.persist(run);
     try {
       if (node.type === "agent") {
-        if (this.isLocalModel?.() && this.activeAgents.size) {
+        const legacyModel =
+            node.config.modelSource === "specified"
+              ? node.config.model
+              : await this.currentModel?.(),
+          wantsLocal =
+            node.config.modelRef?.source === "local" ||
+            (!node.config.modelRef &&
+              node.config.modelSource !== "specified" &&
+              this.isLocalModel?.());
+        if (wantsLocal && this.activeAgents.size) {
           run.nodeRuns.pop();
           this.pendingLocalAgents.push({ definition, runId, nodeId });
           this.trace(run, "info", `本地模型繁忙，节点“${node.name}”已进入执行队列`, node.id);
           this.persist(run);
           return;
         }
-        const inputs = Object.fromEntries(
-            (node.config.inputs || []).map((item) => [item.name, ""]),
-          ),
-          descriptions = Object.fromEntries(
-            (node.config.inputs || []).map((item) => [
-              item.name,
-              item.description,
-            ]),
-          ),
-          expanded = this.render(node.config.instruction, run),
-          inputJson = JSON.stringify(inputs, null, 2),
-          branches =
-            node.config.branchMode === "ai"
-              ? `\n\n输入 JSON：\n${inputJson}\n\n输入参数说明：\n${JSON.stringify(descriptions, null, 2)}\n\n输出分支（只能选择一个）：\n${JSON.stringify(
-                  (node.branches || []).map((branch) => ({
-                    id: branch.id,
-                    name: branch.name,
-                    condition: branch.condition,
-                    output: JSON.parse(branch.outputValue || "{}"),
-                  })),
-                  null,
-                  2,
-                )}\n\n根据任务、输入参数说明和输入，识别唯一最符合的分支。只返回一个 JSON 对象，不要 Markdown 或解释：{"branchId":"分支 ID","output":{...}}。branchId 必须是上列 ID；output 必须严格保留所选分支输出格式中的全部属性，所有叶子值均为字符串，不得增加或删除属性。`
-              : `\n\n输入 JSON：\n${inputJson}\n\n输入参数说明：\n${JSON.stringify(descriptions, null, 2)}`,
-          prompt = `${expanded}${branches}`,
-          model =
-            node.config.modelSource === "specified"
-              ? node.config.model
-              : await this.currentModel?.(),
+        const prompt = this.agentPrompt(definition, node, run),
+          plan = this.prepareModel
+            ? await this.prepareModel(node.config.modelRef, legacyModel)
+            : { model: legacyModel || node.config.model || "" },
           result = this.agent.start(
             {
               projectId: definition.projectId,
               hidden: true,
               mode: node.config.mode,
               model: (() => {
-                const resolved = model || node.config.model;
+                const resolved = plan.model || legacyModel || node.config.model;
                 if (!resolved)
                   throw new Error(
                     "当前连接尚未选择模型；请在模型连接设置中选择可用模型后重试",
                   );
                 return resolved;
               })(),
+              ...(plan.connection ? { connectionOverride: plan.connection } : {}),
               prompt,
               maxSteps: node.config.maxSteps,
               fastMode: node.config.fastMode,
@@ -896,6 +1154,13 @@ export class WorkflowService {
             },
             0,
             (task) => this.agentUpdate(definition, run.id, node, task),
+          );
+        if (plan.label)
+          this.trace(
+            run,
+            "info",
+            `节点“${node.name}”使用${plan.source === "local" ? "本地" : plan.source === "remote" ? "远程" : "当前"}模型：${plan.label}`,
+            node.id,
           );
         nodeRun.agentTaskId = result.id;
         run.agentTaskIds.push(result.id);
@@ -931,7 +1196,10 @@ export class WorkflowService {
       if (node.type === "data") {
         run.variables = run.variables || {};
         for (const assignment of node.config.assignments)
-          run.variables[assignment.name] = this.render(assignment.value, run);
+          run.variables[assignment.name] = this.render(assignment.value, run, {
+            definition,
+            node,
+          });
         nodeRun.status = "succeeded";
         nodeRun.summary = `已设置 ${node.config.assignments.length} 个变量`;
         nodeRun.finishedAt = now();
@@ -948,7 +1216,10 @@ export class WorkflowService {
       if (node.type === "approval") {
         run.status = "waiting";
         nodeRun.status = "waiting";
-        nodeRun.summary = this.render(node.config.prompt, run);
+        nodeRun.summary = this.render(node.config.prompt, run, {
+          definition,
+          node,
+        });
         nodeRun.approval = {
           approveLabel: node.config.approveLabel,
           rejectLabel: node.config.rejectLabel,
@@ -958,7 +1229,7 @@ export class WorkflowService {
       }
       if (node.type === "end") {
         const summary =
-          this.render(node.config.summary, run) ||
+          this.render(node.config.summary, run, { definition, node }) ||
           `${node.config.status === "succeeded" ? "成功" : "失败"}结束`;
         nodeRun.status = "succeeded";
         nodeRun.summary = summary;
@@ -970,8 +1241,8 @@ export class WorkflowService {
         return this.continueRun(definition, run);
       }
       const notified = this.notify?.(
-        this.render(node.config.title, run),
-        this.render(node.config.body, run),
+        this.render(node.config.title, run, { definition, node }),
+        this.render(node.config.body, run, { definition, node }),
       );
       if (notified === false) throw new Error("当前系统不支持桌面通知");
       nodeRun.status = "succeeded";
@@ -1031,7 +1302,7 @@ export class WorkflowService {
         nodeRun.error = String(error);
         nodeRun.finishedAt = now();
         this.persist(run);
-        void this.advance(definition, run, node, false, null);
+        this.fail(run.id, String(error));
         return;
       }
     nodeRun.status = success ? "succeeded" : "failed";
@@ -1141,7 +1412,10 @@ export class WorkflowService {
         branch.outputValue &&
         !(node.type === "agent" && node.config.branchMode === "ai")
       ) {
-        nodeRun.outputValue = this.render(branch.outputValue, run);
+        nodeRun.outputValue = this.render(branch.outputValue, run, {
+          definition,
+          node,
+        });
         nodeRun.summary = nodeRun.outputValue;
       }
       const queued = new Set([

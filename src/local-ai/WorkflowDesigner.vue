@@ -9,6 +9,7 @@ import {
 } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
+  Aim,
   Bell,
   Check,
   Close,
@@ -16,12 +17,14 @@ import {
   Cpu,
   DataAnalysis,
   Delete,
+  DocumentChecked,
   Edit,
   Flag,
+  Fold,
+  FullScreen,
   Guide,
+  MagicStick,
   Plus,
-  Position,
-  Rank,
   RefreshLeft,
   RefreshRight,
   ScaleToOriginal,
@@ -36,13 +39,13 @@ import type {
   WorkflowBranch,
   WorkflowDefinition,
   WorkflowDefinitionInput,
-  WorkflowInputParameter,
+  WorkflowModelRef,
   WorkflowNode,
   WorkflowRun,
   WorkflowVariableAssignment,
 } from "../../electron/shared/local-ai-workflow";
 
-type ModelOption = { id: string; name?: string; instanceId?: string };
+type ModelOption = { id: string; name?: string; instanceId?: string; modelRef?: WorkflowModelRef };
 const props = withDefaults(
     defineProps<{
       model: string;
@@ -63,8 +66,10 @@ const definitions = ref<WorkflowDefinition[]>([]),
   error = ref(""),
   selectedNodeId = ref("__start__");
 const canvas = ref<HTMLElement>(),
-  canvasHost = ref<HTMLElement>();
+  canvasHost = ref<HTMLElement>(),
+  editorBody = ref<HTMLElement>();
 let timer: ReturnType<typeof setInterval> | undefined,
+  autoSaveTimer: ReturnType<typeof setInterval> | undefined,
   historyTimer: ReturnType<typeof setTimeout> | undefined,
   disposeSaved: (() => void) | undefined,
   nodeSequence = 0,
@@ -77,12 +82,12 @@ type FormNode = {
   branches: FormBranch[];
   instruction: string;
   model: string;
+  modelRef?: WorkflowModelRef;
   modelSource: "current" | "specified";
   mode: "coding" | "general" | "documents";
   maxSteps: number;
   fastMode: boolean;
   approvalMode: "ask" | "auto" | "full" | "unrestricted";
-  inputs: WorkflowInputParameter[];
   inputSignalMode: "all" | "any";
   branchMode: "ai" | "rules";
   sourceNodeId: string;
@@ -116,6 +121,12 @@ type DragState = {
   positions: Map<string, { x: number; y: number }>;
 };
 type PanState = { clientX: number; clientY: number; x: number; y: number };
+type InspectorDragState = {
+  clientX: number;
+  clientY: number;
+  x: number;
+  y: number;
+};
 type CanvasEdge = {
   id: string;
   sourceId: string;
@@ -150,6 +161,9 @@ const connection = ref<ConnectionDraft>(),
     targetId: string;
   }>(),
   selectedNodeIds = ref(new Set<string>(["__start__"]));
+const inspectorFloating = ref(false),
+  inspectorPosition = reactive({ x: 24, y: 18 }),
+  inspectorDrag = ref<InspectorDragState>();
 let spacePressed = false,
   suppressEdgeMenuUntil = 0;
 const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
@@ -206,7 +220,6 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     maxSteps: 30,
     fastMode: true,
     approvalMode: "ask",
-    inputs: [],
     inputSignalMode: "any",
     branchMode: "ai",
     sourceNodeId: "",
@@ -239,6 +252,9 @@ const fresh = () => ({
 const form = reactive(fresh());
 const history = ref<string[]>([]),
   historyIndex = ref(-1),
+  lastSavedSnapshot = ref(""),
+  lastAutoSaveAttempt = ref(""),
+  lastSavedAt = ref<Date>(),
   canUndo = computed(() => historyIndex.value > 0),
   canRedo = computed(
     () =>
@@ -260,6 +276,49 @@ const selected = computed(() =>
 const selectedNode = computed(() =>
     form.nodes.find((node) => node.id === selectedNodeId.value),
   ),
+  encodeModelRef = (ref: WorkflowModelRef) => JSON.stringify(ref),
+  decodeModelRef = (value: string): WorkflowModelRef | undefined => {
+    try {
+      const parsed = JSON.parse(value) as WorkflowModelRef;
+      if (
+        parsed?.source === "local" ||
+        parsed?.source === "remote" ||
+        parsed?.source === "current"
+      )
+        return parsed;
+    } catch {
+      /* Legacy plain model id. */
+    }
+  },
+  specifiedModelOptions = computed(() => {
+    const rows = new Map<string, string>();
+    for (const item of props.models) {
+      const value = item.id || item.instanceId || "";
+      if (!value) continue;
+      const name = item.name || value;
+      rows.set(item.modelRef ? encodeModelRef(item.modelRef) : value, name);
+    }
+    const current = selectedNode.value?.model?.trim();
+    const currentValue = selectedNode.value?.modelRef
+      ? encodeModelRef(selectedNode.value.modelRef)
+      : current;
+    if (currentValue && !rows.has(currentValue))
+      rows.set(currentValue, `当前配置：${current}`);
+    return [...rows].map(([value, label]) => ({ value, label }));
+  }),
+  selectedModelValue = computed({
+    get: () =>
+      selectedNode.value?.modelRef
+        ? encodeModelRef(selectedNode.value.modelRef)
+        : selectedNode.value?.model || "",
+    set: (value: string) => {
+      if (!selectedNode.value) return;
+      const ref = decodeModelRef(value);
+      selectedNode.value.modelRef = ref;
+      selectedNode.value.model =
+        ref?.source === "local" || ref?.source === "remote" ? ref.id : value;
+    },
+  }),
   nodeCandidates = computed(() =>
     form.nodes.filter((node) => node.id !== selectedNode.value?.id),
   ),
@@ -282,6 +341,25 @@ const selectionStyle = computed(() =>
     : {},
 );
 const formSnapshot = () => JSON.stringify(form);
+const hasUnsavedChanges = computed(
+  () => !!lastSavedSnapshot.value && formSnapshot() !== lastSavedSnapshot.value,
+);
+const saveStateText = computed(() => {
+  if (busy.value === "save") return "正在保存";
+  if (!form.id) return "首次保存后启用自动保存";
+  if (hasUnsavedChanges.value) return "有未保存更改";
+  if (lastSavedAt.value)
+    return `已保存 ${lastSavedAt.value.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`;
+  return "已保存";
+});
+function markSaved() {
+  lastSavedSnapshot.value = formSnapshot();
+  lastAutoSaveAttempt.value = lastSavedSnapshot.value;
+  lastSavedAt.value = new Date();
+}
 function resetHistory() {
   if (historyTimer) clearTimeout(historyTimer);
   historyTimer = undefined;
@@ -386,6 +464,129 @@ const incomingSourceCount = (nodeId: string) =>
       )
       .map((source) => source.id),
   ).size;
+const incomingSources = (nodeId: string) =>
+  form.nodes.filter((source) =>
+    source.branches.some((branch) => branch.targetNodeIds?.includes(nodeId)),
+  );
+type UpstreamReference = {
+  sourceId: string;
+  sourceName: string;
+  label: string;
+  expression: string;
+  detail: string;
+};
+function jsonLeaves(value: string | undefined) {
+  if (!value?.trim()) return [] as string[];
+  try {
+    const parsed = JSON.parse(value),
+      rows: string[] = [],
+      walk = (item: unknown, path: string) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          if (path) rows.push(path);
+          return;
+        }
+        for (const [key, child] of Object.entries(item as Record<string, unknown>))
+          walk(child, path ? `${path}.${key}` : key);
+      };
+    walk(parsed, "");
+    return rows;
+  } catch {
+    return [];
+  }
+}
+function emptyJsonShape(value: string | undefined) {
+  if (!value?.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value),
+      shape = (item: unknown): unknown => {
+        if (typeof item === "string") return "";
+        if (!item || typeof item !== "object" || Array.isArray(item))
+          return undefined;
+        const entries = Object.entries(item as Record<string, unknown>).flatMap(
+          ([key, child]) => {
+            const next = shape(child);
+            return next === undefined ? [] : [[key, next]];
+          },
+        );
+        return entries.length ? Object.fromEntries(entries) : undefined;
+      };
+    return shape(parsed);
+  } catch {
+    return undefined;
+  }
+}
+function mergeShape(target: Record<string, unknown>, source: unknown) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return;
+  for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      target[key] &&
+      typeof target[key] === "object" &&
+      !Array.isArray(target[key])
+    )
+      mergeShape(target[key] as Record<string, unknown>, value);
+    else target[key] = value;
+  }
+}
+function upstreamOutputReferences(nodeId: string) {
+  const rows = new Map<string, UpstreamReference>();
+  for (const source of incomingSources(nodeId)) {
+    if (source.type === "data")
+      for (const assignment of source.assignments) {
+        const name = assignment.name.trim();
+        if (!name) continue;
+        const expression = `{{input.${source.id}.${name}}}`;
+        rows.set(expression, {
+          sourceId: source.id,
+          sourceName: source.name,
+          label: `${source.id}.${name}`,
+          expression,
+          detail: "工作流变量",
+        });
+      }
+    for (const branch of source.branches.filter((item) => item.outputValue?.trim()))
+      for (const path of jsonLeaves(branch.outputValue)) {
+        const expression = `{{input.${source.id}.${path}}}`;
+        rows.set(expression, {
+          sourceId: source.id,
+          sourceName: source.name,
+          label: `${source.id}.${path}`,
+          expression,
+          detail: `分支：${branch.name}`,
+        });
+      }
+  }
+  return [...rows.values()];
+}
+const upstreamReferences = computed<UpstreamReference[]>(() => {
+  const node = selectedNode.value;
+  return node ? upstreamOutputReferences(node.id) : [];
+});
+const upstreamJsonPreview = computed(() => {
+  const node = selectedNode.value;
+  if (!node) return "";
+  const output: Record<string, unknown> = {};
+  for (const source of incomingSources(node.id)) {
+    const sourceOutput: Record<string, unknown> = {};
+    if (source.type === "data")
+      for (const assignment of source.assignments) {
+        const name = assignment.name.trim();
+        if (name) sourceOutput[name] = "";
+      }
+    for (const branch of source.branches)
+      mergeShape(sourceOutput, emptyJsonShape(branch.outputValue));
+    output[source.id] = sourceOutput;
+  }
+  return JSON.stringify(output, null, 2);
+});
+function bindReference(target: { value?: string }, expression: string) {
+  target.value = expression;
+}
+function appendReference(target: { value?: string }, expression: string) {
+  target.value = `${target.value || ""}${target.value ? " " : ""}${expression}`;
+}
 function portPoint(sourceId: string, branch: Branch) {
   if (sourceId === "__start__")
     return { x: form.startX + 150, y: form.startY + 38 };
@@ -569,6 +770,9 @@ function initializeNew() {
   selectedId.value = "";
   setSelection(["__start__"], "__start__");
   resetHistory();
+  lastSavedSnapshot.value = formSnapshot();
+  lastAutoSaveAttempt.value = lastSavedSnapshot.value;
+  lastSavedAt.value = undefined;
 }
 function create() {
   if (!props.windowMode) {
@@ -623,14 +827,7 @@ function fromNode(
             },
           ]
         : []),
-    ],
-    inputs =
-      node.type === "agent"
-        ? (node.config.inputs || []).map((parameter) => ({
-            name: parameter.name,
-            description: parameter.description || "",
-          }))
-        : [];
+    ];
   return {
     id: node.id,
     name: node.name,
@@ -638,16 +835,16 @@ function fromNode(
     branches,
     instruction: node.type === "agent" ? node.config.instruction : "",
     model: node.type === "agent" ? node.config.model || "" : props.model || "",
+    modelRef: node.type === "agent" ? node.config.modelRef : undefined,
     modelSource:
       node.type === "agent" ? node.config.modelSource || "current" : "current",
     mode: node.type === "agent" ? node.config.mode : "coding",
     maxSteps: node.type === "agent" ? node.config.maxSteps : 30,
     fastMode: node.type === "agent" ? node.config.fastMode : true,
     approvalMode: node.type === "agent" ? node.config.approvalMode : "ask",
-    inputs,
     inputSignalMode:
       node.type === "agent" ? node.config.inputSignalMode || "all" : "all",
-    branchMode: "ai",
+    branchMode: node.type === "agent" ? node.config.branchMode || "ai" : "ai",
     sourceNodeId:
       node.type === "condition" || node.type === "route"
         ? node.config.sourceNodeId
@@ -692,6 +889,7 @@ function initializeEdit(item: WorkflowDefinition) {
   setSelection(["__start__"], "__start__");
   editing.value = true;
   resetHistory();
+  markSaved();
 }
 function edit(item: WorkflowDefinition) {
   if (!props.windowMode) {
@@ -744,11 +942,13 @@ function payload(): WorkflowDefinitionInput {
           ...(node.modelSource === "specified" && node.model.trim()
             ? { model: node.model.trim() }
             : {}),
+          ...(node.modelSource === "specified" && node.modelRef
+            ? { modelRef: node.modelRef }
+            : {}),
           mode: node.mode,
           maxSteps: Number(node.maxSteps),
           fastMode: node.fastMode,
           approvalMode: node.approvalMode,
-          inputs: node.inputs.map((parameter) => ({ ...parameter })),
           inputSignalMode: node.inputSignalMode,
           branchMode: node.branchMode,
         },
@@ -818,7 +1018,11 @@ function payload(): WorkflowDefinitionInput {
     },
   };
 }
-async function save() {
+async function save(manual = true) {
+  const snapshot = formSnapshot();
+  if (!manual && (!form.id || snapshot === lastSavedSnapshot.value || snapshot === lastAutoSaveAttempt.value))
+    return;
+  if (!manual) lastAutoSaveAttempt.value = snapshot;
   error.value = "";
   if (!form.name.trim()) {
     error.value = "请先填写工作流名称";
@@ -832,10 +1036,12 @@ async function save() {
   busy.value = "save";
   try {
     const item = await api("workflowSave", payload());
+    form.id = item.id;
     selectedId.value = item.id;
+    markSaved();
     if (props.windowMode) {
-      ElMessage.success(`工作流 v${item.version} 已保存`);
       await window.myplane.workflowEditorSaved(item.id);
+      if (manual) ElMessage.success(`工作流 v${item.version} 已保存`);
     } else {
       await load();
       editing.value = false;
@@ -926,7 +1132,11 @@ function beginStartDrag(event: PointerEvent) {
 }
 function beginCanvasAction(event: PointerEvent) {
   edgeMenu.value = undefined;
-  if (event.button === 1 || (event.button === 0 && spacePressed)) {
+  if (
+    event.button === 1 ||
+    event.button === 2 ||
+    (event.button === 0 && spacePressed)
+  ) {
     event.preventDefault();
     pan.value = {
       clientX: event.clientX,
@@ -1120,24 +1330,6 @@ function removeBranch(node: FormNode, branch: FormBranch) {
   )
     selectedEdgeKey.value = undefined;
 }
-function addAgentInput(node: FormNode) {
-  node.inputs.push({ name: "", description: "" });
-}
-function removeAgentInput(node: FormNode, index: number) {
-  node.inputs.splice(index, 1);
-}
-function agentInputJson(node: FormNode) {
-  return JSON.stringify(
-    Object.fromEntries(
-      node.inputs.map((item, index) => [
-        item.name.trim() || `参数${index + 1}`,
-        "",
-      ]),
-    ),
-    null,
-    2,
-  );
-}
 function addAssignment(node: FormNode) {
   node.assignments.push({ name: "", value: "" });
 }
@@ -1145,6 +1337,25 @@ function removeAssignment(node: FormNode, index: number) {
   node.assignments.splice(index, 1);
 }
 function pointerMove(event: PointerEvent) {
+  if (inspectorDrag.value) {
+    const body = editorBody.value?.getBoundingClientRect();
+    if (body) {
+      inspectorPosition.x = Math.max(
+        10,
+        Math.min(
+          body.width - 390,
+          inspectorDrag.value.x + event.clientX - inspectorDrag.value.clientX,
+        ),
+      );
+      inspectorPosition.y = Math.max(
+        10,
+        Math.min(
+          body.height - 120,
+          inspectorDrag.value.y + event.clientY - inspectorDrag.value.clientY,
+        ),
+      );
+    }
+  }
   if (pan.value) {
     viewport.x = Math.round(pan.value.x + event.clientX - pan.value.clientX);
     viewport.y = Math.round(pan.value.y + event.clientY - pan.value.clientY);
@@ -1226,6 +1437,26 @@ function pointerUp() {
   pan.value = undefined;
   selectionBox.value = undefined;
   connection.value = undefined;
+  inspectorDrag.value = undefined;
+}
+function toggleInspectorMode() {
+  inspectorFloating.value = !inspectorFloating.value;
+  if (inspectorFloating.value) {
+    const body = editorBody.value?.getBoundingClientRect();
+    inspectorPosition.x = Math.max(12, (body?.width || 900) - 430);
+    inspectorPosition.y = 16;
+  }
+}
+function beginInspectorDrag(event: PointerEvent) {
+  if (!inspectorFloating.value || (event.target as HTMLElement).closest("button"))
+    return;
+  inspectorDrag.value = {
+    clientX: event.clientX,
+    clientY: event.clientY,
+    x: inspectorPosition.x,
+    y: inspectorPosition.y,
+  };
+  event.preventDefault();
 }
 function isEditableTarget(target: EventTarget | null) {
   const element = target as HTMLElement | null;
@@ -1327,6 +1558,7 @@ onMounted(async () => {
     if (props.workflowId && !item) error.value = "找不到要编辑的工作流";
     else if (item) initializeEdit(item);
     else initializeNew();
+    autoSaveTimer = setInterval(() => void save(false), 30_000);
   } else {
     timer = setInterval(() => void load(), 4000);
     disposeSaved = window.myplane.onWorkflowSaved(() => void load());
@@ -1338,6 +1570,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer);
+  if (autoSaveTimer) clearInterval(autoSaveTimer);
   if (historyTimer) clearTimeout(historyTimer);
   disposeSaved?.();
   window.removeEventListener("pointermove", pointerMove);
@@ -1531,11 +1764,15 @@ onBeforeUnmount(() => {
     ><form
       v-if="editing"
       class="workflow-editor-window"
-      :class="{ 'is-native-window': windowMode, 'is-connecting': !!connection }"
+      :class="{
+        'is-native-window': windowMode,
+        'is-connecting': !!connection,
+        'inspector-is-floating': inspectorFloating,
+      }"
       role="dialog"
       aria-modal="true"
       aria-label="工作流画布编辑器"
-      @submit.prevent="save"
+      @submit.prevent="save()"
       @keydown.esc.prevent="closeEditor"
     >
       <header class="workflow-editor-header">
@@ -1544,14 +1781,35 @@ onBeforeUnmount(() => {
           ><strong>{{ form.name || "未命名工作流" }}</strong
           ><small>端口拖动创建连线；已有连线左拖新增目标、右拖切换目标</small>
         </div>
-        <div>
-          <span class="workflow-save-state"
-            >{{ form.id ? "编辑已有流程" : "新流程" }} ·
-            {{ form.nodes.length }} 个节点</span
-          ><button type="button" class="secondary-button" @click="closeEditor">
-            <Close />关闭</button
-          ><button class="primary-button" :disabled="busy === 'save'">
-            <Check />{{ busy === "save" ? "保存中…" : "保存工作流" }}
+        <div class="workflow-editor-actions">
+          <span class="workflow-save-state" :class="{ dirty: hasUnsavedChanges }"
+            >{{ saveStateText }} · {{ form.nodes.length }} 个节点</span
+          ><div class="workflow-header-history">
+            <button
+              type="button"
+              title="撤销 (Ctrl/Cmd+Z)"
+              aria-label="撤销"
+              :disabled="!canUndo"
+              @click="undo"
+            >
+              <RefreshLeft /></button
+            ><button
+              type="button"
+              title="重做 (Ctrl/Cmd+Shift+Z / Ctrl+Y)"
+              aria-label="重做"
+              :disabled="!canRedo"
+              @click="redo"
+            >
+              <RefreshRight />
+            </button>
+          </div>
+          <button
+            class="workflow-save-button"
+            :disabled="busy === 'save'"
+            :title="busy === 'save' ? '正在保存工作流' : '保存工作流'"
+            :aria-label="busy === 'save' ? '正在保存工作流' : '保存工作流'"
+          >
+            <DocumentChecked />
           </button>
         </div>
       </header>
@@ -1569,7 +1827,7 @@ onBeforeUnmount(() => {
           }}</span>
         </div>
       </div>
-      <div class="workflow-editor-body">
+      <div ref="editorBody" class="workflow-editor-body">
         <section class="workflow-canvas-pane">
           <div class="workflow-canvas-toolbar">
             <div class="workflow-component-buttons">
@@ -1623,28 +1881,12 @@ onBeforeUnmount(() => {
               >
                 <Flag />结束
               </button>
-              <div class="workflow-history-control">
-                <button
-                  type="button"
-                  title="撤销 (Ctrl/Cmd+Z)"
-                  :disabled="!canUndo"
-                  @click="undo"
-                >
-                  <RefreshLeft />撤销</button
-                ><button
-                  type="button"
-                  title="重做 (Ctrl/Cmd+Shift+Z / Ctrl+Y)"
-                  :disabled="!canRedo"
-                  @click="redo"
-                >
-                  <RefreshRight />重做
-                </button>
-              </div>
             </div>
-            <div>
-              <span class="workflow-canvas-tip"
-                >左拖框选 · Shift 追加 · Alt 减选 · 空格拖动画布</span
-              >
+            <span class="workflow-canvas-tip"
+              >左拖框选 · Shift 追加 · Alt 减选 · 空格或右键拖动画布</span
+            >
+          </div>
+          <div class="workflow-canvas-float-controls" aria-label="画布视图控制">
               <div class="workflow-zoom-control">
                 <button
                   type="button"
@@ -1684,17 +1926,18 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 title="将画布平移回初始位置"
+                aria-label="回到原点"
                 @click="centerCanvas"
               >
-                <Position />回到原点</button
+                <Aim /></button
               ><button
                 type="button"
                 title="自动整理节点位置"
+                aria-label="自动排列"
                 @click="autoLayout"
               >
-                <Rank />自动排列
+                <MagicStick />
               </button>
-            </div>
           </div>
           <div
             ref="canvasHost"
@@ -1869,7 +2112,31 @@ onBeforeUnmount(() => {
             ><small>左键拖动新增目标，右键拖动切换当前目标</small>
           </div>
         </section>
-        <aside class="workflow-inspector">
+        <aside
+          class="workflow-inspector"
+          :class="{ floating: inspectorFloating, dragging: !!inspectorDrag }"
+          :style="
+            inspectorFloating
+              ? {
+                  left: inspectorPosition.x + 'px',
+                  top: inspectorPosition.y + 'px',
+                  height: `calc(100% - ${inspectorPosition.y + 12}px)`,
+                }
+              : undefined
+          "
+        >
+          <div class="workflow-inspector-modebar" @pointerdown="beginInspectorDrag">
+            <span>属性</span>
+            <button
+              type="button"
+              :title="inspectorFloating ? '停靠到右侧' : '浮动显示属性面板'"
+              :aria-label="inspectorFloating ? '停靠属性面板' : '浮动属性面板'"
+              @click="toggleInspectorMode"
+            >
+              <Fold v-if="inspectorFloating" />
+              <FullScreen v-else />
+            </button>
+          </div>
           <template v-if="selectedEdge"
             ><header>
               <Connection />
@@ -1991,63 +2258,40 @@ onBeforeUnmount(() => {
                 disabled
                 title="节点类型创建后不可修改"
             /></label>
+            <section
+              v-if="incomingSourceCount(selectedNode.id) > 0"
+              class="workflow-upstream"
+            >
+              <header>
+                <div>
+                  <strong>预计接收结构</strong
+                  ><small>根据上游组件输出 JSON 自动推导，运行后才会产生实际值</small>
+                </div>
+              </header>
+              <textarea
+                :value="upstreamJsonPreview"
+                rows="5"
+                readonly
+                aria-label="接收的上游 JSON 数据结构"
+              ></textarea>
+              <article
+                v-for="item in upstreamReferences"
+                :key="item.sourceId + item.expression + item.label"
+              >
+                <span>{{ item.sourceName }} · {{ item.label }}</span>
+                <code>{{ item.expression }}</code>
+                <small>{{ item.detail }}</small>
+              </article>
+            </section>
             <template v-if="selectedNode.type === 'agent'"
               ><label
                 >执行内容<textarea
                   v-model="selectedNode.instruction"
                   rows="8"
                   required
-                  placeholder="描述任务；可引用 {{variables.name}} 或 {{节点ID.summary}}"
+	                  placeholder="描述任务；可引用 {{input.上游节点ID.name}} 或 {{variables.name}}"
                 ></textarea>
               </label>
-              <section class="workflow-agent-inputs">
-                <header>
-                  <div>
-                    <strong>输入参数</strong
-                    ><small
-                      >参数名自动拼接为 JSON；说明仅供 AI 理解字段语义</small
-                    >
-                  </div>
-                  <button type="button" @click="addAgentInput(selectedNode)">
-                    <Plus />添加参数
-                  </button>
-                </header>
-                <article
-                  v-for="(parameter, index) in selectedNode.inputs"
-                  :key="index"
-                >
-                  <header>
-                    <strong>参数 {{ index + 1 }}</strong
-                    ><button
-                      type="button"
-                      title="删除参数"
-                      @click="removeAgentInput(selectedNode, index)"
-                    >
-                      <Delete />
-                    </button>
-                  </header>
-                  <label
-                    >参数名称<input
-                      v-model="parameter.name"
-                      required
-                      maxlength="100" /></label
-                  ><label
-                    >参数说明<textarea
-                      v-model="parameter.description"
-                      rows="3"
-                      maxlength="4000"
-                      placeholder="例如：待分析的项目名称"
-                    ></textarea>
-                  </label>
-                </article>
-                <label
-                  >输入 JSON 预览<textarea
-                    :value="agentInputJson(selectedNode)"
-                    rows="5"
-                    readonly
-                  ></textarea>
-                </label>
-              </section>
               <p class="workflow-field-note">
                 AI 会基于自然语言条件互斥选择一个分支，并按该分支的 JSON
                 格式输出属性值。
@@ -2058,12 +2302,16 @@ onBeforeUnmount(() => {
                   <option value="specified">指定模型 ID</option>
                 </select></label
               ><label v-if="selectedNode.modelSource === 'specified'"
-                >模型 ID<input
-                  v-model="selectedNode.model"
-                  list="workflow-models"
-                  required
-                  placeholder="选择当前服务可用的模型 ID"
-              /></label>
+                >模型 ID<select v-model="selectedModelValue" required>
+                  <option value="" disabled>选择模型</option>
+                  <option
+                    v-for="item in specifiedModelOptions"
+                    :key="item.value"
+                    :value="item.value"
+                  >
+                    {{ item.label }}
+                  </option>
+                </select></label>
               ><p
                 v-if="selectedNode.modelSource === 'current'"
                 class="workflow-field-note"
@@ -2172,9 +2420,22 @@ onBeforeUnmount(() => {
                       v-model="assignment.value"
                       rows="3"
                       maxlength="4000"
-                      placeholder="支持 {{variables.name}} 和 {{节点ID.summary}}"
+	                      placeholder="支持 {{input.上游节点ID.name}} 和 {{variables.name}}"
                     ></textarea>
                   </label>
+                  <div
+                    v-if="upstreamReferences.length"
+                    class="workflow-reference-actions"
+                  >
+                    <button
+                      v-for="item in upstreamReferences"
+                      :key="item.expression"
+                      type="button"
+                      @click="bindReference(assignment, item.expression)"
+                    >
+                      绑定 {{ item.label }}
+                    </button>
+                  </div>
                 </article></section
             ></template>
             <template v-else-if="selectedNode.type === 'join'"
@@ -2221,7 +2482,7 @@ onBeforeUnmount(() => {
                   v-model="selectedNode.title"
                   required
                   maxlength="120"
-                  placeholder="支持 {{variables.name}}" /></label
+	                  placeholder="支持 {{input.上游节点ID.name}} 或 {{variables.name}}" /></label
               ><label
                 >通知内容<textarea
                   v-model="selectedNode.body"
@@ -2358,6 +2619,27 @@ onBeforeUnmount(() => {
                     placeholder="支持模板变量"
                   ></textarea>
                 </label>
+                <div
+                  v-if="
+                    upstreamReferences.length &&
+                    !(
+                      selectedNode.type === 'agent' &&
+                      selectedNode.branchMode === 'ai'
+                    )
+                  "
+                  class="workflow-reference-actions"
+                >
+                  <button
+                    v-for="item in upstreamReferences"
+                    :key="item.expression"
+                    type="button"
+                    @click="
+                      branch.outputValue = `${branch.outputValue || ''}${branch.outputValue ? ' ' : ''}${item.expression}`
+                    "
+                  >
+                    插入 {{ item.label }}
+                  </button>
+                </div>
               </article>
             </section>
             <button
@@ -2370,13 +2652,7 @@ onBeforeUnmount(() => {
           </template>
         </aside>
       </div>
-      <datalist id="workflow-models">
-        <option
-          v-for="item in models"
-          :key="item.id"
-          :value="item.id"
-        >{{ item.name || item.id }}</option></datalist
-      ><datalist id="workflow-branch-conditions">
+      <datalist id="workflow-branch-conditions">
         <option value="执行成功"></option>
         <option value="执行失败"></option>
         <option value="始终"></option>

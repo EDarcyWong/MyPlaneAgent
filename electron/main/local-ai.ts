@@ -193,7 +193,7 @@ export class LocalAiService {
     }
   }
 
-  private storedProfiles(): StoredRemoteProfile[] {
+  protected storedProfiles(): StoredRemoteProfile[] {
     const rows = readIntegrationJson<StoredRemoteProfile[]>(this.profilesFile, [])
     return rows.filter(row => row && typeof row.id === 'string' && typeof row.name === 'string' && typeof row.endpoint === 'string' && typeof row.model === 'string' && typeof row.encryptedApiKey === 'string').map(row => ({...row, apiFormat: apiFormat(row.apiFormat), contextLength: clampInteger(row.contextLength, 512, 1_000_000, 4096)}))
   }

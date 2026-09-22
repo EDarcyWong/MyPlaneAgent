@@ -8,7 +8,7 @@ import {
   inferenceBudget,
   type ContextMessage,
 } from "./local-ai-context.js";
-import { requestAgentModel, type AgentMessage } from "./agent/model.js";
+import { requestAgentModel, type AgentConnection, type AgentMessage } from "./agent/model.js";
 import type { TokenUsage } from "../shared/local-ai-usage.js";
 import {
   readTokenUsage,
@@ -85,6 +85,7 @@ import type {
   StudioMessage,
   StudioModelDetails,
   StudioModelFile,
+  StudioRemoteModelCache,
   StudioSession,
   StudioSessionSummary,
   StudioSettings,
@@ -117,7 +118,7 @@ import {
 import { AutomationService } from "./agent/automation.js";
 import type { AutomationTaskInput } from "../shared/local-ai-automation.js";
 import { WorkflowService } from "./agent/workflow.js";
-import type { WorkflowDefinitionInput } from "../shared/local-ai-workflow.js";
+import type { WorkflowDefinitionInput, WorkflowModelRef } from "../shared/local-ai-workflow.js";
 
 export type StudioLogSink = (
   level: "debug" | "info" | "warn" | "error",
@@ -166,6 +167,7 @@ export class LocalAiStudioService extends LocalAiService {
     { time: number; details: StudioModelDetails }
   >();
   private readonly catalogFile: string;
+  private readonly remoteModelCacheFile: string;
   private readonly modelIcons: LocalAiModelIcons;
   private readonly installer: LocalAiInstaller;
   private readonly developer: LocalAiDeveloper;
@@ -214,6 +216,7 @@ export class LocalAiStudioService extends LocalAiService {
       writeIntegrationJson(this.preferencesFile, this.preferences);
     }
     this.catalogFile = path.join(dataRoot, "local-ai-catalog-cache.json");
+    this.remoteModelCacheFile = path.join(dataRoot, "local-ai-remote-model-cache.json");
     this.pythonTools = new PythonToolRuntime();
     this.toolStore = new AgentToolStore(
       path.join(dataRoot, "local-ai-tools.json"),
@@ -298,6 +301,7 @@ export class LocalAiStudioService extends LocalAiService {
         );
       },
       () => this.inferenceSettings().source === "managed",
+      (ref, legacyModel) => this.prepareWorkflowModel(ref, legacyModel),
     );
     this.automation = new AutomationService(
       path.join(dataRoot, "local-ai-automations"),
@@ -479,6 +483,7 @@ export class LocalAiStudioService extends LocalAiService {
         totalMemory: os.totalmem(),
         freeMemory: os.freemem(),
       },
+      remoteModelCache: this.remoteModelCache(),
     };
   }
   bootstrap(): StudioBootstrap {
@@ -507,6 +512,152 @@ export class LocalAiStudioService extends LocalAiService {
       endpoint: endpoint(config.endpoint),
       key: config.encryptedApiKey ? this.decrypt(config.encryptedApiKey) : "",
     };
+  }
+  private agentConnection(settings = this.inferenceSettings()): AgentConnection {
+    const service =
+      settings.source === "managed"
+        ? {
+            apiFormat: "openai" as const,
+            endpoint:
+              this.gateway.endpoint ||
+              `http://127.0.0.1:${settings.runtimePort}/v1`,
+            key: this.gateway.apiKey,
+          }
+        : this.service();
+    return {
+      ...service,
+      maxTokens: settings.maxTokens,
+      contextLength: settings.contextLength,
+      localLlama: settings.source === "managed",
+    };
+  }
+  private async prepareWorkflowModel(ref?: WorkflowModelRef, legacyModel?: string) {
+    if (!ref || ref.source === "current") {
+      const model = ref?.id || legacyModel || (await this.workflowCurrentModel());
+      return { model, source: "current" as const, label: model };
+    }
+    if (ref.source === "local") {
+      const model = this.models().find((item) => item.id === ref.id);
+      if (!model) throw new Error(`本地模型不存在：${ref.name || ref.id}`);
+      if (!model.exists) throw new Error(`本地模型文件不存在：${model.file}`);
+      if (model.format !== "GGUF") throw new Error(`本地模型不是 GGUF，不能由 llama.cpp 加载：${model.file}`);
+      if (isVisionProjector(model.file)) throw new Error("视觉组件不能作为 Agent 模型运行，请选择同目录里的主模型");
+      const state = this.runtime.snapshot();
+      if (
+        state.modelId !== model.id &&
+        (state.pid || ["starting", "running", "stopping"].includes(state.state))
+      )
+        await this.stopRuntime();
+      const ready = this.runtime.snapshot().modelId === model.id && this.runtime.snapshot().state === "running"
+        ? this.runtime.snapshot()
+        : await this.startRuntime(model.id);
+      return {
+        model: ready.modelName,
+        source: "local" as const,
+        label: model.file,
+        connection: this.agentConnection({ ...this.inferenceSettings(), source: "managed" }),
+      };
+    }
+    const endpointValue = endpoint(ref.endpoint),
+      profiles = this.storedProfiles(),
+      profile =
+        (ref.profileId && profiles.find((item) => item.id === ref.profileId)) ||
+        profiles.find((item) => item.apiFormat === ref.apiFormat && endpoint(item.endpoint) === endpointValue),
+      current = this.config(),
+      encryptedApiKey =
+        profile?.encryptedApiKey ||
+        (current.apiFormat === ref.apiFormat && endpoint(current.endpoint) === endpointValue
+          ? current.encryptedApiKey
+          : ""),
+      settings = this.inferenceSettings();
+    return {
+      model: ref.id || legacyModel || profile?.model || "",
+      source: "remote" as const,
+      label: ref.name || ref.id,
+      connection: {
+        apiFormat: ref.apiFormat,
+        endpoint: endpointValue,
+        key: encryptedApiKey ? this.decrypt(encryptedApiKey) : "",
+        maxTokens: settings.maxTokens,
+        contextLength: ref.contextLength || profile?.contextLength || settings.contextLength,
+        localLlama: false,
+      },
+    };
+  }
+  private async workflowCurrentModel() {
+    const settings = this.inferenceSettings();
+    if (settings.source === "managed") return this.runtime.snapshot().modelName;
+    const configured = (
+      settings.model ||
+      this.remoteProfiles()
+        .filter((profile) => profile.endpoint === settings.endpoint)
+        .sort((a, b) => (b.lastUsedAt || "").localeCompare(a.lastUsedAt || ""))[0]?.model ||
+      ""
+    );
+    if (configured) return configured;
+    const response = (await this.request(`${this.service().endpoint}/models`)) as {
+      data?: { id?: unknown }[];
+    };
+    return response.data?.map((item) => textValue(item.id, 500)).find(Boolean) || "";
+  }
+  private remoteModelCacheKey(apiFormat: string, endpointValue: string) {
+    return `${apiFormat}|${endpoint(endpointValue)}`;
+  }
+  remoteModelCache(): StudioRemoteModelCache[] {
+    const rows = readIntegrationJson<StudioRemoteModelCache[]>(
+      this.remoteModelCacheFile,
+      [],
+    );
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .flatMap((row) => {
+        if (!row || typeof row.endpoint !== "string" || !Array.isArray(row.models)) return [];
+        try {
+          const models = row.models
+            .map((item) => record(item))
+            .map((item) => ({
+              id: textValue(item.id, 500),
+              name: textValue(item.name, 500) || textValue(item.id, 500),
+              ...(item.loaded !== undefined ? { loaded: item.loaded === true } : {}),
+              ...(textValue(item.instanceId, 500) ? { instanceId: textValue(item.instanceId, 500) } : {}),
+              ...(Number(item.contextLength) > 0 ? { contextLength: Number(item.contextLength) } : {}),
+            }))
+            .filter((item) => item.id);
+          return models.length
+            ? [{
+                apiFormat: row.apiFormat === "anthropic" ? "anthropic" : "openai",
+                endpoint: endpoint(row.endpoint),
+                updatedAt: textValue(row.updatedAt) || new Date(0).toISOString(),
+                models,
+              }]
+            : [];
+        } catch {
+          return [];
+        }
+      })
+      .filter((row) => row.models.length)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 20);
+  }
+  private saveRemoteModelCache(service: ReturnType<LocalAiStudioService["service"]>, models: StudioConnection["models"]) {
+    const row: StudioRemoteModelCache = {
+        apiFormat: service.apiFormat,
+        endpoint: service.endpoint,
+        updatedAt: new Date().toISOString(),
+        models: models.map((item) => ({
+          id: item.id,
+          name: item.name || item.id,
+          ...(item.loaded !== undefined ? { loaded: item.loaded } : {}),
+          ...(item.instanceId ? { instanceId: item.instanceId } : {}),
+          ...(item.contextLength ? { contextLength: item.contextLength } : {}),
+        })),
+      },
+      key = this.remoteModelCacheKey(row.apiFormat, row.endpoint),
+      next = [
+        row,
+        ...this.remoteModelCache().filter((item) => this.remoteModelCacheKey(item.apiFormat, item.endpoint) !== key),
+      ].slice(0, 20);
+    writeIntegrationJson(this.remoteModelCacheFile, next);
   }
   private async request(url: string, body?: unknown, timeout = 15_000) {
     const service = this.service();
@@ -610,6 +761,8 @@ export class LocalAiStudioService extends LocalAiService {
         } catch {}
       }
       const latencyMs = Date.now() - start;
+      if (this.studioSettings().source === "external")
+        this.saveRemoteModelCache(service, models);
       this.applicationLog?.(
         "info",
         "remote-service",

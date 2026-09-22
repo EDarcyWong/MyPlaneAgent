@@ -99,7 +99,7 @@ async function openWorkflowEditor(workflowId=''){
   if(currentId===workflowId)return
   workflowEditorWindow.close()
  }
- const editor=new BrowserWindow({title:workflowId?'编辑工作流':'新建工作流',width:1320,height:850,minWidth:960,minHeight:640,show:false,parent:window,modal:false,backgroundColor:'#eef3f0',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ const editor=new BrowserWindow({title:workflowId?'编辑工作流':'新建工作流',width:1320,height:850,minWidth:960,minHeight:640,show:false,backgroundColor:'#eef3f0',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
  workflowEditorWindow=editor
  logger.info('window',workflowId?'打开工作流编辑窗体':'打开新建工作流窗体',{workflowId})
  editor.on('closed',()=>{if(workflowEditorWindow===editor)workflowEditorWindow=undefined;window?.webContents.send('workflow:saved')})
@@ -127,7 +127,9 @@ else{
   if(process.platform==='darwin')app.dock?.setIcon(appIcon)
   installApplicationMenu()
   service=new LocalAiStudioService(dataDirectory,(level,scope,message)=>logger[level](scope,message))
-  tray=new Tray(appIcon);tray.setToolTip(app.name);tray.setContextMenu(Menu.buildFromTemplate([{label:'打开 MyPlaneAgent',click:()=>void createWindow()},{type:'separator'},{label:'退出',role:'quit'}]));tray.on('click',()=>void createWindow())
+  if(process.platform!=='darwin'){
+   tray=new Tray(appIcon);tray.setToolTip(app.name);tray.setContextMenu(Menu.buildFromTemplate([{label:'打开 MyPlaneAgent',click:()=>void createWindow()},{type:'separator'},{label:'退出',role:'quit'}]));tray.on('click',()=>void createWindow())
+  }
   registerLocalAiStudio(()=>service!,()=>service?.dispose())
   protectedHandle('ai:open-link',async(_event,value:unknown)=>{
    if(typeof value!=='string'||value.length>8000)throw new Error('链接无效')
@@ -140,10 +142,9 @@ else{
    await openWorkflowEditor(typeof value==='string'?value:'')
   })
   protectedHandle('workflow:editor-close',async event=>{const owner=BrowserWindow.fromWebContents(event.sender);if(owner&&owner===workflowEditorWindow)setTimeout(()=>{if(!owner.isDestroyed())owner.close()},0)})
-  protectedHandle('workflow:editor-saved',async(event,value:unknown)=>{
+  protectedHandle('workflow:editor-saved',async(_event,value:unknown)=>{
    if(typeof value!=='string'||value.length>200)throw new Error('工作流标识无效')
    window?.webContents.send('workflow:saved',value)
-   const owner=BrowserWindow.fromWebContents(event.sender);if(owner&&owner===workflowEditorWindow)setTimeout(()=>{if(!owner.isDestroyed())owner.close()},0)
   })
   protectedHandle('app:logs',async(_event,action:unknown,input:unknown)=>{
    if(action==='read')return {entries:logger.entries(typeof input==='number'?input:1000),directory:logger.directory}

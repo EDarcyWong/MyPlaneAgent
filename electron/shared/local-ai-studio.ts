@@ -36,6 +36,7 @@ export type StudioRuntime = {
   endpoint:string;pid?:number;error:string;logs:string[];startedAt?:number;host?:string;parallel?:number;contextLength?:number;embedding?:boolean;vision?:boolean
 }
 export type StudioServerModel = {id:string;name:string;loaded?:boolean;instanceId?:string;contextLength?:number}
+export type StudioRemoteModelCache = {apiFormat:string;endpoint:string;updatedAt:string;models:StudioServerModel[]}
 export type StudioConnection = {ok:boolean;endpoint:string;latencyMs:number;models:StudioServerModel[];error:string;provider:'lmstudio'|'openai'|'deepseek'|'anthropic'}
 export type StudioImage = {name:string;dataUrl:string}
 export type StudioMessage = {usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
@@ -43,7 +44,7 @@ export type StudioSession = {projectId?:string;checkpoint?:ContextCheckpoint;con
 export type StudioSessionSummary = Omit<StudioSession,'messages'> & {messageCount:number}
 export type StudioEvent = {type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
 export type StudioHardware = {platform:string;arch:string;cpu:string;threads:number;totalMemory:number;freeMemory:number}
-export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;hardware:StudioHardware}
+export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;hardware:StudioHardware;remoteModelCache:StudioRemoteModelCache[]}
 export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean}
 
 export type StudioCommands = {

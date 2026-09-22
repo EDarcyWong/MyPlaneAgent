@@ -319,3 +319,8 @@
 .agent-view .status-bar{background:var(--s-bg);font-size:12px}
 .agent-view .brand strong{display:none}.agent-view .brand .topbar-divider{display:none}
 .agent-view .brand>span:last-child{font-size:13px;color:var(--s-text);font-weight:550}
+.library-row.projector .library-icon{color:var(--s-accent);background:var(--s-accent-soft);border-color:color-mix(in srgb,var(--s-accent) 35%,var(--s-border))}
+.library-model-tags{display:flex!important;align-items:center;gap:5px;min-width:0}
+.library-model-tags span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.library-model-tags b{flex:none;padding:2px 6px;border-radius:4px;background:var(--s-muted);color:var(--s-dim);font-size:10px;font-weight:600}
+.library-model-tags b.vision,.state-tag.projector{background:var(--s-accent-soft);color:var(--s-accent)}
