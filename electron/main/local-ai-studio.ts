@@ -311,12 +311,12 @@ export class LocalAiStudioService extends LocalAiService {
       (level, message) => log?.(level, "automation", message),
       notify,
       {
-        exists: (id, projectId) =>
+        exists: (id) =>
           this.workflow
             .definitions()
             .some(
               (item) =>
-                item.id === id && item.projectId === projectId && item.enabled,
+                item.id === id && item.enabled,
             ),
         start: (id, onUpdate) => this.workflow.start(id, onUpdate),
         cancel: (id) => {
@@ -411,6 +411,9 @@ export class LocalAiStudioService extends LocalAiService {
       repeatPenalty: numeric(p.repeatPenalty, 0.1, 2, 1.1),
       systemPrompt: textValue(p.systemPrompt, 12000),
       theme: p.theme === "light" || p.theme === "dark" ? p.theme : "system",
+      appearanceStyle: ["ocean", "paper", "terminal"].includes(p.appearanceStyle || "")
+        ? p.appearanceStyle as StudioSettings["appearanceStyle"]
+        : "minimal",
     };
   }
   private inferenceSettings(): StudioSettings {
@@ -462,6 +465,7 @@ export class LocalAiStudioService extends LocalAiService {
       "repeatPenalty",
       "systemPrompt",
       "theme",
+      "appearanceStyle",
     ] as const;
     const candidate = { ...this.preferences };
     for (const key of keys)
@@ -2180,7 +2184,7 @@ export class LocalAiStudioService extends LocalAiService {
             title: "允许定时任务自动执行",
             message: "允许此任务在无人值守时自动执行可授权操作？",
             detail:
-              "任务会使用项目现有的文件与联网权限。需要逐次确认的高风险操作会被拒绝，不会停在后台等待确认。",
+              "普通任务在独立工作目录中运行；工作流任务沿用工作流自身的运行权限。需要逐次确认的高风险操作会被拒绝，不会停在后台等待确认。",
             buttons: ["取消", "允许"],
             defaultId: 0,
             cancelId: 0,

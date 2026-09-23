@@ -34,6 +34,7 @@ import {
   Plus,
   RefreshLeft,
   RefreshRight,
+  Search,
   ScaleToOriginal,
   UserFilled,
   VideoPause,
@@ -42,6 +43,7 @@ import {
   ZoomOut,
 } from "@element-plus/icons-vue";
 import type { AgentProject } from "../../electron/shared/local-ai-agent";
+import type { StudioSettings } from "../../electron/shared/local-ai-studio";
 import { ruleOperators, isDecision } from "../../electron/shared/workflow-decisions";
 import type { WorkflowRule } from "../../electron/shared/local-ai-workflow";
 import { mapVariableReferences } from "../../electron/shared/workflow-variable-references";
@@ -67,8 +69,10 @@ const props = withDefaults(
       models: ModelOption[];
       windowMode?: boolean;
       workflowId?: string;
+      appearanceStyle?: StudioSettings["appearanceStyle"];
+      theme?: StudioSettings["theme"];
     }>(),
-    { windowMode: false, workflowId: "" },
+    { windowMode: false, workflowId: "", appearanceStyle: "minimal", theme: "system" },
   ),
   api = window.myplane.localAiStudio;
 const definitions = ref<WorkflowDefinition[]>([]),
@@ -77,6 +81,8 @@ const definitions = ref<WorkflowDefinition[]>([]),
   editing = ref(false),
   selectedId = ref(""),
   historyId = ref(""),
+  workflowSearch = ref(""),
+  historyStatus = ref<"all" | "active" | "failed">("all"),
   busy = ref(""),
   error = ref(""),
   selectedNodeId = ref("__start__");
@@ -334,15 +340,24 @@ const history = ref<string[]>([]),
 const selected = computed(() =>
     definitions.value.find((item) => item.id === selectedId.value),
   ),
+  starterWorkflow = computed(() => selected.value || definitions.value[0]),
+  filteredDefinitions = computed(() =>
+    definitions.value.filter((item) =>
+      item.name.toLocaleLowerCase().includes(workflowSearch.value.trim().toLocaleLowerCase()),
+    ),
+  ),
   visibleRuns = computed(() =>
     runs.value.filter(
       (item) => !historyId.value || item.workflowId === historyId.value,
     ),
   ),
-  running = computed(
-    () =>
-      runs.value.filter((item) => ["running", "waiting"].includes(item.status))
-        .length,
+  filteredRuns = computed(() =>
+    visibleRuns.value.filter((item) =>
+      historyStatus.value === "all" ||
+      (historyStatus.value === "active"
+        ? ["running", "waiting"].includes(item.status)
+        : ["failed", "cancelled"].includes(item.status)),
+    ),
   );
 const selectedNode = computed(() =>
     form.nodes.find((node) => node.id === selectedNodeId.value),
@@ -803,6 +818,8 @@ function create() {
   }
   initializeNew();
 }
+const canCreate = computed(() => projects.value.length > 0);
+defineExpose({ create, canCreate });
 function fromNode(
   node: WorkflowNode,
   index: number,
@@ -1715,65 +1732,62 @@ onBeforeUnmount(() => {
 
 <template>
   <main v-if="!windowMode" class="workflow-page scroll-page">
-    <header class="workflow-header">
-      <div>
-        <span class="eyebrow">WORKFLOWS</span>
-        <h1>工作流</h1>
-        <p>组合智能任务、确定性路由、数据、人工确认和系统动作。</p>
-      </div>
-      <button
-        class="primary-button"
-        :disabled="!projects.length"
-        @click="create"
-      >
-        <Plus />新建工作流
-      </button>
-    </header>
     <div v-if="error && !editing" class="workflow-error">
       {{ error }}<button @click="error = ''">关闭</button>
     </div>
-    <section class="workflow-stats">
-      <div>
-        <strong>{{ definitions.length }}</strong
-        ><span>工作流</span>
+    <section v-if="!definitions.length && !runs.length" class="workflow-onboarding">
+      <div class="workflow-onboarding-hero">
+        <div class="workflow-onboarding-copy">
+          <span class="workflow-onboarding-kicker">从一个想法开始</span>
+          <h2>把重复任务，<br />变成清晰的工作流。</h2>
+          <p>连接 AI 任务、条件判断与人工确认，让每一步按预期执行，结果都有记录可查。</p>
+          <small v-if="projects.length">点击顶部的「＋」按钮创建第一个工作流。</small>
+          <small v-if="!projects.length">创建工作流前，请先在工作台添加项目。</small>
+        </div>
+        <div class="workflow-onboarding-preview" aria-hidden="true">
+          <div class="workflow-preview-caption"><span class="workflow-preview-dot"></span> 流程预览</div>
+          <div class="workflow-preview-flow">
+            <div class="workflow-preview-node start"><span><VideoPlay /></span><strong>开始</strong><small>设定目标</small></div>
+            <i></i>
+            <div class="workflow-preview-node agent"><span><ChatLineSquare /></span><strong>AI 任务</strong><small>分析与生成</small></div>
+            <i></i>
+            <div class="workflow-preview-node check"><span><DocumentChecked /></span><strong>人工确认</strong><small>把关关键步骤</small></div>
+            <i></i>
+            <div class="workflow-preview-node finish"><span><Flag /></span><strong>完成</strong><small>保存结果</small></div>
+          </div>
+          <p>拖放组件，连接步骤，保存后即可运行。</p>
+        </div>
       </div>
-      <div>
-        <strong>{{ running }}</strong
-        ><span>运行中</span>
-      </div>
-      <div>
-        <strong>{{ runs.length }}</strong
-        ><span>历史运行</span>
+      <div class="workflow-onboarding-steps">
+        <article><span>01</span><strong>搭建流程</strong><p>用可视化画布编排任务与判断。</p></article>
+        <article><span>02</span><strong>运行与确认</strong><p>需要人工决策时，流程会等待处理。</p></article>
+        <article><span>03</span><strong>查看结果</strong><p>按节点回看执行记录与最终输出。</p></article>
       </div>
     </section>
-    <div class="workflow-grid">
+    <div v-else class="workflow-grid">
       <section class="workflow-list">
         <header>
-          <h2>流程</h2>
-          <button class="icon-btn" @click="load"><RefreshRight /></button>
+          <div><h2>我的流程</h2><span>{{ definitions.length }} 个流程</span></div>
+          <button class="icon-btn" aria-label="刷新工作流" title="刷新工作流" @click="load"><RefreshRight /></button>
         </header>
-        <p v-if="!definitions.length" class="workflow-empty">暂无工作流</p>
+        <label v-if="definitions.length > 3 || workflowSearch" class="workflow-list-search"><Search /><input v-model="workflowSearch" type="search" placeholder="搜索工作流名称" aria-label="搜索工作流名称" /></label>
+        <div v-if="!definitions.length" class="workflow-empty workflow-empty-list"><Collection /><strong>从第一个工作流开始</strong><p>点击顶部的「＋」按钮，创建可重复运行的流程。</p></div>
+        <p v-else-if="!filteredDefinitions.length" class="workflow-empty">没有匹配的工作流</p>
         <article
-          v-for="item in definitions"
+          v-for="item in filteredDefinitions"
           :key="item.id"
           :class="{ selected: selectedId === item.id }"
-          @click="
-            selectedId = item.id;
-            historyId = item.id;
-          "
         >
-          <div>
-            <span class="workflow-state" :class="{ enabled: item.enabled }">{{
-              item.enabled ? "已启用" : "已暂停"
-            }}</span
-            ><small>v{{ item.version }}</small>
-          </div>
-          <h3>{{ item.name }}</h3>
-          <p>
-            {{ item.nodes.length }} 个节点
-          </p>
+          <button type="button" class="workflow-item-select" :aria-label="`查看 ${item.name} 的运行历史`" :aria-pressed="selectedId === item.id" @click="selectedId = item.id; historyId = item.id">
+            <span class="workflow-item-top">
+              <span class="workflow-state" :class="{ enabled: item.enabled }">{{ item.enabled ? "已启用" : "已暂停" }}</span>
+              <small>v{{ item.version }}</small>
+            </span>
+            <strong class="workflow-item-name" :title="item.name">{{ item.name }}</strong>
+            <span class="workflow-item-meta"><span>{{ item.projectId ? projectName(item.projectId) : "未设置项目" }}</span><span>{{ item.nodes.length }} 个节点</span></span>
+          </button>
           <div class="workflow-actions">
-            <button @click.stop="action(item, 'run')"><VideoPlay />运行</button
+            <button class="workflow-run-action" @click.stop="action(item, 'run')"><VideoPlay />运行</button
             ><button
               @click.stop="action(item, item.enabled ? 'pause' : 'enable')"
             >
@@ -1781,7 +1795,7 @@ onBeforeUnmount(() => {
                 item.enabled ? "暂停" : "启用"
               }}</button
             ><button @click.stop="edit(item)"><Edit />编辑</button
-            ><button class="danger" @click.stop="remove(item)">
+            ><button class="danger" :aria-label="`删除 ${item.name}`" :title="`删除 ${item.name}`" @click.stop="remove(item)">
               <Delete />
             </button>
           </div>
@@ -1795,6 +1809,7 @@ onBeforeUnmount(() => {
               <h2>
                 {{ selected ? selected.name + " · 运行历史" : "全部运行历史" }}
               </h2>
+              <p>{{ visibleRuns.length }} 条记录 · 查看节点执行过程和结果</p>
             </div>
             <button
               v-if="historyId"
@@ -1807,18 +1822,22 @@ onBeforeUnmount(() => {
               查看全部
             </button>
           </header>
-          <p v-if="!visibleRuns.length" class="workflow-empty">暂无运行记录</p>
+          <div v-if="visibleRuns.length" class="workflow-history-filters" aria-label="筛选运行记录">
+            <button :class="{ active: historyStatus === 'all' }" :aria-pressed="historyStatus === 'all'" @click="historyStatus = 'all'">全部</button>
+            <button :class="{ active: historyStatus === 'active' }" :aria-pressed="historyStatus === 'active'" @click="historyStatus = 'active'">进行中</button>
+            <button :class="{ active: historyStatus === 'failed' }" :aria-pressed="historyStatus === 'failed'" @click="historyStatus = 'failed'">失败或取消</button>
+          </div>
+          <div v-if="!visibleRuns.length" class="workflow-empty workflow-empty-history"><Guide /><strong>让流程跑起来</strong><p>运行后可在这里查看每个节点的状态、输出与错误。</p><button v-if="starterWorkflow" class="workflow-empty-run" @click="action(starterWorkflow, 'run')"><VideoPlay />运行{{ starterWorkflow.name }}</button></div>
+          <div v-else-if="!filteredRuns.length" class="workflow-empty workflow-empty-history workflow-filter-empty"><Guide /><strong>此筛选下没有记录</strong><p>切换到全部，查看这 {{ visibleRuns.length }} 条运行记录。</p><button class="workflow-empty-run" @click="historyStatus = 'all'">查看全部记录</button></div>
           <article
-            v-for="run in visibleRuns"
+            v-for="run in filteredRuns"
             :key="run.id"
             class="workflow-run"
           >
             <header>
               <div>
                 <strong>{{ run.workflowName }}</strong
-                ><small
-                  >v{{ run.workflowVersion }} · {{ date(run.startedAt) }}</small
-                >
+                ><small>v{{ run.workflowVersion }} · {{ date(run.startedAt) }} · {{ run.nodeRuns.length }} 个节点</small>
               </div>
               <span class="workflow-run-status" :class="run.status">{{
                 status(run.status)
@@ -1902,6 +1921,8 @@ onBeforeUnmount(() => {
     ><form
       v-if="editing"
       class="workflow-editor-window"
+      :data-style="appearanceStyle"
+      :data-theme="theme"
       :class="{
         'is-native-window': windowMode,
         'is-connecting': !!connection,

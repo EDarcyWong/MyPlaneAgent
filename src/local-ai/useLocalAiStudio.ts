@@ -15,7 +15,7 @@ type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:Wor
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
  const tab=ref<'agent'|'chat'|'workflow'|'automation'|'discover'|'models'|'server'|'tools'|'settings'>('agent'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
- const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system'})
+ const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system',appearanceStyle:'minimal'})
  const apiKey=ref(''),hfToken=ref(''),connection=ref<StudioConnection>(),connecting=ref(false),remoteProfiles=ref<LocalAiRemoteProfile[]>([]),sessions=ref<StudioSessionSummary[]>([]),session=ref<StudioSession>(),sessionFilter=ref('')
  const images=ref<StudioImage[]>([]),attaching=ref(false)
  let composerRevision=0

@@ -266,6 +266,19 @@
 .compact-layout .endpoint-row{gap:8px;flex-wrap:wrap;padding:10px 12px}
 .compact-layout .endpoint-row>span{width:100%}
 .compact-layout .endpoint-row code{font-size:12px}
+
+/* Remote connection selection stays visible before the editable API settings. */
+.remote-profile-choice{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px 10px;margin-bottom:20px;padding:14px 16px;border:1px solid var(--s-border);border-radius:9px;background:var(--s-muted)}
+.remote-profile-choice label{display:flex;flex:1 1 290px;min-width:0;flex-direction:column;gap:7px;color:var(--s-text);font-size:12px;font-weight:600}
+.remote-profile-choice select{width:100%;min-height:36px;border:1px solid var(--s-border);border-radius:7px;background:var(--s-panel);color:var(--s-text);font-size:12px}
+.remote-profile-choice select:focus-visible{outline:2px solid var(--s-accent);outline-offset:2px}
+.remote-profile-choice>.icon-btn{flex:none;min-height:36px;min-width:36px;background:var(--s-panel)}
+.remote-profile-choice p{flex-basis:100%;margin:0;color:var(--s-dim);font-size:11px;line-height:1.5}
+.remote-format-heading{display:flex;align-items:baseline;gap:10px;margin-bottom:9px}
+.remote-format-heading strong{color:var(--s-text);font-size:12px}
+.remote-format-heading span{color:var(--s-dim);font-size:10px}
+.remote-api-formats{grid-template-columns:repeat(2,minmax(0,1fr))}
+.compact-layout .remote-api-formats{grid-template-columns:1fr}
 .compact-layout .content-card{padding:18px}
 .compact-layout .discovery-controls{padding:20px 16px 14px}
 .compact-layout .discovery-results{padding:16px 16px 24px}

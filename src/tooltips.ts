@@ -9,7 +9,22 @@ export function installTooltips(doc:Document=document,themeRoot:Document=doc):()
  const clearTimers=()=>{clearTimeout(showTimer);clearTimeout(hideTimer)}
  function close(){clearTimers();observeTitle.disconnect();if(owner){if(owner.getAttribute('title')==='')owner.setAttribute('title',title);const ids=(owner.getAttribute('aria-describedby')||'').split(/\s+/).filter(id=>id&&id!==tip.id);if(ids.length)owner.setAttribute('aria-describedby',ids.join(' '));else owner.removeAttribute('aria-describedby')}owner=null;tip.hidden=true}
  function position(){if(!owner?.isConnected){close();return}const r=owner.getBoundingClientRect(),box=tip.getBoundingClientRect(),right=!!owner.closest('.primary-sidebar');let x=right?r.right+10:r.left+(r.width-box.width)/2,y=right?r.top+(r.height-box.height)/2:r.bottom+8;if(!right&&y+box.height>win!.innerHeight-10)y=r.top-box.height-8;if(right&&x+box.width>win!.innerWidth-10)x=r.left-box.width-10;tip.style.left=Math.max(10,Math.min(x,win!.innerWidth-box.width-10))+'px';tip.style.top=Math.max(10,Math.min(y,win!.innerHeight-box.height-10))+'px'}
- function reveal(){if(!owner?.isConnected)return close();tip.textContent=title;tip.dataset.dark=String(themeRoot.documentElement.classList.contains('dark'));tip.hidden=false;const ids=(owner.getAttribute('aria-describedby')||'').split(/\s+/).filter(Boolean);if(!ids.includes(tip.id))ids.push(tip.id);owner.setAttribute('aria-describedby',ids.join(' '));position()}
+ function reveal(){
+  if(!owner?.isConnected)return close()
+  tip.textContent=title
+  const surface=(owner.closest('.local-ai-studio,.workflow-editor-window')||themeRoot.querySelector('.local-ai-studio,.workflow-editor-window')) as HTMLElement|null
+  const colors=surface?.ownerDocument.defaultView?.getComputedStyle(surface)
+  const token=(primary:string,fallback:string)=>colors?.getPropertyValue(primary).trim()||colors?.getPropertyValue(fallback).trim()||''
+  tip.dataset.dark=String(colors?.colorScheme==='dark'||themeRoot.documentElement.classList.contains('dark'))
+  tip.style.backgroundColor=token('--s-panel','--wf-panel')
+  tip.style.color=token('--s-text','--wf-text')
+  tip.style.borderColor=token('--s-border','--wf-line')
+  tip.hidden=false
+  const ids=(owner.getAttribute('aria-describedby')||'').split(/\s+/).filter(Boolean)
+  if(!ids.includes(tip.id))ids.push(tip.id)
+  owner.setAttribute('aria-describedby',ids.join(' '))
+  position()
+ }
  const observeTitle=new MutationObserver(()=>{const next=owner?.getAttribute('title');if(next){title=next;owner!.setAttribute('title','');if(!tip.hidden)reveal()}})
  function enter(event:Event){const target=event.target as Element|null;if(!target?.closest)return;if(tip.contains(target)){clearTimeout(hideTimer);return}const element=target.closest('[title]');if(element===owner){clearTimeout(hideTimer);return}if(!element?.getAttribute('title')||element.tagName==='IFRAME')return;close();owner=element;title=element.getAttribute('title')!;element.setAttribute('title','');observeTitle.observe(element,{attributes:true,attributeFilter:['title']});showTimer=setTimeout(reveal,event.type==='focusin'?150:380)}
  function leave(event:Event){const related=(event as MouseEvent).relatedTarget as Node|null;if(related&&(owner?.contains(related)||tip.contains(related)))return;clearTimeout(showTimer);hideTimer=setTimeout(close,120)}

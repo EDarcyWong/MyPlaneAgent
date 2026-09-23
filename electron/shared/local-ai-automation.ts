@@ -8,7 +8,7 @@ export type AutomationTrigger=
  | {type:'cron';expression:string}
 
 export type AutomationTask={
- id:string;name:string;enabled:boolean;projectId:string;instruction:string;trigger:AutomationTrigger;timezone:string
+ id:string;name:string;enabled:boolean;instruction:string;trigger:AutomationTrigger;timezone:string
  agent:{model:string;mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode}
  execution:{timeoutMinutes:number;retryMax:number;retryDelayMinutes:number;concurrency:'forbid'}
  output:{notifyOn:'always'|'failure'|'never'}

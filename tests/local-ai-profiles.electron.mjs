@@ -12,6 +12,10 @@ async function run(){
  await app.whenReady()
  const service=new LocalAiStudioService(root)
  try{
+  assert.equal(service.studioSettings().appearanceStyle,'minimal')
+  service.saveStudioSettings({appearanceStyle:'ocean'})
+  assert.equal(service.studioSettings().appearanceStyle,'ocean')
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root,'local-ai-studio-settings.json'),'utf8')).appearanceStyle,'ocean')
   service.saveStudioSettings({endpoint:'https://first.example/v1',model:'first-model',apiKey:'secret-one'})
   const migrated=service.remoteProfiles();assert.equal(migrated.length,1);assert.equal(migrated[0].hasApiKey,true)
   const created=service.remoteProfileSave({name:'第二个服务',apiFormat:'anthropic',endpoint:'https://second.example/v1',model:'second-model',contextLength:65536,apiKey:'secret-two'})
@@ -25,7 +29,7 @@ async function run(){
   service.saveStudioSettings({runtimePort:await freePort()});await service.startApiServer();assert.equal(service.studioSettings().source,'managed')
   service.saveStudioSettings({source:'external'});assert.equal(service.studioSettings().source,'external');assert.equal(service.snapshot().runtime.endpoint.startsWith('http://127.0.0.1:'),true)
   service.saveStudioSettings({source:'managed'});assert.equal(service.studioSettings().source,'managed')
-  console.log(JSON.stringify({ok:true,checks:['migrates current remote settings','stores protocol and context budget','updates a named profile without adding history','stores encrypted key references only','switches profiles','deletes history','switches inference source while local API keeps running']}))
+  console.log(JSON.stringify({ok:true,checks:['persists visual style','migrates current remote settings','stores protocol and context budget','updates a named profile without adding history','stores encrypted key references only','switches profiles','deletes history','switches inference source while local API keeps running']}))
  }finally{await service.dispose();app.exit(0)}
 }
 void run().catch(error=>{console.error(error);app.exit(1)})

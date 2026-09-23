@@ -12,7 +12,10 @@ if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
 if(params.get('surface')==='help'){
  document.title='工作流使用指南 · MyPlaneAgent'
- void import('./help/HelpWindow.vue').then(({default:HelpWindow})=>createApp(HelpWindow,{documentId:params.get('document')||'workflow'}).mount('#app'))
+ void import('./help/HelpWindow.vue').then(async({default:HelpWindow})=>{
+  const bootstrap=await window.myplane.localAiStudio('bootstrap').catch(()=>null)
+  createApp(HelpWindow,{documentId:params.get('document')||'workflow',appearanceStyle:bootstrap?.settings.appearanceStyle||'minimal',theme:bootstrap?.settings.theme||'system'}).mount('#app')
+ })
 }else if(params.get('surface')==='workflow-editor'){
  void Promise.all([window.myplane.localAiStudio('bootstrap'),window.myplane.localAiStudio('connect',{reason:'startup'})]).then(([bootstrap,connection])=>{
   document.title=params.get('workflowId')?'编辑工作流 · MyPlaneAgent':'新建工作流 · MyPlaneAgent'
@@ -22,6 +25,6 @@ if(params.get('surface')==='help'){
     models=bootstrap.settings.source==='managed'?[...localModels,...remoteModels]:[...remoteModels,...localModels],
     fallback=bootstrap.settings.source==='managed'?bootstrap.runtime.modelName||bootstrap.settings.model:bootstrap.settings.model;
   if(fallback&&!models.some(item=>item.id===fallback||item.instanceId===fallback))models.unshift({id:fallback,name:fallback,instanceId:undefined,modelRef:bootstrap.settings.source==='external'?{source:'remote' as const,id:fallback,name:fallback,apiFormat:bootstrap.settings.apiFormat,endpoint:bootstrap.settings.endpoint,contextLength:bootstrap.settings.contextLength}:{source:'current' as const,id:fallback,name:fallback}})
-  createApp(WorkflowDesigner,{windowMode:true,workflowId:params.get('workflowId')||'',model:bootstrap.settings.source==='managed'?bootstrap.runtime.modelName:bootstrap.settings.model,models}).mount('#app')
+  createApp(WorkflowDesigner,{windowMode:true,workflowId:params.get('workflowId')||'',model:bootstrap.settings.source==='managed'?bootstrap.runtime.modelName:bootstrap.settings.model,models,appearanceStyle:bootstrap.settings.appearanceStyle,theme:bootstrap.settings.theme}).mount('#app')
  })
 }else createApp(LocalAiStudio,{standalone:true}).mount('#app')

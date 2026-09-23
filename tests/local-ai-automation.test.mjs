@@ -20,20 +20,22 @@ test('automation schedules support interval, wall-clock and cron triggers',()=>{
  assert.throws(()=>nextAutomationRun({type:'cron',expression:'bad'},'UTC',after),/5 个字段/)
 })
 
-test('automation persists tasks and creates an independent successful agent run',async t=>{
- const root=sandbox(t),workspace=path.join(root,'project');fs.mkdirSync(workspace)
+test('automation runs without a project and persists its independent workspace',async t=>{
+ const root=sandbox(t)
  const server=createServer(async(req,res)=>{for await(const _ of req){}res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{role:'assistant',content:'定时检查完成'}}]}))})
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.closeAllConnections();server.close()})
  const agent=new LocalAgentService(path.join(root,'agent'),()=>({endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:1024,contextLength:8192}));t.after(()=>agent.dispose())
- const project=agent.createProject(workspace,'测试项目'),automation=new AutomationService(path.join(root,'automation'),agent);t.after(()=>automation.dispose())
- const task=automation.save({name:'每日检查',enabled:true,projectId:project.id,instruction:'检查项目并报告',trigger:{type:'daily',time:'09:00'},timezone:'Asia/Shanghai',agent:{model:'fixture',mode:'coding',maxSteps:10,fastMode:true,approvalMode:'ask'},execution:{timeoutMinutes:2,retryMax:0,retryDelayMinutes:1,concurrency:'forbid'},output:{notifyOn:'never'}})
+ const automation=new AutomationService(path.join(root,'automation'),agent);t.after(()=>automation.dispose())
+ const task=automation.save({name:'每日检查',enabled:true,instruction:'检查当前任务并报告',trigger:{type:'daily',time:'09:00'},timezone:'Asia/Shanghai',agent:{model:'fixture',mode:'general',maxSteps:10,fastMode:true,approvalMode:'ask'},execution:{timeoutMinutes:2,retryMax:0,retryDelayMinutes:1,concurrency:'forbid'},output:{notifyOn:'never'}})
  assert.ok(task.state.nextRunAt);automation.action(task.id,'run')
  await until(()=>automation.runs(task.id)[0]?.status==='succeeded')
  const run=automation.runs(task.id)[0];assert.equal(run.summary,'定时检查完成');assert.ok(run.agentTaskId);assert.equal(run.agentTaskIds.length,1)
- const reopened=new AutomationService(path.join(root,'automation'),agent);t.after(()=>reopened.dispose());assert.equal(reopened.tasks()[0].id,task.id);assert.equal(reopened.runs(task.id)[0].status,'succeeded')
+ const agentTask=agent.get(run.agentTaskId);assert.equal(agentTask.projectId,undefined);assert.equal(agentTask.projectless,true);assert.equal(agentTask.workspace,fs.realpathSync(path.join(root,'automation','workspaces',task.id)));assert.equal(agent.projects().length,0)
+ fs.writeFileSync(path.join(root,'automation','tasks.json'),JSON.stringify([{...task,projectId:'legacy-project'}]))
+ const reopened=new AutomationService(path.join(root,'automation'),agent);t.after(()=>reopened.dispose());assert.equal(reopened.tasks()[0].id,task.id);assert.equal('projectId' in reopened.tasks()[0],false);assert.equal(reopened.runs(task.id)[0].status,'succeeded')
 })
 
 test('expired one-time automations are rejected',t=>{
- const root=sandbox(t),workspace=path.join(root,'project');fs.mkdirSync(workspace);const agent=new LocalAgentService(path.join(root,'agent'),()=>{throw new Error('unused')}),project=agent.createProject(workspace,'项目'),automation=new AutomationService(path.join(root,'automation'),agent);t.after(()=>{automation.dispose();agent.dispose()})
- assert.throws(()=>automation.save({name:'过期任务',enabled:true,projectId:project.id,instruction:'检查',trigger:{type:'once',at:'2020-01-01T00:00:00Z'},timezone:'UTC',agent:{model:'fixture',mode:'general',maxSteps:5,fastMode:true,approvalMode:'ask'},execution:{timeoutMinutes:1,retryMax:0,retryDelayMinutes:1,concurrency:'forbid'},output:{notifyOn:'never'}}),/晚于当前时间/)
+ const root=sandbox(t),agent=new LocalAgentService(path.join(root,'agent'),()=>{throw new Error('unused')}),automation=new AutomationService(path.join(root,'automation'),agent);t.after(()=>{automation.dispose();agent.dispose()})
+ assert.throws(()=>automation.save({name:'过期任务',enabled:true,instruction:'检查',trigger:{type:'once',at:'2020-01-01T00:00:00Z'},timezone:'UTC',agent:{model:'fixture',mode:'general',maxSteps:5,fastMode:true,approvalMode:'ask'},execution:{timeoutMinutes:1,retryMax:0,retryDelayMinutes:1,concurrency:'forbid'},output:{notifyOn:'never'}}),/晚于当前时间/)
 })

@@ -21,6 +21,7 @@ export type StudioSettings = LocalAiSettings & {
   repeatPenalty: number
   systemPrompt: string
   theme: 'system'|'light'|'dark'
+  appearanceStyle: 'minimal'|'ocean'|'paper'|'terminal'
 }
 export type StudioSettingsInput = LocalAiSettingsInput & Partial<Omit<StudioSettings,'hasApiKey'|'hasHfToken'>>
 export type StudioModelFile = LocalAiModelFile & {format:string;quantization:string;revision?:string;sha256?:string}

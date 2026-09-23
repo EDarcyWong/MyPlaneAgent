@@ -192,7 +192,7 @@ export class LocalAgentService {
    if(['running','verifying','unknown'].includes(event.execution.state)){event.execution.state='failed';event.execution.verification={status:'failed',summary:'联网只读操作已中断，未产生文件或项目状态副作用'};event.status='failed'}
    this.journal().save(event.execution);migrated=true
   }
-  if(!task.projectId&&typeof task.workspace==='string'&&path.isAbsolute(task.workspace)){
+  if(!task.projectId&&!task.projectless&&typeof task.workspace==='string'&&path.isAbsolute(task.workspace)){
    // Historical tasks already store their authorized, canonical directory. Do not
    // resolve it again: a missing or redirected folder must not change that grant.
    task.projectId=this.ensureWorkspaceProject(task.workspace).id
@@ -266,14 +266,14 @@ export class LocalAgentService {
   }
   const pending=run.pending;run.pending=undefined;pending.resolve(approved)
  }
- start(input:{approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;taskId?:string;workspace?:string;hidden?:boolean;mode:AgentMode;model:string;prompt:string;maxSteps:number;connectionOverride?:AgentConnection},owner:number,emit:(task:AgentTask)=>void){
+ start(input:{approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;projectless?:boolean;taskId?:string;workspace?:string;hidden?:boolean;mode:AgentMode;model:string;prompt:string;maxSteps:number;connectionOverride?:AgentConnection},owner:number,emit:(task:AgentTask)=>void){
   if([...this.runs.values(),...this.compactions.values()].some(run=>run.owner===owner)||input.taskId&&this.compactions.has(input.taskId))throw new Error('请先完成或停止当前 Agent 任务')
   const prompt=(input.images?.length?String(input.prompt||'').slice(0,16000):bounded(input.prompt,'任务要求',16000)).trim(),model=bounded(input.model,'模型',500),maxSteps=integer(input.maxSteps,20,0,120)
    if(!modes.has(input.mode))throw new Error('任务模式无效')
    const approvalMode=input.approvalMode||'ask';if(!approvalModes.has(approvalMode))throw new Error('任务权限模式无效')
   const connection=input.connectionOverride||this.connection();let task:StoredTask
   if(input.taskId){if(this.runs.has(input.taskId))throw new Error('任务仍在执行');task=this.load(input.taskId);if(input.projectId&&input.projectId!==task.projectId)throw new Error('不能更改已有任务所属项目，请新建任务');this.closePendingCalls(task);this.applySteering(task)}
-  else{const project=input.projectId?this.project(input.projectId):undefined,root=project?.workspace||bounded(input.workspace,'工作目录',2000),workspace=new AgentWorkspace(root);if(project&&workspace.root!==project.workspace)throw new Error('项目目录位置已改变，请重新选择目录创建项目');const assignedProject=project||this.ensureWorkspaceProject(workspace.root),time=now();task={usage:emptyTokenUsageTotals(),id:randomUUID(),projectId:assignedProject.id,...(input.hidden?{hidden:true}:{}),title:prompt.slice(0,48)||'图片对话',workspace:workspace.root,mode:input.mode,model,status:'running',steps:0,maxSteps,plan:[],events:[],artifacts:[],messages:[],error:'',createdAt:time,updatedAt:time}}
+  else{if(input.projectless&&input.projectId)throw new Error('独立任务不能指定项目');const project=input.projectId?this.project(input.projectId):undefined,root=project?.workspace||bounded(input.workspace,'工作目录',2000),workspace=new AgentWorkspace(root);if(project&&workspace.root!==project.workspace)throw new Error('项目目录位置已改变，请重新选择目录创建项目');const assignedProject=input.projectless?undefined:project||this.ensureWorkspaceProject(workspace.root),time=now();task={usage:emptyTokenUsageTotals(),id:randomUUID(),...(assignedProject?{projectId:assignedProject.id}:{}),...(input.projectless?{projectless:true}:{}),...(input.hidden?{hidden:true}:{}),title:prompt.slice(0,48)||'图片对话',workspace:workspace.root,mode:input.mode,model,status:'running',steps:0,maxSteps,plan:[],events:[],artifacts:[],messages:[],error:'',createdAt:time,updatedAt:time}}
   if(!input.taskId&&input.seed){
    const seed=input.seed
    task.sourceSessionId=seed.id;task.title=seed.title==='新对话'?task.title:seed.title
