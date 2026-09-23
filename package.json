@@ -18,6 +18,9 @@
     "build:electron": "node -e \"require('node:fs').rmSync('dist-electron',{recursive:true,force:true})\" && tsc -p electron/tsconfig.json",
     "build:app": "npm run build:renderer && npm run build:electron",
     "build": "npm run build:app && electron-builder",
+    "build:win": "npm run build:app && electron-builder --win",
+    "build:mac": "npm run build:app && electron-builder --mac",
+    "build:linux": "npm run build:app && electron-builder --linux",
     "test": "npm run build:electron && node --test tests/*.test.mjs",
     "test:history": "npm run build:electron && electron tests/local-ai-history-recovery.electron.mjs",
     "test:smoke": "npm run build:app && electron tests/standalone.electron.mjs"

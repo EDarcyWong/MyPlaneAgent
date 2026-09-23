@@ -13,6 +13,16 @@ npm run dev
 
 开发服务器只监听 `127.0.0.1:5174`。`npm run start` 构建后启动本地生产界面；`npm run build` 生成当前平台的安装包，输出到 `release/`。应用 ID 为 `com.myplane.agent`，可与 MyPlane 同时安装、运行。托管 API 默认端口为 `8089`，可在设置中修改。
 
+各平台打包命令如下，均会先构建前端和 Electron 主进程，产物输出到 `release/`：
+
+| 命令 | 产物 |
+| --- | --- |
+| `npm run build:win` | Windows `.exe` 安装包（NSIS） |
+| `npm run build:mac` | macOS `.dmg` 安装镜像 |
+| `npm run build:linux` | Linux `.AppImage` 可执行文件和 `.deb` 安装包 |
+
+建议在对应操作系统上执行打包；macOS 的 DMG 必须在 macOS 上构建。Linux 的 AppImage 下载后可通过 `chmod +x 文件名.AppImage` 添加执行权限，再直接运行。
+
 ```sh
 npm run check
 npm test
