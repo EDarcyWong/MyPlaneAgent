@@ -3,10 +3,11 @@ import {DEEPSEEK_CONTEXT_TOKENS,isDeepSeek,deepseekModels} from '../electron/sha
 import {computed,onBeforeUnmount,onMounted,reactive,ref,watch} from 'vue'
 import AgentExtensions from './local-ai/AgentExtensions.vue'
 import LocalAiAgent from './local-ai/LocalAiAgent.vue'
-import {ChatDotRound,Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
+import {ChatDotRound,Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowRight,Check,AlarmClock,Share,Grid} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentToolManager from './local-ai/AgentToolManager.vue'
 import AgentSkillManager from './local-ai/AgentSkillManager.vue'
+import AgentCapabilityRegistry from './local-ai/AgentCapabilityRegistry.vue'
 import AutomationTasks from './local-ai/AutomationTasks.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import ModelReadme from './local-ai/ModelReadme.vue'
@@ -32,7 +33,7 @@ const logOutputOpen=ref(false)
 let disposeLogToggle:(()=>void)|undefined,disposeLogRequest:(()=>void)|undefined
 onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true})})
 onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.()})
-const navigation=[{id:'agent',label:'工作台',icon:ChatDotRound},{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'skills',label:'Skills',icon:Operation},{id:'tools',label:'工具(旧)',icon:Document},{id:'settings',label:'设置',icon:Setting}] as const
+const navigation=[{id:'agent',label:'工作台',icon:ChatDotRound},{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'capabilities',label:'能力注册表',icon:Grid},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'skills',label:'Skills',icon:Operation},{id:'tools',label:'工具(旧)',icon:Document},{id:'settings',label:'设置',icon:Setting}] as const
 const appearanceStyles=[{id:'minimal',name:'极简',description:'克制的灰阶界面'},{id:'ocean',name:'海蓝',description:'清爽的蓝色工作区'},{id:'paper',name:'暖纸',description:'柔和的暖色层次'},{id:'terminal',name:'程式',description:'编辑器配色与高对比强调'}] as const
 const pageTitle=computed(()=>navigation.find(item=>item.id===tab.value)?.label||'本地 AI')
 const memoryPercent=computed(()=>hardware.value?Math.round((1-hardware.value.freeMemory/hardware.value.totalMemory)*100):0)
@@ -84,6 +85,7 @@ async function saveProfile(activate=false){
 
     <AutomationTasks v-else-if="tab==='automation'" ref="automationTasks" :model="model" :models="serverModels"/>
    <WorkflowDesigner v-else-if="tab==='workflow'" ref="workflowDesigner" :model="model" :models="workflowModels" :appearance-style="settings.appearanceStyle" :theme="settings.theme"/>
+   <AgentCapabilityRegistry v-else-if="tab==='capabilities'"/>
 
    <main v-else-if="tab==='discover'" class="discover-workspace catalog-workspace" :class="{'has-details':!!selected,'details-open':detailsOpen}">
     <button v-if="narrow&&detailsOpen&&selected" class="panel-backdrop" aria-label="关闭模型详情" @click="detailsOpen=false"></button>
