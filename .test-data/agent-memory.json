@@ -1,0 +1,228 @@
+[
+  {
+    "id": "memory-1790234956478-wtyw1lmga",
+    "taskId": "e2e-test-1",
+    "plan": {
+      "taskId": "e2e-test-1",
+      "steps": [
+        {
+          "capability": "file.list",
+          "args": {
+            "path": "skills"
+          },
+          "dependsOn": [],
+          "optional": false
+        },
+        {
+          "capability": "mcp.example.echo",
+          "args": {
+            "message": "找到的 Skill 数量统计完成"
+          },
+          "dependsOn": [
+            "step-1"
+          ],
+          "optional": false
+        }
+      ],
+      "reasoning": "需要列出 skills 目录的文件并统计 Skill 数量",
+      "createdAt": 1790234956443
+    },
+    "result": {
+      "success": true,
+      "outputs": [
+        {
+          "paths": [
+            "skills/file-operations/",
+            "skills/file-operations/requirements.txt",
+            "skills/file-operations/index.py",
+            "skills/file-operations/README.md",
+            "skills/file-operations/skill.json",
+            "skills/git-operations/",
+            "skills/git-operations/requirements.txt",
+            "skills/git-operations/index.py",
+            "skills/git-operations/README.md",
+            "skills/git-operations/skill.json"
+          ],
+          "truncated": false
+        },
+        "Echo: 找到的 Skill 数量统计完成"
+      ],
+      "elapsedMs": 35,
+      "stepResults": [
+        {
+          "step": 0,
+          "success": true,
+          "output": {
+            "paths": [
+              "skills/file-operations/",
+              "skills/file-operations/requirements.txt",
+              "skills/file-operations/index.py",
+              "skills/file-operations/README.md",
+              "skills/file-operations/skill.json",
+              "skills/git-operations/",
+              "skills/git-operations/requirements.txt",
+              "skills/git-operations/index.py",
+              "skills/git-operations/README.md",
+              "skills/git-operations/skill.json"
+            ],
+            "truncated": false
+          },
+          "elapsedMs": 34
+        },
+        {
+          "step": 1,
+          "success": true,
+          "output": "Echo: 找到的 Skill 数量统计完成",
+          "elapsedMs": 0
+        }
+      ]
+    },
+    "timestamp": 1790234956478,
+    "tags": []
+  },
+  {
+    "id": "memory-1790236403046-d41e9e38o",
+    "taskId": "e2e-test-1",
+    "plan": {
+      "taskId": "e2e-test-1",
+      "steps": [
+        {
+          "capability": "file.list",
+          "args": {
+            "path": "skills"
+          },
+          "dependsOn": [],
+          "optional": false
+        },
+        {
+          "capability": "mcp.example.echo",
+          "args": {
+            "message": "找到的 Skill 数量统计完成"
+          },
+          "dependsOn": [
+            "step-1"
+          ],
+          "optional": false
+        }
+      ],
+      "reasoning": "需要列出 skills 目录的文件并统计 Skill 数量",
+      "createdAt": 1790236403009
+    },
+    "result": {
+      "success": true,
+      "outputs": [
+        {
+          "paths": [
+            "skills/file-operations/",
+            "skills/file-operations/requirements.txt",
+            "skills/file-operations/index.py",
+            "skills/file-operations/README.md",
+            "skills/file-operations/skill.json",
+            "skills/git-operations/",
+            "skills/git-operations/requirements.txt",
+            "skills/git-operations/index.py",
+            "skills/git-operations/README.md",
+            "skills/git-operations/skill.json"
+          ],
+          "truncated": false
+        },
+        "Echo: 找到的 Skill 数量统计完成"
+      ],
+      "elapsedMs": 36,
+      "stepResults": [
+        {
+          "step": 0,
+          "success": true,
+          "output": {
+            "paths": [
+              "skills/file-operations/",
+              "skills/file-operations/requirements.txt",
+              "skills/file-operations/index.py",
+              "skills/file-operations/README.md",
+              "skills/file-operations/skill.json",
+              "skills/git-operations/",
+              "skills/git-operations/requirements.txt",
+              "skills/git-operations/index.py",
+              "skills/git-operations/README.md",
+              "skills/git-operations/skill.json"
+            ],
+            "truncated": false
+          },
+          "elapsedMs": 36
+        },
+        {
+          "step": 1,
+          "success": true,
+          "output": "Echo: 找到的 Skill 数量统计完成",
+          "elapsedMs": 0
+        }
+      ]
+    },
+    "timestamp": 1790236403045,
+    "tags": []
+  },
+  {
+    "id": "memory-1790237027390-3bisx38de",
+    "taskId": "e2e-test-1",
+    "plan": {
+      "taskId": "e2e-test-1",
+      "steps": [
+        {
+          "capability": "file.list",
+          "args": {
+            "path": "skills"
+          },
+          "dependsOn": [],
+          "optional": false
+        }
+      ],
+      "reasoning": "分析 Skills 目录结构",
+      "createdAt": 1790237027318
+    },
+    "result": {
+      "success": true,
+      "outputs": [
+        {
+          "paths": [
+            "skills/file-operations/",
+            "skills/file-operations/requirements.txt",
+            "skills/file-operations/index.py",
+            "skills/file-operations/README.md",
+            "skills/file-operations/skill.json",
+            "skills/git-operations/",
+            "skills/git-operations/requirements.txt",
+            "skills/git-operations/index.py",
+            "skills/git-operations/README.md",
+            "skills/git-operations/skill.json"
+          ],
+          "truncated": false
+        }
+      ],
+      "elapsedMs": 71,
+      "stepResults": [
+        {
+          "step": 0,
+          "success": true,
+          "output": {
+            "paths": [
+              "skills/file-operations/",
+              "skills/file-operations/requirements.txt",
+              "skills/file-operations/index.py",
+              "skills/file-operations/README.md",
+              "skills/file-operations/skill.json",
+              "skills/git-operations/",
+              "skills/git-operations/requirements.txt",
+              "skills/git-operations/index.py",
+              "skills/git-operations/README.md",
+              "skills/git-operations/skill.json"
+            ],
+            "truncated": false
+          },
+          "elapsedMs": 71
+        }
+      ]
+    },
+    "timestamp": 1790237027389,
+    "tags": []
+  }
+]

@@ -6,6 +6,7 @@ import LocalAiAgent from './local-ai/LocalAiAgent.vue'
 import {ChatDotRound,Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentToolManager from './local-ai/AgentToolManager.vue'
+import AgentSkillManager from './local-ai/AgentSkillManager.vue'
 import AutomationTasks from './local-ai/AutomationTasks.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import ModelReadme from './local-ai/ModelReadme.vue'
@@ -26,11 +27,12 @@ const agentState=ref('')
 const workflowDesigner=ref<InstanceType<typeof WorkflowDesigner>|null>(null)
 const automationTasks=ref<InstanceType<typeof AutomationTasks>|null>(null)
 const agentToolManager=ref<InstanceType<typeof AgentToolManager>|null>(null)
+const agentSkillManager=ref<InstanceType<typeof AgentSkillManager>|null>(null)
 const logOutputOpen=ref(false)
 let disposeLogToggle:(()=>void)|undefined,disposeLogRequest:(()=>void)|undefined
 onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true})})
 onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.()})
-const navigation=[{id:'agent',label:'工作台',icon:ChatDotRound},{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'tools',label:'工具',icon:Operation},{id:'settings',label:'设置',icon:Setting}] as const
+const navigation=[{id:'agent',label:'工作台',icon:ChatDotRound},{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'skills',label:'Skills',icon:Operation},{id:'tools',label:'工具(旧)',icon:Document},{id:'settings',label:'设置',icon:Setting}] as const
 const appearanceStyles=[{id:'minimal',name:'极简',description:'克制的灰阶界面'},{id:'ocean',name:'海蓝',description:'清爽的蓝色工作区'},{id:'paper',name:'暖纸',description:'柔和的暖色层次'},{id:'terminal',name:'程式',description:'编辑器配色与高对比强调'}] as const
 const pageTitle=computed(()=>navigation.find(item=>item.id===tab.value)?.label||'本地 AI')
 const memoryPercent=computed(()=>hardware.value?Math.round((1-hardware.value.freeMemory/hardware.value.totalMemory)*100):0)
@@ -75,7 +77,7 @@ async function saveProfile(activate=false){
    <div class="rail-spacer"></div><button class="rail-button" :class="{active:drawer}" aria-label="下载队列" title="下载队列" @click="drawer=!drawer"><Download/><b v-if="activeDownloads.length" class="rail-count">{{activeDownloads.length}}</b></button>
   </nav>
   <div class="studio-main">
-   <header class="studio-topbar"><div class="brand"><strong>AI 工作台</strong><span class="topbar-divider"></span><span>{{pageTitle}}</span></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" :disabled="!workflowDesigner?.canCreate" :title="workflowDesigner?.canCreate?'新建工作流':'请先在工作台添加项目'" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-else-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-else-if="tab==='tools'" class="studio-topbar-create" type="button" title="新增 Agent 工具" aria-label="新增 Agent 工具" @click="agentToolManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本地服务 · 数据留在本机':'远程服务 · 请求发送至 API'}}</span></header>
+   <header class="studio-topbar"><div class="brand"><strong>AI 工作台</strong><span class="topbar-divider"></span><span>{{pageTitle}}</span></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" :disabled="!workflowDesigner?.canCreate" :title="workflowDesigner?.canCreate?'新建工作流':'请先在工作台添加项目'" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-else-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-else-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建 Skill" aria-label="新建 Skill" @click="agentSkillManager?.create()"><Plus/></button><button v-else-if="tab==='tools'" class="studio-topbar-create" type="button" title="新增 Agent 工具" aria-label="新增 Agent 工具" @click="agentToolManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本地服务 · 数据留在本机':'远程服务 · 请求发送至 API'}}</span></header>
    <div v-if="error" class="error-banner" role="alert"><span>{{error}}</span><button @click="error=''">关闭</button></div>
    <LocalAiAgent v-if="ready" v-show="tab==='agent'" :model="model" :models="serverModels" :online="online" :chat="chat" @state="agentState=$event"/>
    <div v-if="!ready" class="initial-loading"><div class="loading-orbit"></div><h3>{{error?'工作区暂时无法载入':'正在准备本地工作区'}}</h3><p>{{error?'请检查上方错误提示，修复后重新打开此窗口。':'读取本地模型、配置和会话记录'}}</p></div>
@@ -152,6 +154,7 @@ async function saveProfile(activate=false){
      </div></section>
     </section>
    </main>
+   <AgentSkillManager v-else-if="tab==='skills'" ref="agentSkillManager"/>
    <AgentToolManager v-else-if="tab==='tools'" ref="agentToolManager"/>
 
    <main v-else-if="tab==='settings'" class="scroll-page settings-page"><header class="page-intro with-actions"><div><span class="eyebrow">PREFERENCES</span><h1>应用设置</h1><p>管理模型存储、界面外观和新会话默认值。服务连接请前往“模型服务”。</p></div><button class="primary-button" :disabled="!!busy||sending" @click="saveSettings()"><Check/>{{busy==='save'?'保存中':'保存设置'}}</button></header><div class="settings-grid">

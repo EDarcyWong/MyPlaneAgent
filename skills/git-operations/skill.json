@@ -1,0 +1,183 @@
+{
+  "id": "git-operations",
+  "name": "Git 操作",
+  "version": "1.0.0",
+  "category": "git",
+  "description": "提供 Git 版本控制操作",
+  "author": "MyPlaneAgent",
+
+  "runtime": {
+    "type": "python",
+    "version": ">=3.9",
+    "entry": "index.py",
+    "venv": false
+  },
+
+  "capabilities": {
+    "tools": [
+      {
+        "name": "status",
+        "description": "获取 Git 仓库状态",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "short": {
+              "type": "boolean",
+              "description": "简短格式输出",
+              "default": false
+            }
+          }
+        }
+      },
+      {
+        "name": "add",
+        "description": "添加文件到暂存区",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "文件路径列表"
+            },
+            "all": {
+              "type": "boolean",
+              "description": "添加所有更改",
+              "default": false
+            }
+          }
+        }
+      },
+      {
+        "name": "commit",
+        "description": "提交更改",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "description": "提交信息"
+            },
+            "amend": {
+              "type": "boolean",
+              "description": "修改上次提交",
+              "default": false
+            }
+          },
+          "required": ["message"]
+        }
+      },
+      {
+        "name": "push",
+        "description": "推送到远程仓库",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "remote": {
+              "type": "string",
+              "description": "远程仓库名称",
+              "default": "origin"
+            },
+            "branch": {
+              "type": "string",
+              "description": "分支名称"
+            },
+            "force": {
+              "type": "boolean",
+              "description": "强制推送",
+              "default": false
+            }
+          }
+        }
+      },
+      {
+        "name": "pull",
+        "description": "从远程仓库拉取",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "remote": {
+              "type": "string",
+              "description": "远程仓库名称",
+              "default": "origin"
+            },
+            "branch": {
+              "type": "string",
+              "description": "分支名称"
+            }
+          }
+        }
+      },
+      {
+        "name": "log",
+        "description": "查看提交历史",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "description": "最大提交数",
+              "default": 10
+            },
+            "oneline": {
+              "type": "boolean",
+              "description": "单行格式",
+              "default": false
+            }
+          }
+        }
+      },
+      {
+        "name": "diff",
+        "description": "查看差异",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cached": {
+              "type": "boolean",
+              "description": "查看暂存区差异",
+              "default": false
+            },
+            "files": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "指定文件"
+            }
+          }
+        }
+      },
+      {
+        "name": "branch",
+        "description": "分支操作",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "create", "delete", "checkout"],
+              "description": "操作类型"
+            },
+            "name": {
+              "type": "string",
+              "description": "分支名称"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    ]
+  },
+
+  "permissions": {
+    "fileSystem": {
+      "read": ["**/*"],
+      "write": ["**/*"]
+    },
+    "network": false,
+    "process": true
+  },
+
+  "dependencies": {
+    "python": []
+  }
+}

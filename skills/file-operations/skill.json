@@ -1,0 +1,93 @@
+{
+  "id": "file-operations",
+  "name": "文件处理",
+  "version": "1.0.0",
+  "category": "file",
+  "description": "提供文件读写、列表、搜索等基础操作",
+  "author": "MyPlaneAgent",
+
+  "runtime": {
+    "type": "python",
+    "version": ">=3.9",
+    "entry": "index.py",
+    "venv": false
+  },
+
+  "capabilities": {
+    "tools": [
+      {
+        "name": "read",
+        "description": "读取文件内容",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件路径"
+            },
+            "startLine": {
+              "type": "integer",
+              "description": "起始行号（从1开始）",
+              "default": 1
+            },
+            "endLine": {
+              "type": "integer",
+              "description": "结束行号"
+            }
+          },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "write",
+        "description": "写入文件内容",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件路径"
+            },
+            "content": {
+              "type": "string",
+              "description": "文件内容"
+            }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      {
+        "name": "list",
+        "description": "列出目录文件",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "目录路径",
+              "default": "."
+            },
+            "depth": {
+              "type": "integer",
+              "description": "递归深度",
+              "default": 4
+            }
+          }
+        }
+      }
+    ]
+  },
+
+  "permissions": {
+    "fileSystem": {
+      "read": ["**/*"],
+      "write": ["**/*"]
+    },
+    "network": false,
+    "process": false
+  },
+
+  "dependencies": {
+    "python": []
+  }
+}
