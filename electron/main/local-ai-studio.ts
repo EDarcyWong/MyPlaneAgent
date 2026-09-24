@@ -385,8 +385,8 @@ export class LocalAiStudioService extends LocalAiService {
     );
   }
 
-  async initializeSkills() {
-    const dataDir = path.join(this.dataRoot, 'agent-data')
+  private async initializeSkills() {
+    const dataDir = path.join((this as any).directory, 'agent-data')
     const skillsDir = path.join(dataDir, 'skills')
 
     this.runtimeManager = new PythonRuntimeManager(dataDir)
@@ -2491,14 +2491,14 @@ export class LocalAiStudioService extends LocalAiService {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        return this.skillPlatform!.listSkills().map(skill => ({
+        return Array.from(this.skillPlatform!.skills.values()).map((skill: any) => ({
           name: skill.name,
           displayName: skill.displayName,
           description: skill.description,
           version: skill.version,
           runtime: skill.runtime,
           category: skill.category,
-          tools: skill.tools.map(tool => ({
+          tools: skill.tools.map((tool: any) => ({
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema
@@ -2520,7 +2520,7 @@ export class LocalAiStudioService extends LocalAiService {
           await this.initializeSkills()
         }
         const skillName = required(value.skillName, "Skill 名称")
-        const skillDir = path.join(this.dataRoot, 'agent-data', 'skills', skillName)
+        const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
 
         const [skillJsonRaw, indexPy, readme] = await Promise.all([
           fs.readFile(path.join(skillDir, 'skill.json'), 'utf-8'),
@@ -2544,7 +2544,7 @@ export class LocalAiStudioService extends LocalAiService {
         const indexPy = textValue(value.indexPy, 100000)
         const readme = textValue(value.readme, 50000)
 
-        const skillDir = path.join(this.dataRoot, 'agent-data', 'skills', skillName)
+        const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
 
         await Promise.all([
           fs.writeFile(
@@ -2579,16 +2579,30 @@ export class LocalAiStudioService extends LocalAiService {
 
         const startTime = Date.now()
 
-        const result = await this.runtimeManager!.executeTool(
-          skillName,
-          toolName,
-          args,
-          { workspace },
-          new AbortController().signal
+        // 直接通过 Python 执行
+        const skill = this.skillPlatform!.skills.get(skillName)
+        if (!skill) throw new Error(`Skill not found: ${skillName}`)
+
+        const result = await this.pythonTools.execute(
+          {
+            tool: toolName,
+            args,
+            workspace,
+            code: `
+import sys
+sys.path.insert(0, '${skill.skillDir.replace(/\\/g, '\\\\')}')
+from index import TOOLS
+result = TOOLS['${toolName}'](${JSON.stringify(args)}, {'workspace': '${workspace.replace(/\\/g, '\\\\')}'})
+print(result)
+`,
+            context: { workspace }
+          },
+          new AbortController().signal,
+          30000
         )
 
         return {
-          output: JSON.stringify(result),
+          output: result.output,
           elapsedMs: Date.now() - startTime
         }
       }
@@ -2603,7 +2617,7 @@ export class LocalAiStudioService extends LocalAiService {
           throw new Error('Skill 标识需以小写字母开头，只能包含小写字母、数字、连字符')
         }
 
-        const skillDir = path.join(this.dataRoot, 'agent-data', 'skills', skillName)
+        const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
 
         if (existsSync(skillDir)) {
           throw new Error('Skill 已存在')
