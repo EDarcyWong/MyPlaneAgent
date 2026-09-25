@@ -43,6 +43,7 @@ const filteredNavigation=computed(()=>{
 })
 watch(tab,value=>{if(value!=='chat')lastSettingsTab.value=value})
 async function openSettings(){settingsQuery.value='';tab.value=lastSettingsTab.value;await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.settings-back')?.focus()}
+async function openModelSettings(){settingsQuery.value='';tab.value='server';await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.settings-back')?.focus()}
 async function returnToChat(){drawer.value=false;logOutputOpen.value=false;tab.value='chat';await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.chat-settings-button')?.focus()}
 const appearanceStyles=[{id:'minimal',name:'极简',description:'克制的灰阶界面'},{id:'ocean',name:'海蓝',description:'清爽的蓝色工作区'},{id:'paper',name:'暖纸',description:'柔和的暖色层次'},{id:'terminal',name:'程式',description:'编辑器配色与高对比强调'}] as const
 const pageTitle=computed(()=>navigation.find(item=>item.id===tab.value)?.label||'本地 AI')
@@ -115,7 +116,7 @@ function fillRemotePreset(event:Event){
   <div class="studio-main">
    <header v-if="settingsMode" class="studio-topbar"><div class="brand"><strong>设置</strong><span class="topbar-divider"></span><span>{{pageTitle}}</span></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" title="新建工作流" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建插件" aria-label="新建插件" @click="agentSkillManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本机托管 · 数据留在本机':'外部 API · 请求发送至 API'}}</span></header>
    <div v-if="error" class="error-banner" role="alert"><span>{{error}}</span><button @click="error=''">关闭</button></div>
-   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" @settings="openSettings"/>
+   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" @settings="openSettings" @models="openModelSettings"/>
    <div v-if="!ready" class="initial-loading"><div class="loading-orbit"></div><h3>{{error?'工作区暂时无法载入':'正在准备本地工作区'}}</h3><p>{{error?'请检查上方错误提示，修复后重新打开此窗口。':'读取本地模型、配置和会话记录'}}</p></div>
 
    <WorkflowDesigner ref="workflowDesigner" v-else-if="tab==='workflow'" :model="model" :models="workflowModels" :theme="settings.theme" :appearance-style="settings.appearanceStyle"/>

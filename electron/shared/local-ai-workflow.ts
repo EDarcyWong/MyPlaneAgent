@@ -7,6 +7,7 @@ export type WorkflowVariableAssignment={name:string;value:string}
 export type WorkflowModelRef={source:'current';id?:string;name?:string}|{source:'local';id:string;name?:string}|{source:'remote';id:string;name?:string;apiFormat:RemoteApiFormat;endpoint:string;profileId?:string;contextLength?:number}
 export type WorkflowNodeBase={id:string;name:string;branches?:WorkflowBranch[];onSuccess?:string;onFailure?:string}
 export type WorkflowAgentNode=WorkflowNodeBase&{type:'agent';config:{instruction:string;model?:string;modelRef?:WorkflowModelRef;modelSource?:'current'|'specified';mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode;inputs?:WorkflowInputParameter[];inputSignalMode?:'all'|'any';branchMode?:'ai'|'rules'}}
+export type WorkflowAiJudgeNode=WorkflowNodeBase&{type:'ai-judge';config:WorkflowAgentNode['config']}
 export type WorkflowConditionNode=WorkflowNodeBase&{type:'condition';config:{sourceNodeId:string;operator:'succeeded'|'failed'}}
 export type WorkflowRouteNode=WorkflowNodeBase&{type:'route';config:{sourceNodeId:string}}
 export type WorkflowDataNode=WorkflowNodeBase&{type:'data';config:{assignments:WorkflowVariableAssignment[]}}
@@ -17,7 +18,7 @@ export type WorkflowEndNode=WorkflowNodeBase&{type:'end';config:{status:'succeed
 export type WorkflowRule={kind:'text'|'number'|'boolean'|'collection';left:string;operator:string;right:string}
 export type WorkflowDecisionNode=WorkflowNodeBase&({type:'judge';config:{mode:'all'|'any';rules:WorkflowRule[]}}|{type:'predicate';config:{mode:'all'|'any';rules:WorkflowRule[]}})
 export type WorkflowSwitchNode=WorkflowNodeBase&{type:'switch';config:{value:string;kind:'text'|'number'|'boolean';cases:{branchId:string;value:string}[];defaultBranchId:string}}
-export type WorkflowNode=WorkflowDecisionNode|WorkflowSwitchNode|WorkflowAgentNode|WorkflowConditionNode|WorkflowRouteNode|WorkflowDataNode|WorkflowJoinNode|WorkflowApprovalNode|WorkflowNotifyNode|WorkflowEndNode
+export type WorkflowNode=WorkflowAiJudgeNode|WorkflowDecisionNode|WorkflowSwitchNode|WorkflowAgentNode|WorkflowConditionNode|WorkflowRouteNode|WorkflowDataNode|WorkflowJoinNode|WorkflowApprovalNode|WorkflowNotifyNode|WorkflowEndNode
 export type WorkflowLayout={nodes:Record<string,{x:number;y:number}>;start?:{x:number;y:number}}
 
 export type WorkflowDefinition={id:string;name:string;description:string;projectId?:string;enabled:boolean;version:number;entryNodeId:string;entryNodeIds?:string[];nodes:WorkflowNode[];layout?:WorkflowLayout;timeoutMinutes:number;createdAt:string;updatedAt:string}

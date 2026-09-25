@@ -693,3 +693,39 @@ test('request failures print diagnostics and redaction protects credentials befo
  const chunks=[];writeConversationDiagnostic(message=>chunks.push(message),{taskId:'id',model:'model',request:'x'.repeat(6000),response:'reply',error:'failed'})
  assert.equal(chunks.filter(line=>line.includes('请求对话')).length,4);assert.ok(chunks.every(line=>line.length<2000))
 })
+
+
+test('AI judgement calls the model with upstream data and executes only the chosen branch',async t=>{
+ for (const choice of ['yes','no']) {
+  const h=await harness(t,()=>response(JSON.stringify({branchId:choice,output:{reason:'语义判断结果'}})))
+  const workflow=new WorkflowService(path.join(h.root,'ai-judge'),h.agent);t.after(()=>workflow.dispose())
+  const branch=(id,target,condition,outputValue)=>({id,name:id,condition,color:'#347fc5',targetNodeIds:[target],outputValue})
+  const judge={...agentNode('judge'),type:'ai-judge',config:{...agentNode('judge').config,instruction:'判断输入客户反馈是否表达满意',mode:'general'},branches:[branch('yes','accepted','客户表达满意','{"reason":"","accepted":true}'),branch('no','rejected','始终：其他情况','{"reason":"","accepted":false}')]}
+  const input={name:'AI 客户反馈判断',description:'',projectId:h.project.id,enabled:true,timeoutMinutes:1,entryNodeId:'source',nodes:[
+   {id:'source',name:'反馈',type:'data',config:{assignments:[{name:'feedback',value:'服务很贴心'}]},branches:[branch('out','judge','','{"feedback":"服务很贴心"}')]},judge,
+   {id:'accepted',name:'满意',type:'end',config:{status:'succeeded',summary:'满意路径'},branches:[]},
+   {id:'rejected',name:'其他',type:'end',config:{status:'succeeded',summary:'其他路径'},branches:[]}
+  ]}
+  const saved=workflow.save(input)
+  assert.equal(saved.nodes[1].type,'ai-judge');assert.equal(saved.nodes[1].config.branchMode,'ai')
+  assert.throws(()=>workflow.save({...input,nodes:input.nodes.map(node=>node===judge?{...judge,branches:judge.branches.slice(0,1)}:node)}),/至少需要两个输出分支/)
+  workflow.start(saved.id);await until(()=>['succeeded','failed'].includes(workflow.runs(saved.id)[0]?.status))
+  const run=workflow.runs(saved.id)[0]
+  assert.equal(run.status,'succeeded',run.error)
+  const result=run.nodeRuns.find(node=>node.nodeId==='judge')
+  assert.equal(result.type,'ai-judge');assert.equal(result.branchId,choice)
+  assert.deepEqual(JSON.parse(result.outputValue),{reason:'语义判断结果',accepted:choice==='yes'})
+  assert.ok(run.nodeRuns.some(node=>node.nodeId===(choice==='yes'?'accepted':'rejected')))
+  assert.ok(!run.nodeRuns.some(node=>node.nodeId===(choice==='yes'?'rejected':'accepted')))
+  assert.match(JSON.stringify(h.requests),/服务很贴心/)
+ }
+})
+
+test('AI judgement rejects an unknown model branch instead of following a fallback',async t=>{
+ const h=await harness(t,()=>response('{"branchId":"unknown","output":{}}'))
+ const workflow=new WorkflowService(path.join(h.root,'ai-judge-invalid'),h.agent);t.after(()=>workflow.dispose())
+ const node={...agentNode('judge'),type:'ai-judge',config:{...agentNode('judge').config,branchMode:'ai'},branches:['yes','no'].map(id=>({id,name:id,condition:'自然语言条件',color:'#347fc5',outputValue:'{}'}))}
+ const saved=workflow.save({name:'无效 AI 判断',description:'',projectId:h.project.id,enabled:true,timeoutMinutes:1,entryNodeId:'judge',nodes:[node]})
+ workflow.start(saved.id);await until(()=>workflow.runs(saved.id)[0]?.status==='failed')
+ assert.match(workflow.runs(saved.id)[0].error,/不存在的输出分支/)
+})

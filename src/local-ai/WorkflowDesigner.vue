@@ -207,6 +207,7 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
   nodeSequence++;
   const names: Record<FormNode["type"], string> = {
       agent: "Agent 任务",
+      "ai-judge": "AI 判断",
       condition: "旧版判断",
       route: "旧版路由",
       judge: "数据判断", predicate: "条件判断", switch: "Switch",
@@ -219,6 +220,8 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     branches: FormBranch[] =
       isDecision(type)
         ? ['成立', type === 'switch' ? '默认' : '不成立'].map((name, i) => ({id:`decision_${nodeSequence}_${i}`,name:type === 'switch' && i === 0 ? '匹配 1' : name,condition:'',color:i ? '#d45b68' : '#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'}))
+        : type === "ai-judge"
+        ? ["条件成立", "默认兜底"].map((name, i) => ({id:`ai_${nodeSequence}_${i}`,name,condition:i ? "始终：前面的判断条件均不成立时选择此分支" : "输入内容符合任务中描述的判断标准",color:i ? "#d45b68" : "#2f9b74",targetNodeIds:[],outputValue:'{"result":""}'}))
         : type === "agent"
         ? [
             {
@@ -264,7 +267,7 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     instruction: "",
     model: props.model || props.models[0]?.id || "",
     modelSource: "current",
-    mode: "coding",
+    mode: type === "ai-judge" ? "general" : "coding",
     maxSteps: 30,
     fastMode: true,
     approvalMode: "ask",
@@ -286,7 +289,7 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     endSummary: "工作流执行完成",
     endScope:"path",endResult:"",
     x: 430 + (index % 3) * 290,
-    y: 110 + Math.floor(index / 3) * 190,
+    y: 110 + Math.floor(index / 3) * 260,
   };
 };
 const fresh = () => ({
@@ -306,7 +309,7 @@ type ComponentItem = {label:string;type:FormNode['type'];icon:typeof Cpu;kind?:W
 const componentGroups: {name:string;items:ComponentItem[]}[] = [
   {name:'任务执行',items:[{label:'Agent',type:'agent',icon:Cpu},{label:'系统通知',type:'notify',icon:Bell}]},
   {name:'数据处理',items:[{label:'数据变量',type:'data',icon:DataAnalysis},{label:'汇合',type:'join',icon:Connection}]},
-  {name:'逻辑判断',items:[...(['text','number','boolean','collection'] as const).map((kind,i)=>({label:['文本判断','数值判断','布尔判断','集合判断'][i],type:'judge' as const,icon:[ChatLineSquare,Sort,Checked,Collection][i],kind})),{label:'条件判断',type:'predicate',icon:Operation},{label:'Switch',type:'switch',icon:Switch}]},
+  {name:'逻辑判断',items:[{label:'AI 判断',type:'ai-judge',icon:Cpu},...(['text','number','boolean','collection'] as const).map((kind,i)=>({label:['文本判断','数值判断','布尔判断','集合判断'][i],type:'judge' as const,icon:[ChatLineSquare,Sort,Checked,Collection][i],kind})),{label:'条件判断',type:'predicate',icon:Operation},{label:'Switch',type:'switch',icon:Switch}]},
   {name:'流程控制',items:[{label:'人工确认',type:'approval',icon:UserFilled},{label:'结束',type:'end',icon:Flag}]},
 ];
 function addComponent(item: ComponentItem) {
@@ -514,6 +517,7 @@ const nodeType = (type: FormNode["type"]) =>
   (
     ({
       agent: "Agent",
+      "ai-judge": "AI 判断",
       condition: "旧版判断",
       route: "旧版路由",
       judge: "数据判断", predicate: "条件判断", switch: "Switch",
@@ -524,10 +528,21 @@ const nodeType = (type: FormNode["type"]) =>
       end: "结束",
     }) as Record<FormNode["type"], string>
   )[type];
+const isJudgement = (type: FormNode["type"]) =>
+  isDecision(type) || ["ai-judge", "condition", "route"].includes(type);
 const nodeHeight = (node: FormNode) =>
-  Math.max(140, 92 + node.branches.length * 28);
+  Math.max(isJudgement(node.type) ? 220 : 140, 92 + node.branches.length * 28);
+function outputPortPosition(node: FormNode, index: number) {
+  if (!isJudgement(node.type)) return { x: 230, y: 68 + index * 28 };
+  const height = nodeHeight(node);
+  const y = node.branches.length === 1 ? height / 2
+    : height * (0.25 + 0.5 * index / Math.max(1, node.branches.length - 1));
+  return { x: 230 * (1 - Math.abs(2 * y / height - 1) / 2), y };
+}
 const nodeSummary = (node: FormNode) =>
   isDecision(node.type) ? (node.type === 'switch' ? `${node.switchCases.length} 个匹配值 · 默认分支` : `${node.ruleMode === 'all' ? '全部' : '任一'}满足 · ${node.rules.length} 条规则`)
+    : node.type === "ai-judge"
+    ? node.instruction.trim().split("\n")[0] || "点击设置 AI 判断标准"
     : node.type === "agent"
     ? node.instruction.trim().split("\n")[0] || "点击设置 Agent 执行内容"
     : node.type === "condition"
@@ -630,11 +645,12 @@ function portPoint(sourceId: string, branch: Branch) {
     0,
     node.branches.findIndex((item) => item.id === branch),
   );
-  return { x: node.x + 230, y: node.y + 68 + index * 28 };
+  const port = outputPortPosition(node, index);
+  return { x: node.x + port.x, y: node.y + port.y };
 }
 function inputPoint(id: string) {
   const node = nodeById.value.get(id);
-  return node ? { x: node.x, y: node.y + 70 } : { x: 0, y: 0 };
+  return node ? { x: node.x, y: node.y + (isJudgement(node.type) ? nodeHeight(node) / 2 : 70) } : { x: 0, y: 0 };
 }
 const edges = computed(() => {
   const rows: CanvasEdge[] = [];
@@ -689,7 +705,7 @@ function branchOutputError(node: FormNode, branch: FormBranch) {
   if ((branch.outputValue?.length || 0) > 4000) return "输出内容不能超过 4000 个字符";
   const syntaxError = workflowJsonError(branch.outputValue);
   if (syntaxError) return syntaxError;
-  if (node.type === "agent" && node.branchMode === "ai") return outputJsonError(branch.outputValue);
+  if ((node.type === "agent" || node.type === "ai-judge") && node.branchMode === "ai") return outputJsonError(branch.outputValue);
 
   return "";
 }
@@ -844,7 +860,7 @@ function fromNode(
   node = mapVariableReferences(node, definition.nodes, "display");
   const position = definition.layout?.nodes[node.id] || {
       x: 320 + (index % 3) * 290,
-      y: 110 + Math.floor(index / 3) * 190,
+      y: 110 + Math.floor(index / 3) * 260,
     },
     branches = node.branches?.map((branch) => {
       const targetNodeIds = [
@@ -894,18 +910,18 @@ function fromNode(
     name: node.name,
     type: node.type,
     branches,
-    instruction: node.type === "agent" ? node.config.instruction : "",
-    model: node.type === "agent" ? node.config.model || "" : props.model || "",
-    modelRef: node.type === "agent" ? node.config.modelRef : undefined,
+    instruction: (node.type === "agent" || node.type === "ai-judge") ? node.config.instruction : "",
+    model: (node.type === "agent" || node.type === "ai-judge") ? node.config.model || "" : props.model || "",
+    modelRef: (node.type === "agent" || node.type === "ai-judge") ? node.config.modelRef : undefined,
     modelSource:
-      node.type === "agent" ? node.config.modelSource || "current" : "current",
-    mode: node.type === "agent" ? node.config.mode : "coding",
-    maxSteps: node.type === "agent" ? node.config.maxSteps : 30,
-    fastMode: node.type === "agent" ? node.config.fastMode : true,
-    approvalMode: node.type === "agent" ? node.config.approvalMode : "ask",
+      (node.type === "agent" || node.type === "ai-judge") ? node.config.modelSource || "current" : "current",
+    mode: (node.type === "agent" || node.type === "ai-judge") ? node.config.mode : "coding",
+    maxSteps: (node.type === "agent" || node.type === "ai-judge") ? node.config.maxSteps : 30,
+    fastMode: (node.type === "agent" || node.type === "ai-judge") ? node.config.fastMode : true,
+    approvalMode: (node.type === "agent" || node.type === "ai-judge") ? node.config.approvalMode : "ask",
     inputSignalMode:
-      node.type === "agent" ? node.config.inputSignalMode || "all" : "all",
-    branchMode: node.type === "agent" ? node.config.branchMode || "ai" : "ai",
+      (node.type === "agent" || node.type === "ai-judge") ? node.config.inputSignalMode || "all" : "all",
+    branchMode: (node.type === "agent" || node.type === "ai-judge") ? node.config.branchMode || "ai" : "ai",
     sourceNodeId:
       node.type === "condition" || node.type === "route"
         ? node.config.sourceNodeId
@@ -1033,10 +1049,10 @@ function payload(): WorkflowDefinitionInput {
         targetNodeIds: [...(branch.targetNodeIds || [])],
       })),
     };
-    if (node.type === "agent")
+    if (node.type === "agent" || node.type === "ai-judge")
       return {
         ...base,
-        type: "agent" as const,
+        type: node.type,
         config: {
           instruction: node.instruction,
           modelSource: node.modelSource,
@@ -1143,6 +1159,7 @@ async function save(manual = true) {
   }
   saveErrorNodeIds.value = new Set([
     ...form.nodes.filter(node => workflowNodeNameError(node, form.nodes)).map(node => node.id),
+    ...form.nodes.filter(node => node.type === "agent" && node.branches.length !== 1).map(node => node.id),
     ...branchOutputErrors.value.map(item => item.node.id),
     ...endResultErrors.value.map(item=>item.node.id),
   ]);
@@ -1150,6 +1167,12 @@ async function save(manual = true) {
   if (invalidNameNode) {
     error.value = workflowNodeNameError(invalidNameNode, form.nodes);
     if (manual) setSelection([invalidNameNode.id], invalidNameNode.id);
+    return;
+  }
+  const invalidAgentNode = form.nodes.find(node => node.type === "agent" && node.branches.length !== 1);
+  if (invalidAgentNode) {
+    error.value = `${invalidAgentNode.name} 必须有且只有一个输出分支`;
+    if (manual) setSelection([invalidAgentNode.id], invalidAgentNode.id);
     return;
   }
   if (inputConnectionErrors.value.length || endResultErrors.value.length) {
@@ -1247,9 +1270,8 @@ function beginSelectionDrag(id: string, event: PointerEvent) {
   event.preventDefault();
   event.stopPropagation();
   selectNode(id, event);
-  const ids = selectedNodeIds.value.has(id)
-      ? selectedNodeIds.value
-      : new Set([id]),
+  if (!selectedNodeIds.value.has(id)) return;
+  const ids = selectedNodeIds.value,
     positions = new Map(
       form.nodes
         .filter((item) => ids.has(item.id))
@@ -1439,17 +1461,17 @@ const branchColors = [
   "#6677cc",
 ];
 function addBranch(node: FormNode) {
-  if ((node.type === "join" || node.type === "data") && node.branches.length) return;
+  if (["agent", "join", "data"].includes(node.type) && node.branches.length) return;
   const index = node.branches.length,
     used = new Set(node.branches.map((branch) => branch.color.toLowerCase())),
     color =
       branchColors.find((value) => !used.has(value.toLowerCase())) ||
       branchColors[index % branchColors.length],
     output =
-      node.type === "join" || node.type === "data" || (node.type === "agent" && node.branchMode === "ai")
+      node.type === "join" || node.type === "data" || ((node.type === "agent" || node.type === "ai-judge") && node.branchMode === "ai")
         ? '{"result":""}'
         : undefined;
-  node.branches.push({
+  node.branches.splice(node.type === "ai-judge" ? Math.max(0, index - 1) : index, 0, {
     id: `branch_${Date.now().toString(36)}_${++nodeSequence}`,
     name: node.type === "join" ? "汇合完成" : node.type === "data" ? "设置完成" : `分支 ${index + 1}`,
     condition: "",
@@ -1487,7 +1509,8 @@ function insertOutputReference(branch: FormBranch, item: UpstreamReference) {
   }
 }
 function removeBranch(node: FormNode, branch: FormBranch) {
-  if ((node.type === "join" || node.type === "data") && node.branches.length === 1) return;
+  if (node.type === "ai-judge" && node.branches.length <= 2) return;
+  if (["agent", "join", "data"].includes(node.type) && node.branches.length <= 1) return;
   node.branches.splice(node.branches.indexOf(branch), 1);
   if (
     selectedEdgeKey.value?.sourceId === node.id &&
@@ -1698,9 +1721,12 @@ function resetZoom() {
 function autoLayout() {
   form.startX = 60;
   form.startY = 180;
+  let rowY = 100;
   form.nodes.forEach((node, index) => {
+    if (index && index % 3 === 0)
+      rowY += Math.max(...form.nodes.slice(index - 3, index).map(nodeHeight)) + 40;
     node.x = 330 + (index % 3) * 290;
-    node.y = 100 + Math.floor(index / 3) * 190;
+    node.y = rowY;
   });
   centerCanvas();
 }
@@ -2190,23 +2216,28 @@ onBeforeUnmount(() => {
                 v-for="node in form.nodes"
                 :key="node.id"
                 class="workflow-canvas-node"
-                :class="[node.type, { selected: isSelected(node.id), 'has-save-error': saveErrorNodeIds.has(node.id) }]"
+                :class="[node.type, { 'decision-diamond': isJudgement(node.type), selected: isSelected(node.id), 'has-save-error': saveErrorNodeIds.has(node.id) }]"
                 :aria-invalid="saveErrorNodeIds.has(node.id)"
                 :style="{
                   left: node.x + 'px',
                   top: node.y + 'px',
                   height: nodeHeight(node) + 'px',
                 }"
-                @pointerdown.stop="selectNode(node.id, $event)"
+                @pointerdown.stop="beginDrag(node, $event)"
               >
+                <svg v-if="isJudgement(node.type)" class="workflow-diamond-shape" viewBox="0 0 230 220" preserveAspectRatio="none" aria-hidden="true">
+                  <polygon points="115,2 228,110 115,218 2,110" />
+                </svg>
                 <button
                   type="button"
                   class="workflow-input-port"
+                  :style="isJudgement(node.type) ? { top: nodeHeight(node) / 2 - 7 + 'px' } : undefined"
                   title="连接到此节点"
+                  @pointerdown.stop
                   @pointerup="completeConnection(node.id, $event)"
                   @contextmenu.prevent
                 ></button>
-                <header @pointerdown="beginDrag(node, $event)">
+                <header>
                   <span>{{ nodeType(node.type) }}</span
                   ><strong>{{ node.name }}</strong>
                 </header>
@@ -2222,7 +2253,8 @@ onBeforeUnmount(() => {
                   type="button"
                   class="workflow-output-port custom"
                   :style="{
-                    top: 61 + branchIndex * 28 + 'px',
+                    top: outputPortPosition(node, branchIndex).y - 7 + 'px',
+                    left: outputPortPosition(node, branchIndex).x - 7 + 'px',
                     background: branch.color,
                     boxShadow: '0 0 0 1px ' + branch.color,
                   }"
@@ -2377,7 +2409,7 @@ onBeforeUnmount(() => {
                 :is="
                   selectedNode.type === 'notify'
                     ? Bell
-                    : selectedNode.type === 'agent'
+                    : (selectedNode.type === 'agent' || selectedNode.type === 'ai-judge')
                       ? Edit
                       : Connection
                 "
@@ -2430,9 +2462,9 @@ onBeforeUnmount(() => {
                 <small>{{ item.detail }}</small>
               </article>
             </section>
-            <template v-if="selectedNode.type === 'agent'"
+            <template v-if="(selectedNode.type === 'agent' || selectedNode.type === 'ai-judge')"
               ><label
-                >执行内容<textarea
+                >{{ selectedNode.type === "ai-judge" ? "判断任务与标准" : "执行内容" }}<textarea
                   v-model="selectedNode.instruction"
                   rows="8"
                   required
@@ -2440,8 +2472,7 @@ onBeforeUnmount(() => {
                 ></textarea>
               </label>
               <p class="workflow-field-note">
-                AI 会基于自然语言条件互斥选择一个分支，并按该分支的 JSON
-                格式输出属性值。
+                {{ selectedNode.type === "ai-judge" ? "AI 会按顺序评估自然语言条件，只选择一个分支，并按该分支的 JSON 格式输出。" : "AI 完成任务后，按唯一输出分支的 JSON 格式输出结果。" }}
               </p>
               <label
                 >模型来源<select v-model="selectedNode.modelSource">
@@ -2712,13 +2743,14 @@ onBeforeUnmount(() => {
                       ? "汇合完成后直接输出；一个输出分支可连接多个下游"
                       : selectedNode.type === "data"
                         ? "变量设置完成后直接输出；一个输出分支可连接多个下游"
-                      : selectedNode.type === "agent" &&
-                    selectedNode.branchMode === "ai"
-                      ? "分支之间为或关系；每次只选择一个"
+                      : selectedNode.type === "ai-judge"
+                      ? "AI 按顺序判断自然语言条件，每次只选择一个分支"
+                      : selectedNode.type === "agent"
+                      ? "有且只有一个输出分支；可连接多个下游"
                       : "按顺序匹配第一条规则"
                   }}</small>
                 </div>
-                <button v-if="!isDecision(selectedNode.type) && !['approval','notify'].includes(selectedNode.type) && selectedNode.type !== 'join' && (selectedNode.type !== 'data' || !selectedNode.branches.length)" type="button" @click="addBranch(selectedNode)">
+                <button v-if="!isDecision(selectedNode.type) && !['approval','notify'].includes(selectedNode.type) && selectedNode.type !== 'join' && (!['agent', 'data'].includes(selectedNode.type) || !selectedNode.branches.length)" type="button" @click="addBranch(selectedNode)">
                   <Plus />添加分支
                 </button>
               </header>
@@ -2735,7 +2767,7 @@ onBeforeUnmount(() => {
                 <header>
                   <strong>{{ selectedNode.type === 'notify' ? (index === 0 ? '发送成功分支' : index === 1 ? '发送失败分支' : '旧版多余分支，请删除') : selectedNode.type === 'approval' ? (index === 0 ? '批准分支' : '拒绝分支') : selectedNode.type === 'switch' ? (branch.id === selectedNode.defaultBranchId ? '默认分支' : '匹配分支 ' + (index + 1)) : ['judge','predicate'].includes(selectedNode.type) ? (index === 0 ? '成立分支' : '不成立分支') : '分支 ' + (index + 1) }}</strong
                   ><button
-                    v-if="!isDecision(selectedNode.type) && selectedNode.type !== 'approval' && (selectedNode.type !== 'notify' || selectedNode.branches.length > 2) && (!['join', 'data'].includes(selectedNode.type) || selectedNode.branches.length > 1)"
+                    v-if="!isDecision(selectedNode.type) && (selectedNode.type !== 'ai-judge' || selectedNode.branches.length > 2) && selectedNode.type !== 'approval' && (selectedNode.type !== 'notify' || selectedNode.branches.length > 2) && (!['agent', 'join', 'data'].includes(selectedNode.type) || selectedNode.branches.length > 1)"
                     type="button"
                     title="删除分支"
                     @click="removeBranch(selectedNode, branch)"
@@ -2755,13 +2787,13 @@ onBeforeUnmount(() => {
                 </div>
                 <label v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)"
                   >{{
-                    selectedNode.type === "agent" &&
+                    (selectedNode.type === "agent" || selectedNode.type === "ai-judge") &&
                     selectedNode.branchMode === "ai"
                       ? "AI 识别条件"
                       : "匹配条件"
                   }}<textarea
                     v-if="
-                      selectedNode.type === 'agent' &&
+                      (selectedNode.type === 'agent' || selectedNode.type === 'ai-judge') &&
                       selectedNode.branchMode === 'ai'
                     "
                     v-model="branch.condition"
@@ -2778,7 +2810,7 @@ onBeforeUnmount(() => {
                     list="workflow-branch-conditions"
                     placeholder="例如 变量：risk 等于：high" /></label
                 ><small v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)">{{
-                  selectedNode.type === "agent" &&
+                  (selectedNode.type === "agent" || selectedNode.type === "ai-judge") &&
                   selectedNode.branchMode === "ai"
                     ? "描述业务语义，AI 将在所有分支中选择唯一最符合的一条。"
                     : "支持执行状态、摘要/错误包含，以及变量等于、不等于、包含、大小或为空。"
@@ -2798,7 +2830,7 @@ onBeforeUnmount(() => {
                 ></textarea>
                 <small :id="`workflow-output-error-${branch.id}`" :class="{ danger: branchOutputError(selectedNode, branch) }" aria-live="polite">{{
                   branchOutputError(selectedNode, branch) ||
-                  (selectedNode.type === 'agent' && selectedNode.branchMode === 'ai'
+                  ((selectedNode.type === 'agent' || selectedNode.type === 'ai-judge') && selectedNode.branchMode === 'ai'
                     ? '填写合法 JSON：固定值原样保留，空字符串由 AI 填写，引用值由程序自动填入。'
                     : selectedNode.type === 'join'
                       ? '填写合法 JSON，固定值原样输出；引用值保留原始类型。引用缺失或不唯一时会报错。'

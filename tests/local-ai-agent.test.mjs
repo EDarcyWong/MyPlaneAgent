@@ -41,6 +41,22 @@ async function harness(t,reply,connection){
  const events=[];return {root,workspace,service,events,start:(extra={})=>service.start({workspace,mode:'coding',model:'fixture-model',prompt:'检查并修复项目',maxSteps:10,...extra},7,event=>events.push(event))}
 }
 
+test('project tasks initialize local Git before model execution, including resumed tasks',async t=>{
+ const h=await harness(t,()=>{
+  assert.equal(fs.existsSync(path.join(h.workspace,'.git')),true)
+  return response('已检查项目')
+ })
+ const task=h.start()
+ await until(()=>h.service.get(task.id).status==='completed')
+ const config=fs.readFileSync(path.join(h.workspace,'.git','config'),'utf8')
+ assert.match(config,/localHistory = true/)
+ assert.doesNotMatch(config,/\[remote /)
+ fs.rmSync(path.join(h.workspace,'.git'),{recursive:true,force:true})
+ h.start({taskId:task.id,prompt:'继续检查'})
+ await until(()=>h.service.get(task.id).status==='completed')
+ assert.equal(fs.existsSync(path.join(h.workspace,'.git')),true)
+})
+
 test('fast Agent mode disables local thinking and caps each model round',async t=>{
  const bodies=[],h=await harness(t,body=>{bodies.push(body);return response('完成')},{maxTokens:65536,contextLength:131072,localLlama:true})
  const fast=h.start();await until(()=>!h.service.active(fast.id));assert.equal(bodies[0].max_tokens,8192);assert.deepEqual(bodies[0].chat_template_kwargs,{enable_thinking:false})

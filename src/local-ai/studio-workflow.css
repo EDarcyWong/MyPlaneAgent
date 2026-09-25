@@ -420,3 +420,24 @@
 .workflow-editor-window:not([data-style=minimal]) :is(.workflow-canvas-toolbar button:hover,.workflow-component-panel .workflow-component-buttons button:hover){border-color:var(--wf-green);background:var(--wf-panel-soft);color:var(--wf-green)}
 .workflow-editor-window:not([data-style=minimal]) :is(.workflow-save-state,.workflow-editor-header .eyebrow){border-color:var(--wf-line);background:var(--wf-panel-soft);color:var(--wf-green)}
 .workflow-editor-window:not([data-style=minimal]) :is(.workflow-component-panel,.workflow-inspector h3){border-color:var(--wf-line)}
+
+/* Decision nodes use the same diamond geometry as their connection anchors. */
+.workflow-canvas-node.decision-diamond,
+.workflow-canvas-node.decision-diamond.selected,
+.is-native-window .workflow-canvas-node.decision-diamond.selected:hover {
+  --node-accent:#c98a18;
+  border:0;border-radius:0;background:transparent;box-shadow:none;outline:0;
+}
+.workflow-diamond-shape{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;filter:drop-shadow(0 4px 6px #19332612)}
+.workflow-diamond-shape polygon{fill:#fffdf6;stroke:var(--node-accent);stroke-width:1.5;vector-effect:non-scaling-stroke}
+.workflow-canvas-node.decision-diamond.selected .workflow-diamond-shape polygon{fill:#fff7df;stroke-width:3}
+.workflow-canvas-node.decision-diamond.has-save-error .workflow-diamond-shape polygon{fill:#fff3f1;stroke:#c64c43;stroke-width:3}
+.workflow-canvas-node.decision-diamond>header{position:absolute;top:calc(50% - 45px);left:23%;width:54%;height:48px;box-sizing:border-box;flex-direction:column;justify-content:center;gap:4px;padding:0;border:0;background:transparent;text-align:center}
+.workflow-canvas-node.decision-diamond>header strong{max-width:100%}
+.workflow-canvas-node.decision-diamond>p{position:absolute;top:calc(50% + 5px);left:25%;width:50%;height:30px;margin:0;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.workflow-canvas-node.decision-diamond>footer{position:absolute;top:calc(50% + 38px);left:25%;width:50%;box-sizing:border-box;padding:0;text-align:center}
+.workflow-canvas-node.decision-diamond .workflow-output-port span{left:18px;right:auto;max-width:150px;overflow:hidden;text-overflow:ellipsis;background:#f7f9f8d9;border-radius:3px;padding:2px 4px}
+.workflow-component-buttons>button.ai-judge{--component-color:#c98a18}
+.workflow-canvas-node.decision-diamond::before{display:none}.workflow-canvas-node.decision-diamond .workflow-input-port{left:-7px}.workflow-canvas-node.decision-diamond .workflow-input-port,.workflow-canvas-node.decision-diamond .workflow-output-port{width:14px;height:14px}
+
+.workflow-canvas-node{cursor:grab}.workflow-canvas-node:active,.workflow-start-node:active{cursor:grabbing}

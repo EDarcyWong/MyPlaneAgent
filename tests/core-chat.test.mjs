@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createServer } from 'node:http'
-import { mkdtempSync, cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, cpSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runCoreChat, chatApprovalRequired, chatCapabilityAllowed } from '../dist-electron/main/agent/core/chat-runner.js'
 import { estimateTokens } from '../dist-electron/main/local-ai-context.js'
 import { AgentCoreService } from '../dist-electron/main/agent/agent-core-service.js'
+import {execFileSync} from 'node:child_process'
 
 const capability = (name, risk = 'high') => ({name,category:'agent',description:name,parameters:{type:'object',properties:{query:{type:'string'}},required:['query']},source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',permissions:['network'],tags:risk==='read'?[]:['requires-approval',`risk:${risk}`]})
 async function withModel(call, work, reviewCall) {
@@ -24,6 +25,44 @@ async function withModel(call, work, reviewCall) {
 }
 const toolCall=(input,name,args)=>({role:'assistant',content:null,tool_calls:[{id:'call1',type:'function',function:{name:input.tools.find(tool=>tool.function.description.startsWith(name+':')).function.name,arguments:JSON.stringify(args)}}]})
 const options=(connection,overrides={})=>({connection,model:'test-model',messages:[{role:'user',content:'搜索今日天气'}],workspace:tmpdir(),filesEnabled:false,webEnabled:true,approvalMode:'ask',signal:new AbortController().signal,onRequest(){},onUsage(){},onContent(){},onReasoning(){},onActivity(){},approve:async()=>true,...overrides})
+
+test('project chat initializes local Git before inference, while ordinary chat leaves its directory untouched',async()=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-git-'))
+ try{
+  let shouldExist=false
+  await withModel(()=>{
+   assert.equal(existsSync(path.join(workspace,'.git')),shouldExist)
+   return {content:'已完成检查'}
+  },async connection=>{
+   const registry={list:()=>[],execute:async()=>assert.fail('no file tool should be needed')}
+   await runCoreChat(registry,options(connection,{workspace,filesEnabled:true}))
+   assert.equal(existsSync(path.join(workspace,'.git')),false)
+   shouldExist=true
+   await runCoreChat(registry,options(connection,{workspace,filesEnabled:true,initializeLocalGit:true}))
+   const config=readFileSync(path.join(workspace,'.git','config'),'utf8')
+   assert.match(config,/localHistory = true/)
+   assert.doesNotMatch(config,/\[remote /)
+  })
+ }finally{rmSync(workspace,{recursive:true,force:true})}
+})
+
+test('chat file writes save complete snapshots and local Git versions without sending snapshots to the model',async()=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-write-')),activities=[]
+ writeFileSync(path.join(workspace,'hello.txt'),'original\ncontext')
+ try{
+  const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
+  const registry={list:()=>[write],execute:async request=>{writeFileSync(path.join(workspace,request.args.path),request.args.content);return {success:true,output:'saved'}}}
+  await withModel((input,n)=>n===1?toolCall(input,'agent.write_file',{path:'hello.txt',content:'updated\ncontext'}):{content:'已更新'},async(connection,requests)=>{
+   await runCoreChat(registry,options(connection,{workspace,filesEnabled:true,initializeLocalGit:true,onActivity:activity=>activities.push(activity)}))
+   const completed=activities.find(activity=>activity.status==='complete')
+   assert.deepEqual(completed.fileChanges,[{path:'hello.txt',before:'original\ncontext',after:'updated\ncontext'}])
+   assert.equal(execFileSync('git',['show','HEAD~1:hello.txt'],{cwd:workspace,encoding:'utf8',windowsHide:true}),'original\ncontext')
+   assert.equal(execFileSync('git',['show','HEAD:hello.txt'],{cwd:workspace,encoding:'utf8',windowsHide:true}),'updated\ncontext')
+   assert.doesNotMatch(JSON.stringify(requests[1].messages),/fileChanges|original/)
+   assert.match(JSON.stringify(requests[1].messages),/本地 Git 状态快照/)
+  })
+ }finally{rmSync(workspace,{recursive:true,force:true})}
+})
 
 test('chat search waits for approval, executes a registered Skill and returns tool results to the model',async()=>{
   let executed=0,approval=0,text='',release

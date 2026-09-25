@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {computed} from 'vue'
 import ChatToolCard from './ChatToolCard.vue'
+import ChatArtifactList from './ChatArtifactList.vue'
 import {chatArtifacts,executionEntries,toolLabel,type ChatArtifact} from '../../electron/shared/chat-presentation'
 import AiMarkdown from '../AiMarkdown.vue'
 import TokenUsageDisplay from './TokenUsageDisplay.vue'
@@ -35,7 +36,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
       </div>
      </details>
      <div v-if="active(index)" class="live-status" role="status"><span class="flow-indicator running"></span>{{liveLabel(message)}}</div>
-     <div v-if="artifacts.length" class="message-artifacts"><button v-for="artifact in artifacts" :key="artifact.id" @click="$emit('open-artifact',artifact)"><span aria-hidden="true">↗</span><strong>{{artifact.path}}</strong><small>{{artifact.kind==='diff'?'查看修改':'查看产物'}}</small></button></div>
+     <ChatArtifactList v-if="artifacts.length" :artifacts="artifacts" @open="$emit('open-artifact',$event)"/>
      <section v-if="message.content" class="final-answer"><h3 v-if="entries.length">{{outcomeLabel(message)}}</h3><AiMarkdown :text="message.content"/></section>
      <div v-if="message.status==='error'" class="execution-error" role="alert"><strong>本次执行未完成</strong><p>{{message.error||'生成未完成，可以重试。'}}</p></div>
      <p v-else-if="message.status==='stopped'" class="quiet">已停止生成，已执行的操作记录保留。</p>

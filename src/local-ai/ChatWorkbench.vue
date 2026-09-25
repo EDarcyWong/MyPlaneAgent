@@ -12,15 +12,24 @@ import ChatHistorySidebar from './ChatHistorySidebar.vue'
 import WorkspaceChatMessages from './WorkspaceChatMessages.vue'
 import TokenUsageDisplay from './TokenUsageDisplay.vue'
 import ContextUsageDisplay from './ContextUsageDisplay.vue'
+import ChatComposerSelect from './ChatComposerSelect.vue'
+import ChatPermissionSelect from './ChatPermissionSelect.vue'
 
 const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>}>()
-const emit = defineEmits<{settings: []}>()
+const emit = defineEmits<{settings: []; models: []}>()
 const ch = reactive(props.studio)
 const locked = computed(() => ch.sending || ch.sessionBusy)
 const hasConversation = computed(() => ch.messages.length > 0)
 const historyOpen = ref(false)
 const selectedArtifact = ref<ChatArtifact>()
 const artifacts = computed(()=>chatArtifacts(ch.messages))
+watch(artifacts,values=>{
+ const selected=selectedArtifact.value
+ if(!selected)return
+ const messagePrefix=selected.id.slice(0,selected.id.indexOf(':')+1)
+ const latest=values.find(item=>item.path===selected.path&&item.id.startsWith(messagePrefix))
+ if(latest)selectedArtifact.value=latest
+})
 watch(()=>ch.session?.id,()=>{selectedArtifact.value=undefined})
 const scroller = ref<HTMLElement>()
 const composerElement = ref<HTMLElement>()
@@ -88,11 +97,9 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
           <div v-if="ch.images.length" class="composer-images"><figure v-for="(image,index) in ch.images" :key="index"><img :src="image.dataUrl" :alt="image.name"/><figcaption>{{image.name}}</figcaption><button type="button" :aria-label="'移除图片 '+(index+1)" :disabled="ch.attaching" @click="ch.removeImage(index)">×</button></figure></div>
           <textarea v-model="ch.input" aria-label="消息" :disabled="ch.sessionBusy" maxlength="100000" :placeholder="hasConversation?'补充要求，继续这段对话…':'询问任何问题，或描述你想完成的工作…'" @paste="ch.pasteImages" @keydown="ch.composerKey"></textarea>
           <footer><div class="agent-prompt-options">
-            <label class="agent-mode agent-approval-mode" :title="ch.approvalMode==='ask'?'联网、写入和高风险操作请求批准':ch.approvalMode==='auto'?'自动允许搜索和工作目录内写入，高风险及目录外访问仍请求批准':'允许访问互联网和本机文件，操作不再逐次询问'">
-              <select v-model="ch.approvalMode" aria-label="任务权限" :disabled="locked"><option value="ask">请求批准</option><option value="auto">帮我批准</option><option value="full">完全访问</option></select>
-            </label>
+            <ChatPermissionSelect v-model="ch.approvalMode" :disabled="locked"/>
             <button ref="settingsTrigger" type="button" class="agent-settings-trigger" title="会话设置" aria-label="会话设置" @click="openConversationSettings"><Setting/></button>
-            <select v-model="ch.model" class="agent-model-select" :disabled="locked" :title="ch.model" aria-label="会话模型"><option v-if="!ch.serverModels.length" value="">选择模型</option><option v-for="item in ch.serverModels" :key="item.instanceId||item.id" :value="item.instanceId||item.id">{{item.name||item.id}}</option></select>
+            <ChatComposerSelect v-model="ch.model" class="conversation-model-select" :models="ch.serverModels" :disabled="locked" @manage="emit('models')"/>
           </div><button v-if="ch.sending" type="button" class="agent-primary stop-button" title="停止" aria-label="停止生成" @click="ch.stop"><VideoPause/></button><button v-else class="agent-primary send-button" title="发送" aria-label="发送消息" :disabled="!ch.canSend"><ArrowUp/></button></footer>
         </form>
       </div>
@@ -114,6 +121,7 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
 <style scoped src="./studio-agent.css"></style>
 <style scoped src="./studio-workspace.css"></style>
 <style scoped>
+.agent-prompt-options>.conversation-model-select{margin-left:auto;flex:0 1 220px;min-width:0}.conversation-model-select{max-width:220px}@container studio (max-width:650px){.conversation-model-select{max-width:150px}}
 .agent-history>.chat-sidebar-footer{padding:8px 0 0;border-top:1px solid var(--s-border);flex:none}
 .chat-settings-button{display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;border:0;border-radius:8px;background:transparent;color:var(--s-text);font-size:13px;text-align:left}
 .chat-settings-button:hover{background:var(--s-accent-soft)}

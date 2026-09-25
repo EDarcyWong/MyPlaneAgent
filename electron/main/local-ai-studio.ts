@@ -112,6 +112,7 @@ import { LocalAgentService } from "./agent/service.js";
 import { PythonToolRuntime } from "./agent/python.js";
 import { AgentToolStore } from "./agent/tool-store.js";
 import { AgentWorkspace } from "./agent/workspace.js";
+import {readGitContext,formatGitContext} from './agent/git-context.js';
 import type {
   AgentMode,
   AgentApprovalMode,
@@ -1564,7 +1565,7 @@ export class LocalAiStudioService extends LocalAiService {
       requestId,
       compactOnly,
       {
-        workspace, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled,
+        workspace, initializeLocalGit: !!grant || !!project, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled,
         approvalMode: session.approvalMode || 'ask',
         approve: activity => new Promise<boolean>(resolve => {
           if (sender.isDestroyed() || controller.signal.aborted) { resolve(false); return }
@@ -1586,7 +1587,7 @@ export class LocalAiStudioService extends LocalAiService {
   private chatHistory(session: StudioSession): ContextMessage[] {
     return session.messages.map((item) => ({
       role: item.role,
-      content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(activity => ({...activity, output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
+      content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(({fileChanges: _fileChanges,...activity}) => ({...activity, output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
     }));
   }
   private chatSystem(session: StudioSession): ContextMessage[] {
@@ -1618,6 +1619,7 @@ export class LocalAiStudioService extends LocalAiService {
     requestId: string,
     force = false,
     aggressive = false,
+    gitWorkspace?: string,
   ): Promise<ContextMessage[]> {
     const history = this.chatHistory(session),
       system = this.chatSystem(session),
@@ -1646,6 +1648,7 @@ export class LocalAiStudioService extends LocalAiService {
           signal,
           force,
           aggressive,
+          evidence:gitWorkspace?formatGitContext(await readGitContext(gitWorkspace,signal),settings.contextLength):undefined,
           summarize: async (messages, maxTokens) => {
             session.usage!.requests++;
             let previous: TokenUsage | undefined;
@@ -1692,7 +1695,7 @@ export class LocalAiStudioService extends LocalAiService {
       } catch (error) {
         if (error instanceof ModelContextCapacityError && error.capacity < settings.contextLength && !signal.aborted) {
           Object.assign(settings, inferenceBudget({ ...settings, contextLength: error.capacity }));
-          return this.prepareChatContext(session, service, settings, signal, emit, requestId, true, true);
+          return this.prepareChatContext(session, service, settings, signal, emit, requestId, true, true, gitWorkspace);
         }
         session.context = {
           ...before,
@@ -1719,7 +1722,7 @@ export class LocalAiStudioService extends LocalAiService {
     emit: (event: StudioEvent) => void,
     requestId: string,
     compactOnly = false,
-    toolOptions?: Pick<ChatRunOptions, 'workspace'|'filesEnabled'|'webEnabled'|'approvalMode'|'approve'>,
+    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'approvalMode'|'approve'>,
   ) {
     const started = Date.now(),
       answer: StudioMessage = {
@@ -1762,6 +1765,8 @@ export class LocalAiStudioService extends LocalAiService {
         emit,
         requestId,
         compactOnly,
+        false,
+        toolOptions?.initializeLocalGit?toolOptions.workspace:undefined,
       );
       if (compactOnly) return;
       const core = await this.ensureAgentCore();

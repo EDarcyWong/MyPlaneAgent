@@ -85,7 +85,7 @@ export function recoverContext(history:ContextMessage[],system:ContextMessage[],
 export type Summarize=(messages:ContextMessage[],maxTokens:number)=>Promise<string>
 // Return a new checkpoint only after every bounded summary request succeeds.
 // The caller persists it atomically; full message/event history is never removed.
-export async function compactContext(options:{history:ContextMessage[];system:ContextMessage[];checkpoint?:ContextCheckpoint;budget:ContextBudget;force?:boolean;aggressive?:boolean;signal:AbortSignal;summarize:Summarize}):Promise<ContextCheckpoint|undefined>{
+export async function compactContext(options:{history:ContextMessage[];system:ContextMessage[];checkpoint?:ContextCheckpoint;budget:ContextBudget;force?:boolean;aggressive?:boolean;signal:AbortSignal;summarize:Summarize;evidence?:string}):Promise<ContextCheckpoint|undefined>{
  const {history,system,budget,signal,summarize}=options,previous=checkpointFor(history,options.checkpoint)
  const before=contextStatus(history,system,previous,budget)
  if(!options.force&&!needsCompaction(before))return previous
@@ -112,7 +112,8 @@ export async function compactContext(options:{history:ContextMessage[];system:Co
  while(remaining){
   signal.throwIfAborted()
   if(++rounds>64)throw new Error('历史过长，本次压缩未完成，原始记录与原摘要已保留。请缩小任务或增大模型上下文。')
-  const base:ContextMessage[]=[{role:'system',content:summaryInstruction+` 摘要最多 ${Math.max(32,Math.min(200,Math.floor(summaryTarget/3)))} 字。`},{role:'user',content:'已有摘要：\n'+summary+'\n\n接下来合并历史片段：\n'}]
+  const evidence=options.evidence&&estimateTokens(options.evidence)<=Math.min(640,Math.floor(budget.contextLength*.04))?options.evidence:''
+  const base:ContextMessage[]=[{role:'system',content:summaryInstruction+` 摘要最多 ${Math.max(32,Math.min(200,Math.floor(summaryTarget/3)))} 字。`},{role:'user',content:(evidence?evidence+'\n以上是当前仓库快照，可能包含其他任务的提交；仅辅助核对，不能替代下面的用户要求和执行证据。\n\n':'')+'已有摘要：\n'+summary+'\n\n接下来合并历史片段：\n'}]
   const available=Math.floor(budget.contextLength*.85)-retryOutput-estimateTokens(base)-128
   if(available<128)throw new Error('模型上下文太小，无法安全生成摘要。请增大上下文容量后重试。')
   // Binary search a text chunk that fits the summary request's own context.

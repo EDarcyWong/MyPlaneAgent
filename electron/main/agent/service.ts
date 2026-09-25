@@ -8,6 +8,8 @@ import {randomUUID} from 'node:crypto'
 import {readIntegrationJson,writeIntegrationJson} from '../integration-store.js'
 import type {AgentEvent,AgentTask,AgentTaskSummary,AgentMode,AgentPlanItem,AgentProject,AgentPolicy,AgentApprovalMode,AgentWebAccess,AgentCommandApproval} from '../../shared/local-ai-agent.js'
 import {AgentWorkspace,bounded,integer,object} from './workspace.js'
+import {ensureLocalGitHistory} from './local-git-history.js'
+import {readGitContext,formatGitContext,systemWithGitContext} from './git-context.js'
 import {readTools} from './tools.js'
 import {ToolRegistry,ToolError,builtinSpecs,boundedTool,fingerprint,appendAudit,type ToolDefinition,type ToolSpec} from './registry.js'
 import {requestAgentModel,ModelFormatError,ModelOutputLimitError,type AgentConnection,type AgentMessage,type AgentAnswer} from './model.js'
@@ -20,7 +22,7 @@ import {inspectBuild} from './build-profile.js'
 import {webFetch,webPreview,webSearch} from './web-access.js'
 
 type StoredTask=AgentTask&{messages:AgentMessage[]}
-type Run={inferenceController?:AbortController;owner:number;controller:AbortController;task:StoredTask;emit:(task:AgentTask)=>void;connection?:AgentConnection;pending?:{eventId:string;resolve:(approved:boolean)=>void}}
+type Run={gitEvidence?:string;gitEvidenceKey?:string;inferenceController?:AbortController;owner:number;controller:AbortController;task:StoredTask;emit:(task:AgentTask)=>void;connection?:AgentConnection;pending?:{eventId:string;resolve:(approved:boolean)=>void}}
 const now=()=>new Date().toISOString()
 const modes=new Set(['chat','coding','documents','general'])
 const approvalModes=new Set<AgentApprovalMode>(['ask','auto','full','unrestricted'])
@@ -203,7 +205,7 @@ export class LocalAgentService {
  }
  private public(task:StoredTask):AgentTask{
   const {messages,...view}=task
-  try{view.context={...contextStatus(messages,[{role:'system',content:this.system(task)}],task.checkpoint,{...this.inference(task),overhead:this.definitions(task)}),state:task.context?.state||'ready',message:task.context?.message}}catch{/* History remains readable when the model is offline. */}
+  try{const budget={...this.inference(task),overhead:this.definitions(task)},system=systemWithGitContext(messages,[{role:'system',content:this.system(task)}],task.checkpoint,budget,this.runs.get(task.id)?.gitEvidence||'');view.context={...contextStatus(messages,system,task.checkpoint,budget),state:task.context?.state||'ready',message:task.context?.message}}catch{/* History remains readable when the model is offline. */}
   return structuredClone(view)
  }
  private save(task:StoredTask){this.updateFacts(task);task.updatedAt=now();writeIntegrationJson(this.file(task.id),task)}
@@ -302,12 +304,18 @@ export class LocalAgentService {
  private async prepareContext(task:StoredTask,connection:AgentConnection,signal:AbortSignal,emit:()=>void,force=false,aggressive=false,registry=this.registry(task)){
   const system:AgentMessage[]=[{role:'system',content:this.system(task,connection)}],budget={...connection,overhead:this.definitions(task,registry,connection)}
   const before=contextStatus(task.messages,system,task.checkpoint,budget)
+  const run=this.runs.get(task.id),gitKey=task.events.filter(event=>event.kind==='tool'&&!readTools.has(event.tool||'')).at(-1)?.id||'start'
+  let gitEvidence=run?.gitEvidence||''
+  if(task.projectId&&(force||needsCompaction(before)||run?.gitEvidenceKey!==gitKey)){
+   gitEvidence=formatGitContext(await readGitContext(task.workspace,signal),connection.contextLength)
+   if(run){run.gitEvidence=gitEvidence;run.gitEvidenceKey=gitKey}
+  }
   task.context=before
   if(force||needsCompaction(before)){
    task.context={...before,state:'compacting',message:'正在整理进度摘要…'};emit()
    try{
     let checkpoint:StoredTask['checkpoint'],recovered=false
-    try{checkpoint=await compactContext({history:task.messages,system,checkpoint:task.checkpoint,budget,force,aggressive,signal,summarize:async(messages,maxTokens)=>{
+    try{checkpoint=await compactContext({history:task.messages,system,checkpoint:task.checkpoint,budget,force,aggressive,signal,evidence:gitEvidence,summarize:async(messages,maxTokens)=>{
      if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','压缩期间已达到任务 Token 预算，调整预算后可继续');task.usage??={...emptyTokenUsageTotals(),incompleteHistory:true};task.usage.requests++;let reported:TokenUsage|undefined
      const answer=await this.requestModel(task,{...connection,maxTokens},messages as AgentMessage[],signal,{tools:false,summary:true,onUsage:usage=>{updateTokenUsageTotals(task.usage!,reported,usage);reported=usage}})
      return answer.content||''
@@ -322,8 +330,10 @@ export class LocalAgentService {
     try{this.save(task)}catch(error){task.checkpoint=previous;throw error}
    }catch(error){task.context={...before,state:'error',message:signal.aborted?'压缩已停止，原记录已保留':String(error)};try{this.save(task)}finally{emit()}throw error}
   }
+  const contextualSystem=systemWithGitContext(task.messages,system,task.checkpoint,budget,gitEvidence)
+  task.context={...contextStatus(task.messages,contextualSystem,task.checkpoint,budget),message:task.context?.message}
   assertContextFits(task.context);emit()
-  return contextMessages(task.messages,system,task.checkpoint) as AgentMessage[]
+  return contextMessages(task.messages,contextualSystem,task.checkpoint) as AgentMessage[]
  }
  private system(task:AgentTask,baseConnection=this.connection()){
   const lastTool=[...task.events].reverse().find(event=>event.kind==='tool')
@@ -385,6 +395,11 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
   let definitions=this.definitions(task,registry,connection);task.toolSnapshot=definitions===false?[]:registry.snapshot().filter(item=>definitions!==false&&definitions.some(definition=>definition.function.name===item.name));this.publish(run)
   try{
    const stepLimit=task.maxSteps||AGENT_EMERGENCY_MAX_STEPS
+   signal.throwIfAborted()
+   if(task.projectId){
+    const warning=await ensureLocalGitHistory(workspace.root)
+    if(warning){task.events.push({id:randomUUID(),kind:'assistant',text:warning,createdAt:now()});this.publish(run)}
+   }
    for(let step=0;step<stepLimit;step++){
     this.applySteering(task)
     signal.throwIfAborted();if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','已达到任务 Token 预算，调整预算后可继续');definitions=this.definitions(task,registry,connection)

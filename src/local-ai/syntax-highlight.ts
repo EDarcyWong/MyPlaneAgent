@@ -27,7 +27,7 @@ export function syntaxLanguage(value=''){
  return syntaxAliases[extension]||extension||'text'
 }
 const escapeHtml=(value:string)=>value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
-const token=(kind:string,value:string)=>`<span class="tok-${kind}">${escapeHtml(value)}</span>`
+const token=(kind:string,value:string)=>value.split('\n').map(line=>`<span class="tok-${kind}">${escapeHtml(line)}</span>`).join('\n')
 function markup(code:string){
  const pattern=/(<!--[\s\S]*?-->)|(<\/?)([A-Za-z][\w:-]*)|([\w:-]+)(\s*=\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g
  let html='',last=0

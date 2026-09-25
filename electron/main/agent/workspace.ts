@@ -9,6 +9,7 @@ import type {FileExpectation} from '../../shared/agent-execution.js'
 import {executeProcess} from './execution-supervisor.js'
 import {inspectBuild,prepareBuild} from './build-profile.js'
 import {analyzeTestResult} from './test-analysis.js'
+import {withLocalGitHistory} from './local-git-history.js'
 
 const ignored=new Set(['.git','node_modules','dist','dist-electron','release','vendor','.idea','.venv','venv','__pycache__'])
 const secret=(name:string)=>/^\.env(?:\.|$)/i.test(name)&&!/^\.env\.(example|sample|template)$/i.test(name)||/^(\.ssh|\.aws|\.gnupg|credentials(?:\.json)?|id_rsa|id_ed25519)$/i.test(name)||/\.(pem|key|p12|pfx)$/i.test(name)
@@ -60,6 +61,17 @@ export class AgentWorkspace {
   throw new Error(`未知读取工具：${name}`)
  }
  async prepare(name:string,args:Record<string,unknown>,signal:AbortSignal=new AbortController().signal):Promise<PreparedAction>{
+  const prepared=await this.prepareAction(name,args,signal)
+  const paths=prepared.expectedFiles?.map(file=>file.path)
+  if(!paths?.length)return prepared
+  const execute=prepared.execute
+  return {...prepared,execute:async(s,onOutput)=>{
+   s.throwIfAborted()
+   paths.forEach(name=>this.resolve(name,true))
+   return withLocalGitHistory(this.root,paths,()=>execute(s,onOutput))
+  }}
+ }
+ private async prepareAction(name:string,args:Record<string,unknown>,signal:AbortSignal):Promise<PreparedAction>{
   signal.throwIfAborted()
   if(name==='build_project')return prepareBuild(this,args)
   if(name==='apply_patch')return this.patch(args,signal)

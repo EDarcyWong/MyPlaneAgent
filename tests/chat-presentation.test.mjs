@@ -21,6 +21,54 @@ test('timeline keeps chronological progress and resolves latest tool status with
  assert.deepEqual(entries.map(row=>row.id),['p1','a','p2']);assert.equal(entries[1].activity.status,'complete')
  assert.equal(executionEntries(message())[0].activity.id,'a')
 })
+
+test('repeated file edits produce one card with the latest successful operation',()=>{
+ const edits=[
+  activity({id:'write',args:{path:'src/App.vue',content:'original'}}),
+  activity({id:'index',args:{path:'index.html',content:'index'}}),
+  activity({id:'patch',capability:'agent.apply_patch',args:{changes:[{path:'./src/App.vue',before:'original',after:'patched'}]}}),
+  activity({id:'replace',capability:'agent.replace_text',args:{path:'src\\App.vue',oldText:'patched',newText:'latest'}}),
+  activity({id:'failed',status:'error',args:{path:'src/App.vue',content:'failed'}}),
+ ]
+ const artifacts=chatArtifacts([message({toolActivity:edits})])
+ assert.deepEqual(artifacts.map(item=>item.path),['index.html','src\\App.vue'])
+ assert.equal(artifacts[1].activityId,'replace')
+ assert.equal(artifacts[1].before,'patched')
+ assert.equal(artifacts[1].after,'latest')
+ assert.equal(artifacts[1].kind,'diff')
+ assert.match(artifacts[1].note,/文本片段/)
+ assert.equal(executionEntries(message({toolActivity:edits})).length,5)
+})
+
+test('artifact summaries deduplicate across messages but keep distinct directory paths',()=>{
+ const first=message()
+ const second=message({id:'m2',toolActivity:[
+  activity({id:'updated',args:{path:'hello.txt',content:'updated'}}),
+  activity({id:'other',args:{path:'sub/hello.txt',content:'other'}}),
+ ]})
+ const artifacts=chatArtifacts([first,second])
+ assert.deepEqual(artifacts.map(item=>item.path),['hello.txt','sub/hello.txt'])
+ assert.equal(artifacts[0].after,'updated')
+ assert.equal(chatArtifacts([first])[0].after,'hello')
+})
+
+test('full snapshots merge successive edits and preserve newly created file status',()=>{
+ const edits=[activity({id:'create',fileChanges:[{path:'hello.txt',after:'first'}]}),activity({id:'replace',capability:'agent.replace_text',args:{path:'hello.txt',oldText:'first',newText:'final'},fileChanges:[{path:'hello.txt',before:'first',after:'final'}]})]
+ const artifacts=chatArtifacts([message({toolActivity:edits})])
+ assert.equal(artifacts.length,1)
+ assert.equal(artifacts[0].change,'added');assert.equal(artifacts[0].before,undefined)
+ assert.equal(artifacts[0].after,'final');assert.equal(artifacts[0].edits,2)
+ assert.equal(artifacts[0].scope,'file')
+ const modified=chatArtifacts([message({toolActivity:[activity({fileChanges:[{path:'hello.txt',before:'',after:'new'}]})]})])[0]
+ assert.equal(modified.change,'modified')
+})
+
+test('partial snapshots and legacy patch entries retain unique card identities',()=>{
+ const patch=activity({capability:'agent.apply_patch',args:{changes:[{path:'a.ts',before:'old',after:'new'},{path:'b.ts',before:'old',after:'new'}]},fileChanges:[{path:'b.ts',before:'old',after:'new'}]})
+ const artifacts=chatArtifacts([message({toolActivity:[patch]})])
+ assert.equal(artifacts.length,2)
+ assert.equal(new Set(artifacts.map(item=>item.id)).size,2)
+})
 test('nonzero command exit codes are displayed as failures; targets remain literal strings',()=>{
  const command=activity({capability:'agent.run_command',args:{command:'npm test'},output:'{"exitCode":1,"output":"failed"}'})
  assert.equal(toolState(command),'error');assert.equal(toolTarget(command),'npm test')
