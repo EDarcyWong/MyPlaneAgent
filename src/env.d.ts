@@ -1,5 +1,6 @@
+import type {BrowserAction,BrowserState} from '../electron/shared/browser'
 /// <reference types="vite/client" />
-import type {StudioCommands,StudioEvent} from '../electron/shared/local-ai-studio'
+import type {StudioCommands,StudioEvent,AgentCoreUiEvent} from '../electron/shared/local-ai-studio'
 import type {AgentTask} from '../electron/shared/local-ai-agent'
 import type {ApplicationLogAction,ApplicationLogResult} from '../electron/shared/application-log'
 declare global {
@@ -7,9 +8,12 @@ declare global {
   myplane:{
    localAiStudio<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input']):Promise<StudioCommands[K]['output']>
    onLocalAiAgentEvent(callback:(task:AgentTask)=>void):()=>void
+   onAgentCoreEvent(callback:(event:AgentCoreUiEvent)=>void):()=>void
    onLocalAiStudioEvent(callback:(event:StudioEvent)=>void):()=>void
    applicationLogs(action:ApplicationLogAction,limit?:number):Promise<ApplicationLogResult>
    onApplicationLogToggle(callback:()=>void):()=>void
+   browser(action:BrowserAction,value?:string|boolean):Promise<BrowserState>
+   onBrowserState(callback:(state:BrowserState)=>void):()=>void
    openAiLink(url:string):Promise<void>
    openWorkflowEditor(workflowId?:string):Promise<void>
    openHelpDocument(documentId?:'workflow'):Promise<void>

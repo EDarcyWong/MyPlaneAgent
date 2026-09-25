@@ -18,7 +18,8 @@ import type {
   WorkflowNodeRun,
   WorkflowRun,
 } from "../../shared/local-ai-workflow.js";
-import { LocalAgentService } from "./service.js";
+import type { LocalAgentService } from "./service.js";
+import type { CoreWorkflowAdapter } from "./core-workflow-adapter.js";
 import { workflowOutputData } from "../../shared/workflow-inputs.js";
 import { workflowNodeNameError } from "../../shared/workflow-node-names.js";
 import { parseWorkflowAiOutput, workflowAiGeneratedTemplate, assembleWorkflowAiOutput } from "../../shared/workflow-ai-output.js";
@@ -55,7 +56,7 @@ export class WorkflowService {
   private readonly timeouts = new Map<string, ReturnType<typeof setTimeout>>();
   constructor(
     directory: string,
-    private agent: LocalAgentService,
+    private agent: Pick<LocalAgentService, 'start' | 'stop' | 'projects' | 'logModelConversation'> | CoreWorkflowAdapter,
     private log?: (level: "info" | "warn" | "error", message: string) => void,
     private notify?: (title: string, body: string) => void | boolean,
     private currentModel?: () => string | Promise<string>,

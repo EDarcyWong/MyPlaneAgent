@@ -1,7 +1,10 @@
+import {modelFileRole,modelDownloadParts,modelDownloadState} from '../../electron/shared/model-library'
+import type { AgentProject } from '../../electron/shared/local-ai-agent'
 import {deepseekPreset} from '../../electron/shared/local-ai-providers'
 import {computed,nextTick,onBeforeUnmount,onMounted,reactive,ref,watch} from 'vue'
-import {ElMessage,ElMessageBox} from 'element-plus'
-import type {StudioBootstrap,StudioCommands,StudioConnection,StudioDownload,StudioImage,StudioLocalModel,StudioMessage,StudioModelFile,StudioSession,StudioSessionSummary,StudioSettings,StudioSettingsInput} from '../../electron/shared/local-ai-studio'
+import {ElMessage} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
+import type {StudioApprovalMode,StudioToolActivity,StudioBootstrap,StudioCommands,StudioConnection,StudioDownload,StudioImage,StudioLocalModel,StudioMessage,StudioModelFile,StudioSession,StudioSessionSummary,StudioSettings,StudioSettingsInput} from '../../electron/shared/local-ai-studio'
 import type {LocalAiRemoteProfile,RemoteApiFormat} from '../../electron/shared/local-ai'
 import {clipboardImageFiles,readChatImages} from './chat-images'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
@@ -14,10 +17,22 @@ type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:Wor
 
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
- const tab=ref<'agent'|'chat'|'workflow'|'automation'|'discover'|'models'|'server'|'tools'|'settings'>('agent'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
+ const tab=ref<'chat'|'workflow'|'automation'|'discover'|'models'|'server'|'skills'|'mcp'|'settings'>('chat'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
  const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system',appearanceStyle:'minimal'})
  const apiKey=ref(''),hfToken=ref(''),connection=ref<StudioConnection>(),connecting=ref(false),remoteProfiles=ref<LocalAiRemoteProfile[]>([]),sessions=ref<StudioSessionSummary[]>([]),session=ref<StudioSession>(),sessionFilter=ref('')
  const images=ref<StudioImage[]>([]),attaching=ref(false)
+ const chatProjects=ref<AgentProject[]>([])
+ const chatWorkspacePath=computed(()=>chatWorkspace.value?.path||chatProjects.value.find(item=>item.id===session.value?.projectId)?.workspace||'')
+ const webEnabled=ref(true),approvalMode=ref<StudioApprovalMode>('ask'),chatWorkspace=ref<{path:string;token:string}>()
+ const chatApproval=ref<{approvalId:string;activity:StudioToolActivity}>(),approvingChat=ref(false)
+ watch(approvalMode,value=>{if(value==='full')webEnabled.value=true})
+ async function chooseChatWorkspace(){if(sending.value)return;try{const picked=await api('agentCoreChooseWorkspace');if(picked)chatWorkspace.value=picked}catch(cause){report(cause)}}
+ async function approveChat(approved:boolean){
+  const pending=chatApproval.value;if(!pending||approvingChat.value)return
+  approvingChat.value=true
+  try{await api('chatApprove',{requestId:requestId.value,approvalId:pending.approvalId,approved});chatApproval.value=undefined}catch(cause){report(cause)}finally{approvingChat.value=false}
+ }
+
  let composerRevision=0
  const input=ref(''),model=ref(''),systemPrompt=ref(''),pending=ref<StudioMessage>(),requestId=ref(''),scroller=ref<HTMLElement>(),followBottom=ref(true)
  const query=ref(''),format=ref<'gguf'|'all'>('gguf'),sort=ref<'downloads'|'likes'|'lastModified'>('downloads'),searching=ref(false),searched=ref(false),results=ref<StudioDiscoveryModel[]>(builtinCatalog().models),selected=ref<StudioDiscoveryModel|undefined>(results.value[0]),files=ref<StudioModelFile[]>([]),filesBusy=ref(false),fileFilter=ref(''),ggufOnly=ref(true)
@@ -29,21 +44,16 @@ export function useLocalAiStudio(){
  const activeDownloads=computed(()=>downloads.value.filter(item=>['queued','downloading','verifying'].includes(item.status)))
  const totalSize=computed(()=>(data.value?.models||[]).filter(item=>item.exists).reduce((sum,item)=>sum+item.size,0))
  const localModels=computed(()=>(data.value?.models||[]).filter(item=>(showMissing.value||item.exists)&&`${item.file} ${item.repoId}`.toLowerCase().includes(modelFilter.value.toLowerCase())))
- const isVisionProjector=(item:{file:string})=>/^mmproj(?:[-_.].*)?\.gguf$/i.test(item.file.split('/').at(-1)||item.file)
- const localModelKind=(item:StudioLocalModel)=>isVisionProjector(item)?'视觉组件':item.format==='GGUF'?'主模型':item.format
+ const isVisionProjector=(item:{file:string})=>modelFileRole(item.file)==='projector'
+ const localModelKind=(item:StudioLocalModel)=>isVisionProjector(item)?'视觉组件':modelFileRole(item.file)==='shard'?'模型分片':item.format==='GGUF'?'主模型':item.format
  const localModelState=(item:StudioLocalModel)=>!item.exists?'文件缺失':isVisionProjector(item)?'配套组件':runtime.value?.modelId===item.id&&runtime.value.state==='running'?'已加载':runtime.value?.modelId===item.id&&runtime.value.state==='starting'?'加载中':'在硬盘中'
- const canStartLocalModel=(item:StudioLocalModel)=>!!item.exists&&item.format==='GGUF'&&!isVisionProjector(item)&&!sending.value&&!['running','starting','stopping'].includes(runtime.value?.state||'')
+ const canStartLocalModel=(item:StudioLocalModel)=>!!item.exists&&item.format==='GGUF'&&modelFileRole(item.file)==='model'&&!sending.value&&!['running','starting','stopping'].includes(runtime.value?.state||'')
  const visibleSessions=computed(()=>sessions.value.filter(item=>item.title.toLowerCase().includes(sessionFilter.value.toLowerCase())))
  const visibleFiles=computed(()=>files.value.filter(item=>(!ggufOnly.value||item.format==='GGUF')&&item.file.toLowerCase().includes(fileFilter.value.toLowerCase())))
  const downloadChoices=computed(()=>visibleFiles.value.filter(item=>!/-\d{5}-of-\d{5}\.gguf$/i.test(item.file)||/-00001-of-\d{5}\.gguf$/i.test(item.file)))
  const selectedDownload=computed(()=>downloadChoices.value.find(item=>item.file===selectedFileName.value)||downloadChoices.value.find(item=>item.quantization==='Q4_K_M'&&!/mmproj/i.test(item.file))||downloadChoices.value.find(item=>item.format==='GGUF'&&!/mmproj/i.test(item.file))||downloadChoices.value[0])
- const downloadParts=computed(()=>{
-  const file=selectedDownload.value;if(!file)return []
-  const split=file.file.match(/^(.*)-\d{5}-of-(\d{5})\.gguf$/i),parts=split?files.value.filter(item=>item.file.startsWith(`${split[1]}-`)&&item.file.endsWith(`-of-${split[2]}.gguf`)):[file]
-  const directory=(name:string)=>name.slice(0,name.lastIndexOf('/')+1),isProjector=(name:string)=>/^mmproj(?:[-_.].*)?\.gguf$/i.test(name.split('/').at(-1)||'')
-  const projectors=files.value.filter(item=>isProjector(item.file)&&directory(item.file)===directory(file.file))
-  return !isProjector(file.file)&&projectors.length===1?[...parts,projectors[0]]:parts
- })
+ const downloadParts=computed(()=>selectedDownload.value?modelDownloadParts(selectedDownload.value,files.value):[])
+ const selectedDownloadState=computed(()=>modelDownloadState(selected.value?.id||'',downloadParts.value,data.value?.models||[],downloads.value))
  const downloadSize=computed(()=>downloadParts.value.every(item=>item.size>0)?downloadParts.value.reduce((sum,item)=>sum+item.size,0):0)
  const modelFormats=computed(()=>[...new Set(files.value.map(item=>item.format).filter(item=>['GGUF','SAFETENSORS','BIN','PT','PTH','ONNX'].includes(item)))])
  const catalogLabel=computed(()=>({live:'Hugging Face 在线',cache:'本地缓存',builtin:'内置精选'}[catalogSource.value]))
@@ -88,10 +98,11 @@ export function useLocalAiStudio(){
  const count=(value:number)=>new Intl.NumberFormat('zh-CN',{notation:'compact',maximumFractionDigits:1}).format(value)
  const percent=(item:StudioDownload)=>item.total?Math.min(100,Math.round(item.received/item.total*100)):0
  const downloadLabel=(status:StudioDownload['status'])=>({queued:'排队中',downloading:'下载中',paused:'已暂停',verifying:'校验中',completed:'已完成',failed:'下载失败',cancelled:'已取消'}[status])
- function fit(size:number){const memory=hardware.value?.freeMemory||0;return !size?'大小未知':size*1.3<memory?'内存参考：较充足':'可能需要更多内存 / GPU'}
+ function fit(size:number){const memory=hardware.value?.freeMemory||0;return !size?'大小未知':!memory?'可用内存未知':size*1.3<memory?'当前可用内存较充足（估算）':'当前可用内存可能不足（估算）'}
  function report(cause:unknown){error.value=String(cause).replace(/^Error: (?:Error invoking remote method '[^']+': Error: )?/,'')}
  async function run(label:string,work:()=>Promise<void>){if(busy.value)return;busy.value=label;error.value='';try{await work()}catch(cause){report(cause)}finally{busy.value=''}}
- async function scroll(force=false){await nextTick();const el=scroller.value;if(el&&(followBottom.value||force))el.scrollTop=el.scrollHeight}
+ async function scroll(force=false){await nextTick();const el=scroller.value;if(el&&(followBottom.value||force)){if(force)el.scrollTo({top:el.scrollHeight,behavior:'instant'});else el.scrollTop=el.scrollHeight}}
+ watch(scroller,element=>{if(element)void scroll(true)},{flush:'post'})
  function trackScroll(){const el=scroller.value;if(el)followBottom.value=el.scrollHeight-el.clientHeight-el.scrollTop<100}
  async function refreshModels(){
   if(!data.value||modelsBusy.value)return
@@ -102,9 +113,38 @@ export function useLocalAiStudio(){
  watch([tab,ready],()=>{if((tab.value==='models'||tab.value==='workflow')&&ready.value)void refreshModels().catch(report)})
  async function refreshSessions(){sessions.value=await api('sessions')}
  function activeServiceModel(){return settings.source==='external'?settings.model:runtime.value?.state==='running'?runtime.value.modelName:''}
- function hydrate(next:StudioSession){composerRevision++;images.value=[];session.value=next;model.value=activeServiceModel()||next.model||serverModels.value[0]?.id||'';systemPrompt.value=next.systemPrompt;input.value='';pending.value=undefined;followBottom.value=true;void scroll(true)}
- async function openSession(id:string){if(sending.value||sessionBusy.value)return;sessionBusy.value=true;try{hydrate(await api('session',{id}));tab.value='chat'}catch(cause){report(cause)}finally{sessionBusy.value=false}}
- async function newSession(){if(sending.value||sessionBusy.value)return;sessionBusy.value=true;try{hydrate(await api('newSession'));await refreshSessions();tab.value='chat'}catch(cause){report(cause)}finally{sessionBusy.value=false}}
+ function hydrate(next:StudioSession){composerRevision++;images.value=[];session.value=next;chatWorkspace.value=undefined;webEnabled.value=next.webEnabled!==false;approvalMode.value=next.approvalMode||'ask';chatApproval.value=undefined;model.value=activeServiceModel()||next.model||serverModels.value[0]?.id||'';systemPrompt.value=next.systemPrompt;input.value='';pending.value=undefined;followBottom.value=true;void scroll(true)}
+ async function openSession(id:string){if(sending.value||sessionBusy.value)return;sessionBusy.value=true;try{hydrate(await api('session',{id}))}catch(cause){report(cause)}finally{sessionBusy.value=false}}
+ async function newSession(projectId?:string){
+  if(sending.value||sessionBusy.value)return
+  // Reuse the open empty conversation, preserving its draft and workspace.
+  // An explicit different project still needs its own conversation.
+  if(session.value&&!session.value.messages.length&&(!projectId||session.value.projectId===projectId))return
+  sessionBusy.value=true
+  try{hydrate(await api('newSession',projectId?{projectId}:undefined));await refreshSessions()}
+  catch(cause){report(cause)}finally{sessionBusy.value=false}
+ }
+ async function refreshChatProjects(){try{chatProjects.value=await api('agentProjects')}catch(cause){report(cause)}}
+ async function organizeSession(item:StudioSessionSummary,changes:{pinned?:boolean;projectId?:string}){
+  if(sending.value||sessionBusy.value)return
+  sessionBusy.value=true
+  try{
+   const updated=await api('updateSession',{id:item.id,...changes})
+   if(changes.pinned!==undefined&&updated.pinned!==changes.pinned)throw new Error('置顶功能需要重启应用主进程后生效')
+   if(session.value?.id===item.id){session.value.pinned=updated.pinned;session.value.projectId=updated.projectId;if(changes.projectId!==undefined)chatWorkspace.value=undefined}
+   await refreshSessions()
+  }catch(cause){report(cause)}finally{sessionBusy.value=false}
+ }
+ async function createChatProject(){
+  if(sending.value||sessionBusy.value)return
+  try{
+   const directory=await api('agentCoreChooseWorkspace');if(!directory)return
+   const result=await ElMessageBox.prompt('为项目取一个名称','新建项目',{inputValue:directory.path.split(/[\\/]/).filter(Boolean).pop()||'新项目',inputValidator:value=>!!value?.trim()||'请输入项目名称'})
+   const project=await api('agentCreateProject',{workspaceToken:directory.token,name:result.value.trim()})
+   await refreshChatProjects();await newSession(project.id)
+  }catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}
+ }
+ watch(tab,value=>{if(value==='chat'&&ready.value)void refreshChatProjects()})
  async function renameSession(item:StudioSessionSummary){if(sending.value)return;try{const result=await ElMessageBox.prompt('为这段对话取一个名字','重命名对话',{inputValue:item.title,inputValidator:value=>!!value?.trim()||'请输入名称'});await api('updateSession',{id:item.id,title:result.value});if(session.value?.id===item.id)session.value.title=result.value;await refreshSessions()}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function deleteSession(item:StudioSessionSummary){if(sending.value)return;try{await ElMessageBox.confirm(`删除“${item.title}”？此操作不会删除模型。`,'删除对话',{type:'warning'});await api('deleteSession',{id:item.id});await refreshSessions();if(session.value?.id===item.id){session.value=undefined;if(sessions.value[0])await openSession(sessions.value[0].id);else await newSession()}}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function saveSettings(testConnection=false){let savedSuccessfully=false;await run('save',async()=>{const payload:StudioSettingsInput={...settings,...(apiKey.value?{apiKey:apiKey.value}:{}),...(hfToken.value?{hfToken:hfToken.value}:{})};const saved=await api('settings',payload);Object.assign(settings,saved);apiKey.value='';hfToken.value='';if(saved.source==='external')remoteProfiles.value=await api('remoteProfiles');ElMessage.success('设置已保存');connection.value=undefined;model.value=saved.model;if(testConnection)await connect();savedSuccessfully=true});return savedSuccessfully}
@@ -185,6 +225,7 @@ export function useLocalAiStudio(){
  async function importModels(){await run('import',async()=>{if(data.value)data.value.models=await api('importModels')})}
  async function removeModel(item:StudioLocalModel,deleteFile=false){try{await ElMessageBox.confirm(deleteFile?`永久删除文件 ${item.file}？`:`从模型库移除 ${item.file}？原文件会保留；如果文件位于设置的下载目录中，下次扫描时会重新出现在列表中。`,deleteFile?'删除模型文件':'移除模型记录',{type:'warning'});if(data.value)data.value.models=await api('removeModel',{id:item.id,deleteFile})}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function startModel(item:StudioLocalModel){
+  if(modelFileRole(item.file)==='shard'){await showServiceStartError('请选择该模型的第一个分片（00001）启动，其余分片会自动读取。');return}
   if(isVisionProjector(item)){await showServiceStartError('视觉组件不能单独运行。请加载同目录里的主模型，它会自动配套使用这个 mmproj 文件。');return}
   if(!settings.runtimePath){tab.value='server';await showServiceStartError('未配置 llama-server。请在“模型服务 > 本地服务 > 运行时”中查找或安装运行时，再启动模型服务。');return}
   if(busy.value)return
@@ -214,6 +255,7 @@ export function useLocalAiStudio(){
  function removeImage(index:number){if(!attaching.value)images.value.splice(index,1)}
  async function send(regenerate=false,submission?:{text:string;images:StudioImage[]}){
   if(sending.value||attaching.value||sessionBusy.value||(!regenerate&&!submission&&!canSend.value))return false
+  if((webEnabled.value||chatWorkspace.value||approvalMode.value==='full')&&data.value?.chatToolsSupported!==true){report('联网与工具调用需要重启应用主进程后生效；消息草稿已保留。');return false}
   const text=(submission?.text??input.value).trim(),attachments=regenerate?[]:(submission?.images??images.value).map(image=>({name:image.name,dataUrl:image.dataUrl}))
   if(attachments.length&&data.value?.chatImagesSupported!==true){report('图片发送功能需要重启 MyPlane 后生效；图片草稿已保留，请重启后重新粘贴发送。');return}
   if(!session.value){await newSession();if(!session.value)return}
@@ -224,7 +266,7 @@ export function useLocalAiStudio(){
    requestId.value=id
    if(regenerate){if(session.value.messages.at(-1)?.role==='assistant')session.value.messages.pop()}else{session.value.messages.push({id:crypto.randomUUID(),role:'user',content:text,...(attachments.length?{images:attachments}:{}),createdAt:new Date().toISOString()});if(!submission){input.value='';images.value=[]}}
    pending.value={id,role:'assistant',content:'',reasoning:'',model:model.value,createdAt:new Date().toISOString()};followBottom.value=true;void scroll(true)
-   await api('chat',{sessionId:target.id,requestId:id,text,images:attachments,model:model.value,regenerate});return true
+   await api('chat',{sessionId:target.id,requestId:id,text,images:attachments,model:model.value,regenerate,webEnabled:webEnabled.value,approvalMode:approvalMode.value,workspaceToken:chatWorkspace.value?.token});return true
   }catch(cause){requestId.value='';pending.value=undefined;report(cause);try{session.value=await api('session',{id:target.id})}catch{}if(!regenerate&&!submission&&!input.value&&!images.value.length){input.value=text;images.value=attachments}return false}
  }
  async function compactSession(){
@@ -238,7 +280,7 @@ export function useLocalAiStudio(){
  async function stop(){if(requestId.value)try{await api('stopChat',{requestId:requestId.value})}catch(cause){report(cause)}}
  function composerKey(event:KeyboardEvent){if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();void send()}}
  async function copy(value:string){try{await navigator.clipboard.writeText(value);ElMessage.success('已复制')}catch(cause){report(cause)}}
- async function exportSession(){if(session.value)await run('export',async()=>{if(await api('exportSession',{id:session.value!.id}))ElMessage.success('会话已导出')})}
+ async function exportSession(format:'md'|'pdf'|'json'='md'){if(session.value)await run('export',async()=>{if(await api('exportSession',{id:session.value!.id,format}))ElMessage.success('会话已导出')})}
  async function reveal(item:StudioLocalModel){try{await api('revealModel',{id:item.id})}catch(cause){report(cause)}}
  async function openLink(url:string){try{await window.myplane.openAiLink(url)}catch(cause){report(cause)}}
  async function poll(){
@@ -246,13 +288,17 @@ export function useLocalAiStudio(){
  }
  onMounted(async()=>{
   try{
-   unlisten=window.myplane.onLocalAiStudioEvent(event=>{if(event.requestId!==requestId.value)return;if(event.type==='context'){if(session.value){session.value.context=event.context;if(event.sessionUsage)session.value.usage=event.sessionUsage}}else if(event.type==='delta'){if(event.sessionUsage&&session.value)session.value.usage=event.sessionUsage;if(pending.value){if(event.usage){pending.value.usage=event.usage;pending.value.tokens=event.usage.outputTokens}pending.value.content+=event.content;pending.value.reasoning=(pending.value.reasoning||'')+event.reasoning};void scroll()}else{session.value=event.session;pending.value=undefined;requestId.value='';if(event.error)error.value=event.error;void refreshSessions().catch(report);void scroll()}})
+   unlisten=window.myplane.onLocalAiStudioEvent(event=>{if(event.requestId!==requestId.value)return;if(event.type==='progress'){if(pending.value){pending.value.execution??=[];pending.value.execution.push(event.entry)}void scroll()}else if(event.type==='outcome'){if(pending.value)pending.value.outcome=event.outcome}else if(event.type==='approval'){chatApproval.value={approvalId:event.approvalId,activity:event.activity}}else if(event.type==='tool'){
+    if(pending.value){pending.value.toolActivity??=[];const index=pending.value.toolActivity.findIndex(item=>item.id===event.activity.id);if(index>=0)pending.value.toolActivity[index]=event.activity;else {pending.value.toolActivity.push(event.activity);pending.value.execution??=[];pending.value.execution.push({id:event.activity.id,type:'tool',activityId:event.activity.id,createdAt:new Date().toISOString()})}}
+    if(chatApproval.value?.activity.id===event.activity.id&&event.activity.status!=='waiting')chatApproval.value=undefined
+    void scroll()
+   }else if(event.type==='context'){if(session.value){session.value.context=event.context;if(event.sessionUsage)session.value.usage=event.sessionUsage}}else if(event.type==='delta'){if(event.sessionUsage&&session.value)session.value.usage=event.sessionUsage;if(pending.value){if(event.usage){pending.value.usage=event.usage;pending.value.tokens=event.usage.outputTokens}pending.value.content+=event.content;pending.value.reasoning=(pending.value.reasoning||'')+event.reasoning};void scroll()}else{chatApproval.value=undefined;session.value=event.session;pending.value=undefined;requestId.value='';if(event.error&&!event.session.messages.at(-1)?.error)error.value=event.error;void refreshSessions().catch(report);void scroll()}})
    data.value=await api('bootstrap');Object.assign(settings,data.value.settings);sessions.value=data.value.sessions;model.value=settings.model;remoteProfiles.value=await api('remoteProfiles')
    if(sessions.value[0])hydrate(await api('session',{id:sessions.value[0].id}));else hydrate(await api('newSession'))
-   await refreshSessions();ready.value=true;void poll()
+   await refreshChatProjects();await refreshSessions();ready.value=true;void poll()
    if(settings.source==='external'||runtime.value?.state==='running')void connect(true)
   }catch(cause){report(cause)}
  })
  onBeforeUnmount(()=>{disposed=true;clearTimeout(pollTimer);unlisten?.();if(requestId.value)void api('stopChat',{requestId:requestId.value}).catch(()=>{})})
- return {modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
+ return {chatProjects,chatWorkspacePath,refreshChatProjects,organizeSession,createChatProject,webEnabled,approvalMode,chatWorkspace,chooseChatWorkspace,chatApproval,approvingChat,approveChat,modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
 }

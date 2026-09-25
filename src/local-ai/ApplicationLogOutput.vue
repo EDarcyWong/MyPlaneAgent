@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue'
 import {Close,CopyDocument,Delete,FolderOpened,FullScreen,Refresh,ScaleToOriginal,Search,VideoPause,VideoPlay} from '@element-plus/icons-vue'
-import {ElMessage,ElMessageBox} from 'element-plus'
+import {ElMessage} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import type {ApplicationLogEntry,ApplicationLogLevel} from '../../electron/shared/application-log'
 
 const emit=defineEmits<{close:[]}>()

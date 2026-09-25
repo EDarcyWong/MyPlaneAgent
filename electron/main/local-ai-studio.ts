@@ -1,3 +1,8 @@
+import {registerBrowserPlugin} from './browser-plugin.js';
+import {sessionPdf} from './session-pdf.js';
+import {validBackgroundImage,backgroundOpacity} from '../shared/app-background.js';
+import { modelCapacity, ModelContextCapacityError } from './agent/model-budget.js';
+import type { ChatRunOptions } from './agent/core/chat-runner.js';
 import { workflowValidationMessage } from "../shared/workflow-validation.js";
 import {
   compactContext,
@@ -37,10 +42,12 @@ import {
   realpathSync,
   unlinkSync,
   writeFileSync,
+  cpSync,
 } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { LocalAiService } from "./local-ai.js";
 import { LocalAiDownloads } from "./local-ai-downloads.js";
 import { LocalAiRuntime } from "./local-ai-runtime.js";
@@ -119,9 +126,12 @@ import {
 import { AutomationService } from "./agent/automation.js";
 import type { AutomationTaskInput } from "../shared/local-ai-automation.js";
 import { WorkflowService } from "./agent/workflow.js";
+import { CoreWorkflowAdapter } from "./agent/core-workflow-adapter.js";
 import type { WorkflowDefinitionInput, WorkflowModelRef } from "../shared/local-ai-workflow.js";
 import { SkillPlatform } from './agent/core/skill-platform.js'
-import { PythonRuntimeManager } from './agent/core/python-runtime-manager.js'
+import { AgentCoreService } from './agent/agent-core-service.js'
+import type { MCPServerConfig } from './agent/core/mcp-client.js'
+import type { AgentTask as CoreAgentTask, AgentEvent as CoreAgentEvent } from '../shared/types/agent.js'
 import { promises as fs } from 'fs'
 
 export type StudioLogSink = (
@@ -190,12 +200,19 @@ export class LocalAiStudioService extends LocalAiService {
   >();
   private readonly agentOwners = new Set<number>();
   private skillPlatform: SkillPlatform | null = null;
-  private runtimeManager: PythonRuntimeManager | null = null;
+  private agentCoreService: AgentCoreService | null = null;
+  private agentCoreReady: Promise<void> | null = null;
+  private readonly coreTaskOwners = new Map<string, WebContents>();
+  private readonly coreTaskWorkspaces = new Map<string, string>();
+  private readonly chatApprovals = new Map<string, {requestId:string;owner:number;resolve:(approved:boolean)=>void}>();
+  private readonly coreApprovals = new Map<string, { taskId: string; resolve: (approved: boolean) => void }>();
+  private readonly coreMcpFile: string;
+  private deletingPlugin = false;
   private loadingRuntime = false;
   private stoppingServer = false;
   private catalogCache: Record<string, StudioCatalog> = {};
   constructor(
-    dataRoot: string,
+    private readonly dataRoot: string,
     private readonly applicationLog?: StudioLogSink,
   ) {
     const log = applicationLog;
@@ -204,6 +221,7 @@ export class LocalAiStudioService extends LocalAiService {
       log?.(level, "runtime", message),
     );
     this.preferencesFile = path.join(dataRoot, "local-ai-studio-settings.json");
+    this.coreMcpFile = path.join(dataRoot, "agent-core-mcp.json");
     this.sessionsDirectory = path.join(dataRoot, "local-ai-sessions");
     this.preferences = readIntegrationJson<
       Partial<StudioSettings> & { deepseekDefaultsVersion?: number }
@@ -280,9 +298,10 @@ export class LocalAiStudioService extends LocalAiService {
       new Notification({ title, body }).show();
       return true;
     };
+    const workflowAgent = new CoreWorkflowAdapter(() => this.ensureAgentCore(), this.agent, message => log?.("error", "agent-core", message));
     this.workflow = new WorkflowService(
       path.join(dataRoot, "local-ai-workflows"),
-      this.agent,
+      workflowAgent,
       (level, message) => log?.(level, "workflow", message),
       notify,
       async () => {
@@ -312,7 +331,7 @@ export class LocalAiStudioService extends LocalAiService {
     );
     this.automation = new AutomationService(
       path.join(dataRoot, "local-ai-automations"),
-      this.agent,
+      workflowAgent,
       (level, message) => log?.(level, "automation", message),
       notify,
       {
@@ -328,6 +347,7 @@ export class LocalAiStudioService extends LocalAiService {
           this.workflow.cancel(id);
         },
       },
+      true,
     );
     this.modelIcons = new LocalAiModelIcons(
       path.join(dataRoot, "local-ai-model-icons"),
@@ -385,13 +405,96 @@ export class LocalAiStudioService extends LocalAiService {
     );
   }
 
-  private async initializeSkills() {
-    const dataDir = path.join((this as any).directory, 'agent-data')
-    const skillsDir = path.join(dataDir, 'skills')
+  private async compileSkillCode(source: string): Promise<void> {
+    if (!source.trim()) throw new Error('插件 Python 代码不能为空')
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(process.platform === 'win32' ? 'python' : 'python3',
+        ['-c', 'import ast,sys; ast.parse(sys.stdin.read(), filename="index.py")'],
+        { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+      let stderr = ''
+      const timer = setTimeout(() => child.kill(), 10000)
+      child.stderr.on('data', chunk => { stderr += String(chunk).slice(0, 4000) })
+      child.on('error', error => { clearTimeout(timer); reject(error) })
+      child.on('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(stderr.trim() || '插件编译失败')) })
+      child.stdin.end(source)
+    })
+  }
 
-    this.runtimeManager = new PythonRuntimeManager(dataDir)
-    this.skillPlatform = new SkillPlatform(skillsDir, this.runtimeManager)
-    await this.skillPlatform.initialize()
+  private async initializeSkills() {
+    await this.ensureAgentCore()
+  }
+
+  private async ensureAgentCore(): Promise<AgentCoreService> {
+    if (!this.agentCoreReady) {
+      this.agentCoreReady = (async () => {
+        const dataDir = path.join(this.dataRoot, 'agent-data')
+        const skillsDir = path.join(dataDir, 'skills')
+        const removedPlugins = new Set(readIntegrationJson<string[]>(path.join(dataDir,'removed-plugins.json'), []))
+        await fs.mkdir(skillsDir, { recursive: true })
+        const bundledSkills = app.isPackaged
+          ? path.join(process.resourcesPath, 'skills')
+          : path.join(app.getAppPath(), 'skills')
+        if (existsSync(bundledSkills)) {
+          for (const entry of readdirSync(bundledSkills, { withFileTypes: true })) {
+            if (removedPlugins.has(entry.name) || !entry.isDirectory() || !existsSync(path.join(bundledSkills, entry.name, 'skill.json'))) continue
+            const destination = path.join(skillsDir, entry.name)
+            if (!existsSync(destination)) cpSync(path.join(bundledSkills, entry.name), destination, { recursive: true })
+            else if (entry.name === 'agent-tools') {
+              // Upgrade the known shipped runtime while preserving user-edited Skill code.
+              const entryPath = path.join(destination, 'index.py');
+              if (existsSync(entryPath) && createHash('sha256').update(readFileSync(entryPath)).digest('hex') === '97b5a11b0df3579bdcb3ef5e221b3ad38c8197dc737032242e2c561eeab86f22')
+                cpSync(path.join(bundledSkills, entry.name, 'index.py'), entryPath);
+            }
+          }
+        }
+        // Import user-created tools from the old tool store as editable Skills.
+        for (const tool of this.toolStore.list().filter(item => !item.archived && (!item.builtin || item.current.python !== `def execute(args, context):\n    return builtin(${JSON.stringify(item.key)}, args, context)\n`))) {
+          const skillId = `migrated-${tool.id.toLowerCase()}`
+          if(removedPlugins.has(skillId))continue
+          const destination = path.join(skillsDir, skillId)
+          if (existsSync(destination)) continue // Preserve edits made in the Skill editor.
+          await fs.mkdir(destination, { recursive: true })
+          const toolName = tool.key.replace(/-/g, '_')
+          const manifest = {
+            id: skillId, name: tool.current.name, version: `1.0.${tool.activeVersion}`,
+            category: 'custom', description: tool.current.description, enabled: tool.enabled,
+            runtime: { type: 'python', version: '>=3.9', entry: 'index.py', venv: false },
+            capabilities: { tools: [{ name: toolName, description: tool.current.description, parameters: tool.current.parameters, risk: tool.current.risk }] },
+            permissions: { fileSystem: { read: ['**/*'], write: ['**/*'] }, network: true, process: true },
+            dependencies: { python: [] }
+          }
+          await fs.writeFile(path.join(destination, 'skill.json'), JSON.stringify(manifest, null, 2))
+          await fs.writeFile(path.join(destination, 'index.py'), `import json, pathlib, sys, time\nimport engine\nSOURCE = ${JSON.stringify(tool.current.python)}\ndef main():\n    print('READY', flush=True)\n    for line in sys.stdin:\n        start = time.monotonic()\n        request_id = ''\n        try:\n            request = json.loads(line); request_id = request['id']\n            context = {'workspace': str(pathlib.Path(request['workspace']).resolve(strict=True))}\n            scope = {'__builtins__': __builtins__, 'builtin': engine.builtin, 'json': json, 'pathlib': pathlib}\n            exec(compile(SOURCE, 'index.py', 'exec'), scope)\n            output = scope['execute'](request.get('args', {}), context)\n            if isinstance(output, str):\n                try: output = json.loads(output)\n                except ValueError: pass\n            response = {'type':'response','id':request_id,'output':output,'elapsedMs':int((time.monotonic()-start)*1000)}\n        except Exception as error:\n            response = {'type':'response','id':request_id,'error':str(error),'elapsedMs':int((time.monotonic()-start)*1000)}\n        print(json.dumps(response, ensure_ascii=False), flush=True)\nif __name__ == '__main__': main()\n`)
+          cpSync(path.join(bundledSkills, 'agent-tools', 'engine.py'), path.join(destination, 'engine.py'))
+          await fs.writeFile(path.join(destination, 'README.md'), `从旧工具 ${tool.key} 导入。可在插件编辑器中修改 index.py。`)
+        }
+        const core = new AgentCoreService({
+          dataDir,
+          skillsDir,
+          getConnection: () => this.agentConnection(),
+          diagnosticLog: message => this.applicationLog?.('error', 'agent-core', message)
+        })
+        core.on('error', error => this.applicationLog?.('error', 'agent-core', String(error)))
+        core.on('agent-event', ({ taskId, event }: { taskId: string; event: CoreAgentEvent }) => {
+          const sender = this.coreTaskOwners.get(taskId)
+          if (sender && !sender.isDestroyed()) sender.send('local-ai:agent-core-event', { taskId, event })
+        })
+        this.agentCoreService = core
+        await core.initialize()
+        registerBrowserPlugin(core.getCapabilityRegistry())
+        for (const saved of readIntegrationJson<MCPServerConfig[]>(this.coreMcpFile, [])) {
+          try { await core.addMCPServer(saved) }
+          catch (error) { this.applicationLog?.('warn', 'agent-core-mcp', `${saved.id}: ${String(error)}`) }
+        }
+        this.skillPlatform = core.getSkillPlatform()
+      })().catch(error => {
+        this.agentCoreReady = null
+        this.agentCoreService = null
+        throw error
+      })
+    }
+    await this.agentCoreReady
+    return this.agentCoreService!
   }
 
   studioSettings(): StudioSettings {
@@ -425,21 +528,30 @@ export class LocalAiStudioService extends LocalAiService {
       topP: numeric(p.topP, 0.01, 1, 0.95),
       repeatPenalty: numeric(p.repeatPenalty, 0.1, 2, 1.1),
       systemPrompt: textValue(p.systemPrompt, 12000),
+      backgroundImage: validBackgroundImage(p.backgroundImage) ? p.backgroundImage : '',
+      backgroundOpacity: backgroundOpacity(p.backgroundOpacity),
       theme: p.theme === "light" || p.theme === "dark" ? p.theme : "system",
       appearanceStyle: ["ocean", "paper", "terminal"].includes(p.appearanceStyle || "")
         ? p.appearanceStyle as StudioSettings["appearanceStyle"]
         : "minimal",
     };
   }
-  private inferenceSettings(): StudioSettings {
+  private inferenceSettings(model?: string): StudioSettings {
     const settings = this.studioSettings(),
       runtime = this.runtime.snapshot();
-    const contextLength =
+    let contextLength =
       settings.source === "managed" &&
       runtime.contextLength &&
       ["running", "starting"].includes(runtime.state)
         ? Math.floor(runtime.contextLength / Math.max(1, runtime.parallel || 1))
         : settings.contextLength;
+    const selected = model || settings.model;
+    if (settings.source === 'external' && selected) {
+      const cached = this.remoteModelCache().find(row => row.apiFormat === settings.apiFormat && row.endpoint.replace(/\/$/, '') === settings.endpoint.replace(/\/$/, ''))
+        ?.models.find(item => item.id === selected || item.instanceId === selected);
+      if (cached?.contextLength && Number.isFinite(cached.contextLength)) contextLength = Math.min(contextLength, cached.contextLength);
+      contextLength = modelCapacity({endpoint:settings.endpoint,apiFormat:settings.apiFormat,key:'',maxTokens:settings.maxTokens,contextLength}, selected);
+    }
     return inferenceBudget({ ...settings, contextLength });
   }
   saveStudioSettings(input: unknown) {
@@ -467,6 +579,9 @@ export class LocalAiStudioService extends LocalAiService {
           value.runtimePath !== previous.runtimePath))
     )
       throw new Error("请先卸载模型再修改运行文件或端口");
+    if (value.backgroundImage !== undefined && value.backgroundImage !== '' && !validBackgroundImage(value.backgroundImage))
+      throw new Error('背景图片格式无效或文件过大');
+    if (value.backgroundOpacity !== undefined) value.backgroundOpacity = backgroundOpacity(value.backgroundOpacity);
     super.saveSettings(value);
     const keys = [
       "source",
@@ -481,6 +596,8 @@ export class LocalAiStudioService extends LocalAiService {
       "systemPrompt",
       "theme",
       "appearanceStyle",
+      "backgroundImage",
+      "backgroundOpacity",
     ] as const;
     const candidate = { ...this.preferences };
     for (const key of keys)
@@ -510,6 +627,7 @@ export class LocalAiStudioService extends LocalAiService {
   bootstrap(): StudioBootstrap {
     return {
       chatImagesSupported: true,
+      chatToolsSupported: true,
       ...this.snapshot(),
       settings: this.studioSettings(),
       models: this.models(),
@@ -737,7 +855,7 @@ export class LocalAiStudioService extends LocalAiService {
             name: String(item.display_name || item.id),
             loaded: undefined as boolean | undefined,
             instanceId: undefined as string | undefined,
-            contextLength: undefined as number | undefined,
+            contextLength: Number(item.context_length || item.max_model_len || item.max_context_length) || undefined,
           })),
         provider: StudioConnection["provider"] =
           service.apiFormat === "anthropic"
@@ -1290,13 +1408,16 @@ export class LocalAiStudioService extends LocalAiService {
     };
     return session;
   }
-  newSession() {
+  newSession(projectId?: string) {
+    if (projectId && !this.agent.projects().some(project => project.id === projectId)) throw new Error("项目不存在");
     const settings = this.studioSettings(),
       now = new Date().toISOString();
     return this.saveSession({
       usage: emptyTokenUsageTotals(),
+      webEnabled: true,
       id: randomUUID(),
       title: "新对话",
+      ...(projectId ? {projectId} : {}),
       model:
         settings.source === "managed"
           ? this.runtime.snapshot().modelName
@@ -1313,6 +1434,10 @@ export class LocalAiStudioService extends LocalAiService {
     if ([...this.chats.values()].some((item) => item.sessionId === id))
       throw new Error("请先停止生成再修改会话");
     const session = this.session(id);
+    if (value.pinned !== undefined) {
+      if (typeof value.pinned !== "boolean") throw new Error("无效的置顶状态");
+      session.pinned = value.pinned;
+    }
     if (value.projectId !== undefined) {
       const id = textValue(value.projectId);
       if (id && !this.agent.projects().some((project) => project.id === id))
@@ -1346,6 +1471,18 @@ export class LocalAiStudioService extends LocalAiService {
       )
     )
       throw new Error("请先等待当前生成完成");
+    const approvalMode = value.approvalMode ?? session.approvalMode ?? 'ask';
+    if (!['ask', 'auto', 'full'].includes(String(approvalMode))) throw new Error('无效的权限模式');
+    const workspaceToken = textValue(value.workspaceToken);
+    const grant = workspaceToken ? this.agentWorkspaces.get(workspaceToken) : undefined;
+    if (workspaceToken && (!grant || grant.owner !== sender.id)) throw new Error('工作目录授权已失效，请重新选择');
+    const project = session.projectId ? this.agent.projects().find(item => item.id === session.projectId) : undefined;
+    const workspace = grant ? new AgentWorkspace(grant.path).root : project ? new AgentWorkspace(project.workspace).root : os.homedir();
+    if (grant && workspace !== grant.path) throw new Error('工作目录位置已改变，请重新选择');
+    if (!compactOnly) {
+      session.approvalMode = approvalMode as 'ask'|'auto'|'full';
+      session.webEnabled = approvalMode === 'full' || (typeof value.webEnabled === 'boolean' ? value.webEnabled : session.webEnabled !== false);
+    }
     const images =
       compactOnly || value.regenerate === true ? [] : chatImages(value.images);
     const imageChars = [
@@ -1356,7 +1493,7 @@ export class LocalAiStudioService extends LocalAiService {
       throw new Error("当前会话的图片已达到容量上限，请新建对话");
     const model = required(value.model, "模型", 500),
       content = textValue(value.text, 100000).trim(),
-      settings = this.inferenceSettings(),
+      settings = this.inferenceSettings(model),
       service = this.service();
     if (
       settings.source === "managed" &&
@@ -1426,16 +1563,30 @@ export class LocalAiStudioService extends LocalAiService {
       emit,
       requestId,
       compactOnly,
+      {
+        workspace, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled,
+        approvalMode: session.approvalMode || 'ask',
+        approve: activity => new Promise<boolean>(resolve => {
+          if (sender.isDestroyed() || controller.signal.aborted) { resolve(false); return }
+          const approvalId = randomUUID();
+          const finish = (approved:boolean) => { this.chatApprovals.delete(approvalId); controller.signal.removeEventListener('abort', abort); resolve(approved) };
+          const abort = () => finish(false);
+          controller.signal.addEventListener('abort', abort, {once:true});
+          this.chatApprovals.set(approvalId, {requestId, owner:sender.id, resolve:finish});
+          emit({type:'approval', requestId, approvalId, activity});
+        })
+      },
     ).finally(() => {
       sender.removeListener("destroyed", destroyed);
       this.chats.delete(requestId);
+      for (const pending of this.chatApprovals.values()) if (pending.requestId === requestId) pending.resolve(false);
     });
     return { started: true };
   }
   private chatHistory(session: StudioSession): ContextMessage[] {
     return session.messages.map((item) => ({
       role: item.role,
-      content: chatMessageContent(item),
+      content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(activity => ({...activity, output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
     }));
   }
   private chatSystem(session: StudioSession): ContextMessage[] {
@@ -1445,7 +1596,7 @@ export class LocalAiStudioService extends LocalAiService {
   }
   private chatContextStatus(
     session: StudioSession,
-    settings = this.inferenceSettings(),
+    settings = this.inferenceSettings(session.model),
   ) {
     return contextStatus(
       this.chatHistory(session),
@@ -1467,7 +1618,7 @@ export class LocalAiStudioService extends LocalAiService {
     requestId: string,
     force = false,
     aggressive = false,
-  ) {
+  ): Promise<ContextMessage[]> {
     const history = this.chatHistory(session),
       system = this.chatSystem(session),
       before = this.chatContextStatus(session, settings);
@@ -1527,7 +1678,7 @@ export class LocalAiStudioService extends LocalAiService {
         session.context = {
           ...this.chatContextStatus(session, settings),
           message: changed
-            ? "已压缩，可继续"
+            ? checkpoint?.source === "recovery" ? "已使用原始记录摘录恢复上下文，可继续" : "已压缩，可继续"
             : force
               ? "暂无可压缩的旧内容"
               : undefined,
@@ -1539,6 +1690,10 @@ export class LocalAiStudioService extends LocalAiService {
           throw error;
         }
       } catch (error) {
+        if (error instanceof ModelContextCapacityError && error.capacity < settings.contextLength && !signal.aborted) {
+          Object.assign(settings, inferenceBudget({ ...settings, contextLength: error.capacity }));
+          return this.prepareChatContext(session, service, settings, signal, emit, requestId, true, true);
+        }
         session.context = {
           ...before,
           state: "error",
@@ -1564,6 +1719,7 @@ export class LocalAiStudioService extends LocalAiService {
     emit: (event: StudioEvent) => void,
     requestId: string,
     compactOnly = false,
+    toolOptions?: Pick<ChatRunOptions, 'workspace'|'filesEnabled'|'webEnabled'|'approvalMode'|'approve'>,
   ) {
     const started = Date.now(),
       answer: StudioMessage = {
@@ -1608,185 +1764,49 @@ export class LocalAiStudioService extends LocalAiService {
         compactOnly,
       );
       if (compactOnly) return;
-      if (service.apiFormat === "anthropic") {
-        let previous: TokenUsage | undefined;
-        const request = () => {
-          session.usage!.requests++;
-          return requestAgentModel(
-            {
-              ...service,
-              contextLength: settings.contextLength,
-              maxTokens: settings.maxTokens,
-            },
-            session.model,
-            messages as AgentMessage[],
-            signal,
-            {
-              tools: false,
-              onContent: (content) => {
-                answer.content += content;
-                if (
-                  answer.content.length + (answer.reasoning?.length || 0) >
-                  responseCharacterLimit
-                )
-                  throw new Error("输出已达到应用单轮容量");
-                emit({ type: "delta", requestId, content, reasoning: "" });
-                if (Date.now() - lastSave > 2000) {
-                  lastSave = Date.now();
-                  this.saveSession(session);
-                }
-              },
-              onReasoning: (reasoning) => {
-                answer.reasoning = (answer.reasoning || "") + reasoning;
-                if (
-                  answer.content.length + (answer.reasoning?.length || 0) >
-                  responseCharacterLimit
-                )
-                  throw new Error("输出已达到应用单轮容量");
-                emit({ type: "delta", requestId, content: "", reasoning });
-              },
-              onUsage: (usage) => {
-                updateTokenUsageTotals(session.usage!, previous, usage);
-                previous = usage;
-                answer.usage = usage;
-                answer.tokens = usage.outputTokens;
-                emit({
-                  type: "delta",
-                  requestId,
-                  content: "",
-                  reasoning: "",
-                  usage,
-                  sessionUsage: session.usage,
-                });
-              },
-            },
-          );
-        };
-        try {
-          await request();
-        } catch (cause) {
-          if (signal.aborted || !isContextOverflow(cause)) throw cause;
-          const checkpoint = session.checkpoint;
-          messages = await this.prepareChatContext(
-            session,
-            service,
-            settings,
-            signal,
-            emit,
-            requestId,
-            true,
-            true,
-          );
-          if (checkpoint === session.checkpoint) throw cause;
-          previous = undefined;
-          await request();
-        }
-        if (!answer.content && !answer.reasoning)
-          throw new Error("模型没有返回内容");
-        session.messages.push(answer);
-        return;
-      }
-      const request = async () => {
-        session.usage!.requests++;
-        const response = await fetch(`${service.endpoint}/chat/completions`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(service.key ? { Authorization: `Bearer ${service.key}` } : {}),
-          },
-          body: JSON.stringify({
-            model: session.model,
-            messages,
-            stream: true,
-            stream_options: { include_usage: true },
-            max_tokens: settings.maxTokens,
-            temperature: settings.temperature,
-            top_p: settings.topP,
-            ...(isDeepSeek(service.endpoint)
-              ? deepseekThinking(service.endpoint)
-              : { repeat_penalty: settings.repeatPenalty }),
-          }),
-          signal: AbortSignal.any([
-            signal,
-            AbortSignal.timeout(30 * 60 * 1000),
-          ]),
-        });
-        if (!response.ok) await jsonResponse(response);
-        return response;
-      };
-      let response: Response;
-      try {
-        response = await request();
-      } catch (cause) {
-        if (signal.aborted || !isContextOverflow(cause)) throw cause;
-        const previous = session.checkpoint;
-        messages = await this.prepareChatContext(
-          session,
-          service,
-          settings,
-          signal,
-          emit,
-          requestId,
-          true,
-          true,
-        );
-        if (previous === session.checkpoint) throw cause;
-        response = await request();
-      }
+      const core = await this.ensureAgentCore();
+      let previous: TokenUsage | undefined;
+      const answerTotals = emptyTokenUsageTotals();
       session.messages.push(answer);
-      const accept = (data: unknown) => {
-        const value = record(data);
-        if (value.error)
-          throw new Error(
-            textValue(record(value.error).message) || "模型服务返回错误",
-          );
-        const first = record(
-            Array.isArray(value.choices) ? value.choices[0] : undefined,
-          ),
-          delta = record(first.delta ?? first.message);
-        const content = textValue(delta.content, responseCharacterLimit),
-          reasoning = textValue(
-            delta.reasoning_content ?? delta.reasoning,
-            responseCharacterLimit,
-          );
-        answer.content += content;
-        answer.reasoning = (answer.reasoning || "") + reasoning;
-        if (
-          answer.content.length + (answer.reasoning?.length || 0) >
-          responseCharacterLimit
-        )
-          throw new Error("输出已达到应用单轮容量");
-        const reported = readTokenUsage(value);
-        if (reported) {
-          const usage = mergeTokenUsage(answer.usage, reported);
-          updateTokenUsageTotals(session.usage!, answer.usage, usage);
-          answer.usage = usage;
-          answer.tokens = usage.outputTokens;
-        }
-        if (content || reasoning || reported)
-          emit({
-            type: "delta",
-            requestId,
-            content,
-            reasoning,
-            ...(reported
-              ? { usage: answer.usage, sessionUsage: session.usage }
-              : {}),
-          });
-        if (Date.now() - lastSave > 2000) {
-          lastSave = Date.now();
-          this.saveSession(session);
-        }
+      const progress = (text:string, phase:'working'|'reviewing'|'context') => {
+        answer.execution ??= [];
+        const entry = {id:randomUUID(),type:'progress' as const,text:text.slice(0,4000),phase,createdAt:new Date().toISOString()};
+        answer.execution.push(entry);
+        emit({type:'progress',requestId,entry});
       };
-      if (response.headers.get("content-type")?.includes("text/event-stream")) {
-        if (!response.body) throw new Error("响应流为空");
-        for await (const data of sseData(response.body, signal)) {
-          if (data === "[DONE]") break;
-          accept(JSON.parse(data));
+      await core.runConversation({
+        ...toolOptions!, connection: {...service, contextLength:settings.contextLength, maxTokens:settings.maxTokens, localLlama:settings.source === 'managed'},
+        model:session.model, messages:messages as AgentMessage[], signal, temperature:settings.temperature,
+        onProgress: progress,
+        onOutcome: outcome => { answer.outcome = outcome; emit({type:'outcome',requestId,outcome}); },
+        onContext: context => { if(context.state==='compacting')progress('正在整理上下文，保留任务要求与执行记录','context'); session.context = context; emit({type:'context',requestId,context}); },
+        onRequest: () => { previous = undefined; session.usage!.requests++; },
+        onContent: content => {
+          answer.content += content;
+          if (answer.content.length + (answer.reasoning?.length || 0) > responseCharacterLimit) throw new Error('输出已达到应用单轮容量');
+          emit({type:'delta', requestId, content, reasoning:''});
+          if (Date.now() - lastSave > 2000) { lastSave = Date.now(); this.saveSession(session); }
+        },
+        onReasoning: reasoning => { answer.reasoning = (answer.reasoning || '') + reasoning; emit({type:'delta',requestId,content:'',reasoning}); },
+        onUsage: usage => {
+          updateTokenUsageTotals(session.usage!, previous, usage);
+          updateTokenUsageTotals(answerTotals, previous, usage); previous = usage;
+          answer.usage = {inputTokens:answerTotals.inputReports?answerTotals.inputTokens:undefined, outputTokens:answerTotals.outputReports?answerTotals.outputTokens:undefined, totalTokens:answerTotals.totalReports?answerTotals.totalTokens:undefined};
+          answer.tokens = answer.usage.outputTokens;
+          emit({type:'delta',requestId,content:'',reasoning:'',usage:answer.usage,sessionUsage:session.usage});
+        },
+        onActivity: activity => {
+          answer.toolActivity ??= [];
+          const index = answer.toolActivity.findIndex(item => item.id === activity.id);
+          if (index >= 0) answer.toolActivity[index] = activity; else {
+            answer.toolActivity.push(activity);
+            answer.execution ??= [];
+            answer.execution.push({id:activity.id,type:'tool',activityId:activity.id,createdAt:new Date().toISOString()});
+          }
+          emit({type:'tool',requestId,activity}); this.saveSession(session);
         }
-      } else accept(await response.json());
-      if (!answer.content && !answer.reasoning)
-        throw new Error("模型没有返回内容");
+      });
+      if (!answer.content && !answer.reasoning) throw new Error('模型没有返回内容');
     } catch (cause) {
       if (signal.aborted) answer.status = "stopped";
       else {
@@ -1794,12 +1814,16 @@ export class LocalAiStudioService extends LocalAiService {
         error = String(cause);
       }
     } finally {
+      for (const activity of answer.toolActivity || []) if (activity.status === 'waiting' || activity.status === 'running') {
+        activity.status = 'error'; activity.output = signal.aborted ? '操作已停止' : error || '操作未完成';
+      }
+      if(error)answer.error=error;
       answer.elapsedMs = Date.now() - started;
       if (!compactOnly && !session.messages.includes(answer))
         session.messages.push(answer);
       if (session.context?.state !== "error")
         session.context = {
-          ...this.chatContextStatus(session, settings),
+          ...this.chatContextStatus(session, this.inferenceSettings(session.model)),
           message: session.context?.message,
         };
       try {
@@ -2095,6 +2119,9 @@ export class LocalAiStudioService extends LocalAiService {
     const value = record(input),
       owner = BrowserWindow.fromWebContents(event.sender);
     if (!owner) throw new Error("窗口不可用");
+    if (["agentStart", "agentSteer", "agentCompact", "agentApprove", "agentToolsList", "agentToolSave", "agentToolToggle", "agentToolRestore", "agentToolTest"].includes(action)) {
+      throw new Error("旧工具编辑入口已停用，请在插件页面管理工具");
+    }
     switch (action as keyof StudioCommands) {
       case "workflowDefinitions":
         return this.workflow.definitions();
@@ -2487,64 +2514,271 @@ export class LocalAiStudioService extends LocalAiService {
 
       // ============ Skills 管理 ============
 
+      case "agentCoreStatus": {
+        const core = await this.ensureAgentCore()
+        return { enabled: true, available: true, ...core.getStatus() }
+      }
+
+      case "agentCoreChooseWorkspace": {
+        const pick = await dialog.showOpenDialog(owner, {
+          title: "选择 Agent 工作目录",
+          properties: ["openDirectory", "createDirectory"],
+        })
+        if (pick.canceled) return null
+        const workspace = new AgentWorkspace(pick.filePaths[0])
+        const token = randomUUID()
+        this.agentWorkspaces.set(token, { owner: event.sender.id, path: workspace.root })
+        this.trackAgentOwner(event.sender)
+        return { path: workspace.root, token }
+      }
+
+      case "agentCoreListCapabilities": {
+        const core = await this.ensureAgentCore()
+        return core.listCapabilities().map(capability => {
+          const properties = record(capability.parameters.properties)
+          const requiredNames = Array.isArray(capability.parameters.required) ? capability.parameters.required : []
+          return {
+            name: capability.name,
+            category: capability.category,
+            source: capability.source.type,
+            description: capability.description,
+            parameters: Object.entries(properties).map(([name, definition]) => ({
+              name,
+              type: String(record(definition).type || 'any'),
+              required: requiredNames.includes(name),
+              description: typeof record(definition).description === 'string' ? String(record(definition).description) : undefined
+            })),
+            enabled: true,
+            status: 'active' as const
+          }
+        })
+      }
+
+      case "agentCoreRun": {
+        const core = await this.ensureAgentCore()
+        const grant = this.agentWorkspaces.get(required(value.workspaceToken, '工作目录授权'))
+        if (!grant || grant.owner !== event.sender.id) throw new Error('请先选择 Agent 工作目录')
+        const workspace = new AgentWorkspace(grant.path)
+        if (workspace.root !== grant.path) throw new Error('工作目录位置已改变，请重新选择')
+        if ([...this.coreTaskWorkspaces.values()].includes(workspace.root)) throw new Error('此工作目录已有 Agent 任务正在运行')
+        const mode = value.mode
+        if (mode !== 'general' && mode !== 'coding' && mode !== 'documents') throw new Error('无效的 Agent 模式')
+        const model = required(value.model, '模型', 500)
+        const prompt = required(value.prompt, '任务要求', 16000)
+        const taskId = randomUUID()
+        const task: CoreAgentTask = {
+          id: taskId,
+          description: prompt,
+          context: { workspace: workspace.root, userIntent: prompt },
+          createdAt: Date.now()
+        }
+        this.coreTaskOwners.set(taskId, event.sender)
+        this.coreTaskWorkspaces.set(taskId, workspace.root)
+        const sender = event.sender
+        const ownerDestroyed = () => core.cancelTask(taskId)
+        sender.once('destroyed', ownerDestroyed)
+        setImmediate(() => {
+          if (sender.isDestroyed()) {
+            this.coreTaskOwners.delete(taskId)
+            this.coreTaskWorkspaces.delete(taskId)
+            return
+          }
+          void core.runTask(task, { mode, model, approve: (capability, args, signal) => {
+            const approvalId = randomUUID()
+            return new Promise<boolean>(resolve => {
+              if (sender.isDestroyed() || signal.aborted) { resolve(false); return }
+              const abort = () => { this.coreApprovals.delete(approvalId); resolve(false) }
+              signal.addEventListener('abort', abort, { once: true })
+              this.coreApprovals.set(approvalId, { taskId, resolve: approved => { signal.removeEventListener('abort', abort); resolve(approved) } })
+              sender.send('local-ai:agent-core-event', { taskId, approval: { id: approvalId, capability, args } })
+            })
+          } }).then(result => {
+            if (!sender.isDestroyed()) sender.send('local-ai:agent-core-event', { taskId, result })
+          }).catch(error => {
+            if (!sender.isDestroyed()) {
+              sender.send('local-ai:agent-core-event', error instanceof Error && error.name === 'AbortError'
+                ? { taskId, cancelled: true }
+                : { taskId, error: String(error) })
+            }
+          }).finally(() => {
+            for (const [id, approval] of this.coreApprovals) if (approval.taskId === taskId) { this.coreApprovals.delete(id); approval.resolve(false) }
+            sender.removeListener('destroyed', ownerDestroyed)
+            this.coreTaskOwners.delete(taskId)
+            this.coreTaskWorkspaces.delete(taskId)
+          })
+        })
+        return { taskId }
+      }
+
+      case "agentCoreApprove": {
+        const taskId = required(value.taskId, '任务 ID')
+        if (this.coreTaskOwners.get(taskId)?.id !== event.sender.id) throw new Error('任务不存在或不属于当前窗口')
+        const approvalId = required(value.approvalId, '批准 ID')
+        const pending = this.coreApprovals.get(approvalId)
+        if (!pending || pending.taskId !== taskId) throw new Error('批准请求已失效')
+        this.coreApprovals.delete(approvalId)
+        pending.resolve(value.approved === true)
+        return
+      }
+
+      case "agentCoreCancel": {
+        const taskId = required(value.taskId, '任务 ID')
+        if (this.coreTaskOwners.get(taskId)?.id !== event.sender.id) throw new Error('任务不存在或不属于当前窗口')
+        this.agentCoreService?.cancelTask(taskId)
+        return
+      }
+
+      case "agentCoreMcpList": {
+        const core = await this.ensureAgentCore()
+        const connected = new Set(core.getMCPAdapter().listServers().map(server => server.id))
+        return readIntegrationJson<MCPServerConfig[]>(this.coreMcpFile, []).map(server => ({
+          id: server.id, name: server.name, command: server.command, args: server.args || [], connected: connected.has(server.id)
+        }))
+      }
+
+      case "agentCoreMcpAdd": {
+        const core = await this.ensureAgentCore()
+        const id = required(value.id, '服务 ID', 64)
+        if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error('服务 ID 只能包含小写字母、数字和连字符')
+        const command = required(value.command, '可执行文件', 2000)
+        if (!path.isAbsolute(command) || !statSync(command).isFile()) throw new Error('请选择可执行文件的绝对路径')
+        const args = value.args
+        if (!Array.isArray(args) || args.length > 50 || args.some(arg => typeof arg !== 'string' || arg.length > 4000)) throw new Error('参数必须是字符串数组')
+        const saved = readIntegrationJson<MCPServerConfig[]>(this.coreMcpFile, [])
+        if (saved.some(server => server.id === id)) throw new Error('服务 ID 已存在')
+        const config: MCPServerConfig = { id, name: required(value.name, '服务名称', 80), command, args }
+        await core.addMCPServer(config)
+        try { writeIntegrationJson(this.coreMcpFile, [...saved, config]) }
+        catch (error) { await core.removeMCPServer(id); throw error }
+        return
+      }
+
+      case "agentCoreMcpDisconnect": {
+        const core = await this.ensureAgentCore()
+        await core.removeMCPServer(required(value.id, '服务 ID'))
+        return
+      }
+
+      case "agentCoreMcpRemove": {
+        const core = await this.ensureAgentCore()
+        const id = required(value.id, '服务 ID')
+        await core.removeMCPServer(id)
+        writeIntegrationJson(this.coreMcpFile, readIntegrationJson<MCPServerConfig[]>(this.coreMcpFile, []).filter(server => server.id !== id))
+        return
+      }
+
+      case "agentCoreMcpConnect": {
+        const core = await this.ensureAgentCore()
+        const id = required(value.id, '服务 ID')
+        if (core.getMCPAdapter().listServers().some(server => server.id === id)) return
+        const config = readIntegrationJson<MCPServerConfig[]>(this.coreMcpFile, []).find(server => server.id === id)
+        if (!config) throw new Error('MCP 服务不存在')
+        await core.addMCPServer(config)
+        return
+      }
+
       case "skillsList":
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        return Array.from(this.skillPlatform!.skills.values()).map((skill: any) => ({
-          name: skill.name,
-          displayName: skill.displayName,
-          description: skill.description,
-          version: skill.version,
-          runtime: skill.runtime,
-          category: skill.category,
-          tools: skill.tools.map((tool: any) => ({
+        return Array.from(this.skillPlatform!.getAll().values()).map((skill: any) => ({
+          name: skill.manifest.id,
+          displayName: skill.manifest.name,
+          description: skill.manifest.description,
+          version: skill.manifest.version,
+          runtime: skill.manifest.runtime.type,
+          category: skill.manifest.category,
+          tools: (skill.manifest.capabilities?.tools || []).map((tool: any) => ({
             name: tool.name,
             description: tool.description,
-            inputSchema: tool.inputSchema
+            inputSchema: tool.parameters
           })),
-          skillPath: skill.name,
-          loaded: true,
-          metadata: skill.metadata
+          skillPath: skill.path,
+          loaded: skill.enabled,
+          metadata: skill.manifest.metadata
         }))
 
       case "skillsReload":
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
+        if (this.agentCoreService!.getStatus().runningTasks) throw new Error('请先停止运行中的 Agent 任务再重新加载插件')
         await this.skillPlatform!.initialize()
+        await this.agentCoreService!.getCapabilityRegistry().reload()
         return
 
       case "skillGetContent": {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        const skillName = required(value.skillName, "Skill 名称")
-        const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
+        const skillName = required(value.skillName, "插件名称")
+        const skillDir = this.skillPlatform!.get(skillName)?.path
+        if (!skillDir) throw new Error(`插件不存在: ${skillName}`)
 
-        const [skillJsonRaw, indexPy, readme] = await Promise.all([
+        const [skillJsonRaw, indexPy, enginePy, readme] = await Promise.all([
           fs.readFile(path.join(skillDir, 'skill.json'), 'utf-8'),
           fs.readFile(path.join(skillDir, 'index.py'), 'utf-8').catch(() => ''),
+          fs.readFile(path.join(skillDir, 'engine.py'), 'utf-8').catch(() => null),
           fs.readFile(path.join(skillDir, 'README.md'), 'utf-8').catch(() => '')
         ])
 
         return {
           skillJson: JSON.parse(skillJsonRaw),
           indexPy,
+          enginePy,
           readme
         }
+      }
+
+      case "skillDelete": {
+        const core=await this.ensureAgentCore()
+        if(this.chats.size||core.getStatus().runningTasks)throw new Error('请先停止运行中的对话或 Agent 任务再删除插件')
+        if(this.deletingPlugin)throw new Error('正在删除插件，请稍后再试')
+        this.deletingPlugin=true
+        try{
+        const id=required(value.skillName,'插件标识'),skill=this.skillPlatform!.get(id)
+        if(!skill)throw new Error('插件不存在或已删除')
+        const file=path.join(this.dataRoot,'agent-data','removed-plugins.json')
+        const previous=readIntegrationJson<string[]>(file,[])
+        const removed=[...new Set([...previous,path.basename(skill.path)])]
+        await this.skillPlatform!.uninstall(id,async directory=>{
+          writeIntegrationJson(file,removed)
+          try{await shell.trashItem(directory)}catch(error){writeIntegrationJson(file,previous);throw error}
+        })
+        await core.getCapabilityRegistry().reload()
+        return
+        }finally{this.deletingPlugin=false}
+      }
+
+      case "skillCompile": {
+        const skillName = required(value.skillName, "插件名称")
+        await this.ensureAgentCore()
+        if (!this.skillPlatform!.get(skillName)) throw new Error(`插件不存在: ${skillName}`)
+        await this.compileSkillCode(textValue(value.indexPy, 200000))
+        if (typeof value.enginePy === 'string') await this.compileSkillCode(textValue(value.enginePy, 200000))
+        return { success: true }
       }
 
       case "skillSave": {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        const skillName = required(value.skillName, "Skill 名称")
+        if (this.agentCoreService!.getStatus().runningTasks) throw new Error('请先停止运行中的 Agent 任务再编辑插件')
+        const skillName = required(value.skillName, "插件名称")
         const skillJson = record(value.skillJson)
-        const indexPy = textValue(value.indexPy, 100000)
+        const indexPy = textValue(value.indexPy, 200000)
+        const enginePy = typeof value.enginePy === 'string' ? textValue(value.enginePy, 200000) : null
         const readme = textValue(value.readme, 50000)
 
-        const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
+        const skillDir = this.skillPlatform!.get(skillName)?.path
+        if (!skillDir) throw new Error(`插件不存在: ${skillName}`)
+        this.skillPlatform!.validateManifest(skillJson as any)
+        await this.compileSkillCode(indexPy)
+        if (enginePy !== null) {
+          if (!existsSync(path.join(skillDir, 'engine.py'))) throw new Error('此插件没有 engine.py')
+          await this.compileSkillCode(enginePy)
+        }
+        if (skillJson.id !== skillName) throw new Error('插件 ID 不可在编辑时修改')
 
         await Promise.all([
           fs.writeFile(
@@ -2557,6 +2791,7 @@ export class LocalAiStudioService extends LocalAiService {
             indexPy,
             'utf-8'
           ),
+          ...(enginePy !== null ? [fs.writeFile(path.join(skillDir, 'engine.py'), enginePy, 'utf-8')] : []),
           fs.writeFile(
             path.join(skillDir, 'README.md'),
             readme,
@@ -2565,6 +2800,7 @@ export class LocalAiStudioService extends LocalAiService {
         ])
 
         await this.skillPlatform!.initialize()
+        await this.agentCoreService!.getCapabilityRegistry().reload()
         return
       }
 
@@ -2572,37 +2808,19 @@ export class LocalAiStudioService extends LocalAiService {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        const skillName = required(value.skillName, "Skill 名称")
+        const skillName = required(value.skillName, "插件名称")
         const toolName = required(value.toolName, "工具名称")
         const args = record(value.args)
         const workspace = textValue(value.workspace, 1000)
 
         const startTime = Date.now()
 
-        // 直接通过 Python 执行
-        const skill = this.skillPlatform!.skills.get(skillName)
-        if (!skill) throw new Error(`Skill not found: ${skillName}`)
-
-        const result = await this.pythonTools.execute(
-          {
-            tool: toolName,
-            args,
-            workspace,
-            code: `
-import sys
-sys.path.insert(0, '${skill.skillDir.replace(/\\/g, '\\\\')}')
-from index import TOOLS
-result = TOOLS['${toolName}'](${JSON.stringify(args)}, {'workspace': '${workspace.replace(/\\/g, '\\\\')}'})
-print(result)
-`,
-            context: { workspace }
-          },
-          new AbortController().signal,
-          30000
+        const result = await this.skillPlatform!.executeTool(
+          skillName, toolName, args, new AbortController().signal, workspace
         )
 
         return {
-          output: result.output,
+          output: JSON.stringify(result),
           elapsedMs: Date.now() - startTime
         }
       }
@@ -2611,76 +2829,82 @@ print(result)
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        const skillName = required(value.skillName, "Skill 名称")
+        const skillName = required(value.skillName, "插件名称")
 
         if (!/^[a-z][a-z0-9-]{0,63}$/.test(skillName)) {
-          throw new Error('Skill 标识需以小写字母开头，只能包含小写字母、数字、连字符')
+          throw new Error('插件标识需以小写字母开头，只能包含小写字母、数字、连字符')
         }
 
         const skillDir = path.join((this as any).directory, 'agent-data', 'skills', skillName)
 
         if (existsSync(skillDir)) {
-          throw new Error('Skill 已存在')
+          throw new Error('插件已存在')
         }
 
         await fs.mkdir(skillDir, { recursive: true })
 
+        const toolName = `${skillName.replace(/-/g, '_')}_tool`
         const defaultSkillJson = {
+          id: skillName,
           name: skillName,
-          displayName: skillName,
-          description: '新 Skill',
+          description: '新插件',
           version: '1.0.0',
-          runtime: 'python-native',
+          runtime: { type: 'python', version: '>=3.9', entry: 'index.py', venv: false },
           category: 'general',
-          tools: [
+          capabilities: { tools: [
             {
-              name: `${skillName}_tool`,
+              name: toolName,
               description: '工具描述',
-              inputSchema: {
+              parameters: {
                 type: 'object',
                 properties: {},
                 required: [],
                 additionalProperties: false
               }
             }
-          ]
+          ] },
+          permissions: { fileSystem: { read: [], write: [] }, network: false, process: false },
+          dependencies: { python: [] }
         }
 
-        const defaultIndexPy = `"""
-${skillName}
+        const defaultIndexPy = `import json
+import sys
+import time
 
-新创建的 Skill
-"""
-
-def ${skillName}_tool(args, context):
-    """
-    工具实现
-
-    Args:
-        args: 输入参数
-        context: 执行上下文（包含 workspace 等）
-
-    Returns:
-        执行结果（可 JSON 序列化的对象）
-    """
+def ${toolName}(args, context):
     return {
         "message": "Hello from ${skillName}",
         "args": args
     }
 
-# 工具映射（必需）
 TOOLS = {
-    '${skillName}_tool': ${skillName}_tool
+    '${toolName}': ${toolName}
 }
+
+if __name__ == '__main__' and '--runtime-mode' in sys.argv:
+    print('READY', flush=True)
+    for line in sys.stdin:
+        request = None
+        started = time.monotonic()
+        try:
+            request = json.loads(line)
+            tool = TOOLS[request['tool']]
+            output = tool(request.get('args', {}), {'workspace': request.get('workspace')})
+            response = {'type': 'response', 'id': request['id'], 'output': output,
+                        'elapsedMs': int((time.monotonic() - started) * 1000)}
+        except Exception as error:
+            response = {'type': 'response', 'id': request.get('id') if request else '',
+                        'error': str(error), 'elapsedMs': int((time.monotonic() - started) * 1000)}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
 `
 
         const defaultReadme = `# ${skillName}
 
-新创建的 Skill
+新创建的插件
 
 ## 工具
 
-- \`${skillName}_tool\`: 工具描述
+- \`${toolName}\`: 工具描述
 
 ## 使用方法
 
@@ -2706,6 +2930,7 @@ TOOLS = {
         ])
 
         await this.skillPlatform!.initialize()
+        await this.agentCoreService!.getCapabilityRegistry().reload()
         return
       }
 
@@ -3035,24 +3260,28 @@ TOOLS = {
       case "session":
         return this.session(required(value.id, "会话 ID"));
       case "newSession":
-        return this.newSession();
+        return this.newSession(textValue(value.projectId) || undefined);
       case "updateSession":
         return this.updateSession(input);
       case "deleteSession":
         return this.deleteSession(required(value.id, "会话 ID"));
       case "exportSession": {
+        const format = value.format === 'pdf' || value.format === 'json' ? value.format : 'md';
+        const filters = [{name:'PDF 文档',extensions:['pdf']},{name:'Markdown',extensions:['md']},{name:'JSON',extensions:['json']}];
         const session = this.session(required(value.id, "会话 ID")),
           pick = await dialog.showSaveDialog(owner, {
             title: "导出对话",
             defaultPath:
-              session.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_") + ".md",
-            filters: [
-              { name: "Markdown", extensions: ["md"] },
-              { name: "JSON", extensions: ["json"] },
-            ],
+              session.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_") + "." + format,
+            filters: filters.filter(item => item.extensions[0] === format),
           });
         if (pick.canceled || !pick.filePath) return false;
-        const content = pick.filePath.endsWith(".json")
+        if (path.extname(pick.filePath).toLowerCase() === '.pdf') {
+          const pdf = await sessionPdf(structuredClone(session));
+          await fs.writeFile(pick.filePath, pdf);
+          return true;
+        }
+        const content = pick.filePath.toLowerCase().endsWith(".json")
           ? JSON.stringify(session, null, 2)
           : `# ${session.title}\n\n模型：${session.model}\n\n${session.systemPrompt ? "## 系统提示词\n\n" + session.systemPrompt + "\n\n" : ""}${session.messages.map((message) => `## ${message.role === "user" ? "你" : "AI"}\n\n${message.content}${(message.images || []).map((image, index) => `\n\n![图片 ${index + 1}](${image.dataUrl})`).join("")}`).join("\n\n")}`;
         writeFileSync(pick.filePath, content, "utf8");
@@ -3062,6 +3291,13 @@ TOOLS = {
         return this.startChat(input, event.sender);
       case "compactSession":
         return this.startChat(input, event.sender, true);
+      case "chatApprove": {
+        const approvalId = required(value.approvalId, '批准 ID');
+        const pending = this.chatApprovals.get(approvalId);
+        if (!pending || pending.owner !== event.sender.id || pending.requestId !== value.requestId || !this.chats.has(pending.requestId)) throw new Error('批准请求已失效或不属于当前窗口');
+        pending.resolve(value.approved === true);
+        return;
+      }
       case "stopChat":
         return this.stopChat(
           required(value.requestId, "请求 ID"),
@@ -3082,9 +3318,10 @@ TOOLS = {
     });
   }
   hasEnabledAutomations() {
-    return this.automation.tasks().some((task) => task.enabled);
+    return this.automation.tasks().some(task => task.enabled);
   }
   async dispose() {
+    await this.agentCoreService?.dispose()
     for (const probe of this.probes.values()) probe.abort();
     this.automation.dispose();
     this.workflow.dispose();

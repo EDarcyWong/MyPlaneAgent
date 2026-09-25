@@ -18,13 +18,25 @@ export type ModelResponse = {
 }
 
 export type ModelConfig = {
-  connection: AgentConnection
-  model: string
+  connection?: AgentConnection
+  getConnection?: () => AgentConnection
+  model?: string
   temperature?: number
+  diagnosticLog?: (message: string) => void
 }
 
 export class ModelClient {
   constructor(private config: ModelConfig) {}
+
+  private getConnection(): AgentConnection {
+    if (this.config.connection) {
+      return this.config.connection
+    }
+    if (this.config.getConnection) {
+      return this.config.getConnection()
+    }
+    throw new Error('No connection available')
+  }
 
   /**
    * 简单的文本补全（无工具调用）
@@ -50,8 +62,8 @@ export class ModelClient {
     while (retries <= maxRetries) {
       try {
         const response = await requestAgentModel(
-          this.config.connection,
-          this.config.model,
+          this.getConnection(),
+          this.config.model || 'default',
           agentMessages,
           signal,
           {
@@ -66,6 +78,7 @@ export class ModelClient {
         }
 
       } catch (error) {
+        signal.throwIfAborted()
         retries++
         if (retries > maxRetries) {
           throw error
@@ -95,8 +108,8 @@ export class ModelClient {
     }))
 
     return await requestAgentModel(
-      this.config.connection,
-      this.config.model,
+      this.getConnection(),
+      this.config.model || 'default',
       agentMessages,
       signal,
       {
@@ -125,8 +138,8 @@ export class ModelClient {
     let reasoning = ''
 
     const response = await requestAgentModel(
-      this.config.connection,
-      this.config.model,
+      this.getConnection(),
+      this.config.model || 'default',
       agentMessages,
       signal,
       {

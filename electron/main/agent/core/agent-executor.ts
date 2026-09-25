@@ -5,13 +5,23 @@
 
 import type {
   AgentPlan,
+  AgentEvent,
   ExecutionResult,
   CapabilityExecutionRequest
 } from '../../../shared/types/index.js'
 import type { CapabilityRegistry } from './capability-registry.js'
 
 export class AgentExecutor {
-  constructor(private capabilityRegistry: CapabilityRegistry) {}
+  constructor(
+    private capabilityRegistry: CapabilityRegistry,
+    private approve?: (capability: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<boolean>,
+    private onEvent?: (event: AgentEvent) => void
+  ) {}
+
+  private emit(event: AgentEvent): void {
+    // Observers must not change execution outcomes.
+    try { this.onEvent?.(event) } catch (error) { console.error('[Executor] Event listener failed', error) }
+  }
 
   /**
    * 执行计划
@@ -35,6 +45,7 @@ export class AgentExecutor {
       console.log(`[Executor] Step ${i}: ${step.capability}`)
 
       const stepStartTime = Date.now()
+      this.emit({ type: 'step_started', taskId: plan.taskId, step: i })
 
       try {
         // 检查依赖关系
@@ -46,6 +57,12 @@ export class AgentExecutor {
               )
             }
           }
+        }
+
+        const capability = this.capabilityRegistry.get(step.capability)
+        if (capability?.tags?.includes('requires-approval')) {
+          if (!this.approve || !await this.approve(step.capability, step.args, signal)) throw new Error('操作未获批准')
+          signal.throwIfAborted()
         }
 
         // 执行 Capability
@@ -61,6 +78,7 @@ export class AgentExecutor {
         }
 
         const result = await this.capabilityRegistry.execute(request, signal)
+        signal.throwIfAborted()
 
         if (!result.success) {
           throw new Error(result.error || 'Unknown error')
@@ -76,9 +94,12 @@ export class AgentExecutor {
         })
 
         console.log(`[Executor] Step ${i}: ✓ success (${result.elapsedMs}ms)`)
+        this.emit({ type: 'step_completed', taskId: plan.taskId, step: i, result: result.output })
 
       } catch (error) {
+        signal.throwIfAborted()
         const errorMessage = error instanceof Error ? error.message : String(error)
+        this.emit({ type: 'step_failed', taskId: plan.taskId, step: i, error: errorMessage })
         errors[i] = errorMessage
 
         stepResults.push({

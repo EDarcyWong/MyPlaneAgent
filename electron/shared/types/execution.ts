@@ -13,6 +13,7 @@ export type ExecutionRequest = {
   args: Record<string, unknown>
   venv: boolean
   workspace?: string
+  context?: Record<string, unknown>
   timeout?: number                     // 超时时间（毫秒）
 }
 
@@ -70,6 +71,7 @@ export type IpcMessage =
       tool: string
       args: Record<string, unknown>
       workspace?: string
+  context?: Record<string, unknown>
     }
   | {
       type: 'response'

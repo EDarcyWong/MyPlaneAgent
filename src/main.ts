@@ -5,12 +5,17 @@ import './style.css'
 import LocalAiStudio from './LocalAiStudio.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import {installTooltips} from './tooltips'
+import {installFloatingMenus} from './floatingMenus'
 import type {WorkflowModelRef} from '../electron/shared/local-ai-workflow'
 type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:WorkflowModelRef}
+const disposeFloatingMenus=installFloatingMenus()
+if(import.meta.hot)import.meta.hot.dispose(disposeFloatingMenus)
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
-if(params.get('surface')==='help'){
+if(params.get('surface')==='browser'){
+ void import('./local-ai/InternalBrowser.vue').then(({default:InternalBrowser})=>createApp(InternalBrowser).mount('#app'))
+}else if(params.get('surface')==='help'){
  document.title='工作流使用指南 · MyPlaneAgent'
  void import('./help/HelpWindow.vue').then(async({default:HelpWindow})=>{
   const bootstrap=await window.myplane.localAiStudio('bootstrap').catch(()=>null)

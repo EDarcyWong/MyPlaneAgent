@@ -11,7 +11,7 @@ const count=(value:number)=>value.toLocaleString('zh-CN')
   <span v-if="shortcut" class="context-shortcut">{{shortcut}}</span>
   <span v-if="context?.state==='error'" class="context-note" role="status">压缩未完成，原记录已保留</span>
   <div class="context-actions">
-   <details>
+   <details data-floating-menu>
     <summary><span class="context-dot"></span>{{context?.state==='compacting'?'正在压缩上下文…':context?`上下文约 ${percent}%`:'上下文自动管理'}}<span v-if="checkpoint&&context?.state!=='compacting'" class="context-saved">已压缩 {{checkpoint.compactions}} 次</span></summary>
     <div class="context-panel">
      <strong>当前上下文</strong>

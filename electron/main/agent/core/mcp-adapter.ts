@@ -15,8 +15,13 @@ export class MCPAdapter {
    * 添加 MCP 服务器
    */
   async addServer(config: MCPServerConfig): Promise<void> {
-    if (this.clients.has(config.id)) {
+    const previous = this.clients.get(config.id)
+    if (previous?.isConnected()) {
       throw new Error(`MCP server already exists: ${config.id}`)
+    }
+    if (previous) {
+      await previous.disconnect()
+      this.clients.delete(config.id)
     }
 
     console.log(`[MCP Adapter] Adding server: ${config.name}`)
@@ -48,6 +53,7 @@ export class MCPAdapter {
     const capabilities: Capability[] = []
 
     for (const client of this.clients.values()) {
+      if (!client.isConnected()) continue
       capabilities.push(...client.toCapabilities())
     }
 
@@ -88,7 +94,7 @@ export class MCPAdapter {
     try {
       signal.throwIfAborted()
 
-      const output = await client.callTool(toolName, request.args)
+      const output = await client.callTool(toolName, request.args, signal)
 
       return {
         success: true,
@@ -150,5 +156,27 @@ export class MCPAdapter {
       await client.disconnect()
     }
     this.clients.clear()
+  }
+
+  /**
+   * 列出所有服务器
+   */
+  listServers(): Array<{ id: string; name: string }> {
+    const servers: Array<{ id: string; name: string }> = []
+    for (const [id, client] of this.clients) {
+      if (!client.isConnected()) continue
+      servers.push({
+        id,
+        name: client.getConfig().name
+      })
+    }
+    return servers
+  }
+
+  /**
+   * 清理资源
+   */
+  async dispose(): Promise<void> {
+    await this.disconnectAll()
   }
 }

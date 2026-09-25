@@ -15,6 +15,8 @@ import type {
 import type { PythonRuntimeManager } from './python-runtime-manager.js'
 
 export class SkillPlatform {
+  private removing = new Set<string>()
+  private activeExecutions = new Map<string, number>()
   private skills = new Map<string, SkillInstance>()
 
   constructor(
@@ -29,8 +31,11 @@ export class SkillPlatform {
    * 初始化：扫描并加载所有 Skills
    */
   async initialize(): Promise<void> {
+    if(this.removing.size)throw new Error('正在删除插件，请稍后刷新')
     console.log(`[SkillPlatform] Scanning skills directory: ${this.skillsDir}`)
 
+    const previous = this.skills
+    this.skills = new Map()
     const entries = fs.readdirSync(this.skillsDir, { withFileTypes: true })
 
     for (const entry of entries) {
@@ -57,7 +62,7 @@ export class SkillPlatform {
         const instance: SkillInstance = {
           manifest,
           path: skillPath,
-          enabled: true,
+          enabled: manifest.enabled !== false,
           installedAt: stats.birthtime.toISOString(),
           updatedAt: fs.statSync(manifestPath).mtime.toISOString(),
           status: 'idle'
@@ -71,13 +76,18 @@ export class SkillPlatform {
       }
     }
 
+    for (const skillId of previous.keys()) {
+      // Code and dependencies can change without touching skill.json.
+      await this.runtimeManager.stopWorker(skillId)
+    }
+
     console.log(`[SkillPlatform] Loaded ${this.skills.size} skills`)
   }
 
   /**
    * 验证 skill.json
    */
-  private validateManifest(manifest: SkillManifest): void {
+  validateManifest(manifest: SkillManifest): void {
     if (!manifest.id || !/^[a-z0-9-]+$/.test(manifest.id)) {
       throw new Error(`Invalid skill id: ${manifest.id}`)
     }
@@ -97,6 +107,30 @@ export class SkillPlatform {
     if (!manifest.runtime || !manifest.runtime.entry) {
       throw new Error('Skill runtime entry is required')
     }
+    if (manifest.runtime.type !== 'python' || manifest.runtime.entry !== 'index.py') {
+      throw new Error('Only Python index.py skills are supported')
+    }
+    if (!Array.isArray(manifest.capabilities?.tools)) {
+      throw new Error('Skill capabilities.tools is required')
+    }
+    const toolNames = new Set<string>()
+    for (const tool of manifest.capabilities.tools) {
+      if (!tool || typeof tool.name !== 'string' || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(tool.name) || toolNames.has(tool.name)) {
+        throw new Error('Skill tool names must be unique Python identifiers')
+      }
+      if (typeof tool.description !== 'string' || !tool.parameters || typeof tool.parameters !== 'object' || Array.isArray(tool.parameters)) {
+        throw new Error(`Invalid tool definition: ${tool.name}`)
+      }
+      toolNames.add(tool.name)
+    }
+    if (!manifest.permissions || typeof manifest.permissions !== 'object') {
+      throw new Error('Skill permissions are required')
+    }
+    const files = manifest.permissions.fileSystem
+    if (files && (!Array.isArray(files.read) || !Array.isArray(files.write) ||
+      [...files.read, ...files.write].some(pattern => typeof pattern !== 'string'))) {
+      throw new Error('Skill file permissions must be string arrays')
+    }
   }
 
   /**
@@ -104,6 +138,13 @@ export class SkillPlatform {
    */
   get(skillId: string): SkillInstance | undefined {
     return this.skills.get(skillId)
+  }
+
+  /**
+   * 获取所有 Skills（用于管理界面）
+   */
+  getAll(): Map<string, SkillInstance> {
+    return this.skills
   }
 
   /**
@@ -178,7 +219,8 @@ export class SkillPlatform {
     toolName: string,
     args: Record<string, unknown>,
     signal: AbortSignal,
-    workspace?: string
+    workspace?: string,
+    context?: Record<string, unknown>
   ): Promise<unknown> {
     const skill = this.skills.get(skillId)
 
@@ -203,13 +245,10 @@ export class SkillPlatform {
     // TODO: 参数验证（使用 ajv）
     // this.validateArgs(tool.parameters, args)
 
-    // 权限检查
-    await this.checkPermissions(skill, args)
-
-    // 标记为加载中
+    this.activeExecutions.set(skillId,(this.activeExecutions.get(skillId)||0)+1)
     skill.status = 'loading'
-
     try {
+      await this.checkPermissions(skill, args)
       // 提交到 Runtime Manager
       const response = await this.runtimeManager.execute(
         {
@@ -218,19 +257,24 @@ export class SkillPlatform {
           tool: toolName,
           args,
           venv: skill.manifest.runtime.venv,
-          workspace
+          workspace,
+          context
         },
         signal
       )
 
       skill.status = 'ready'
+      skill.error = undefined
 
       return response.output
 
     } catch (error) {
-      skill.status = 'error'
+      skill.status = 'ready'
       skill.error = error instanceof Error ? error.message : String(error)
       throw error
+    } finally {
+      const remaining=(this.activeExecutions.get(skillId)||1)-1
+      if(remaining)this.activeExecutions.set(skillId,remaining);else this.activeExecutions.delete(skillId)
     }
   }
 
@@ -340,24 +384,20 @@ export class SkillPlatform {
   /**
    * 卸载 Skill
    */
-  async uninstall(skillId: string): Promise<void> {
-    const skill = this.skills.get(skillId)
-    if (!skill) {
-      throw new Error(`Skill not found: ${skillId}`)
-    }
-
-    console.log(`[SkillPlatform] Uninstalling skill: ${skillId}`)
-
-    // 停止 Worker
-    await this.runtimeManager.stopWorker(skillId)
-
-    // 删除文件
-    fs.rmSync(skill.path, { recursive: true, force: true })
-
-    // 从注册表移除
-    this.skills.delete(skillId)
-
-    console.log(`[SkillPlatform] Uninstalled skill: ${skillId}`)
+  async uninstall(skillId: string, remove:(directory:string)=>Promise<void>=async directory=>{fs.rmSync(directory,{recursive:true,force:true})}): Promise<void> {
+    const skill=this.skills.get(skillId)
+    if(!skill)throw new Error(`插件不存在: ${skillId}`)
+    if(this.removing.has(skillId))throw new Error('插件正在删除')
+    if(this.activeExecutions.has(skillId))throw new Error('插件正在执行，请等待完成后再删除')
+    const root=fs.realpathSync(this.skillsDir),target=fs.realpathSync(skill.path)
+    if(path.dirname(target)!==root||fs.lstatSync(skill.path).isSymbolicLink())throw new Error('只能删除插件目录内的独立插件')
+    this.removing.add(skillId)
+    const enabled=skill.enabled;skill.enabled=false
+    try{
+      await this.runtimeManager.stopWorker(skillId)
+      await remove(skill.path)
+      this.skills.delete(skillId)
+    }catch(error){skill.enabled=enabled;throw error}finally{this.removing.delete(skillId)}
   }
 
   /**
@@ -418,5 +458,16 @@ export class SkillPlatform {
       byCategory,
       byRuntime
     }
+  }
+
+  /**
+   * 清理资源
+   */
+  async dispose(): Promise<void> {
+    // 停止所有关联的 Workers
+    for (const skillId of this.skills.keys()) {
+      await this.runtimeManager.stopWorker(skillId).catch(() => {})
+    }
+    console.log('[SkillPlatform] Disposed')
   }
 }

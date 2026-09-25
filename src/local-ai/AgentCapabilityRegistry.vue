@@ -50,7 +50,7 @@ const sources = computed(() => {
   return [
     { id: 'all', name: '全部来源', count: capabilities.value.length },
     { id: 'builtin', name: '内置能力', count: counts.builtin },
-    { id: 'skill', name: 'Python Skills', count: counts.skill },
+    { id: 'skill', name: '插件工具', count: counts.skill },
     { id: 'mcp', name: 'MCP 工具', count: counts.mcp }
   ]
 })
@@ -124,7 +124,7 @@ function getSourceClass(source: string): string {
 function getSourceName(source: string): string {
   const names: Record<string, string> = {
     builtin: '内置',
-    skill: 'Skill',
+    skill: '插件',
     mcp: 'MCP'
   }
   return names[source] || source
@@ -151,17 +151,6 @@ async function loadCapabilities() {
   }
 }
 
-// 切换能力启用状态
-async function toggleCapability(capability: Capability) {
-  try {
-    capability.enabled = !capability.enabled
-    ElMessage.success(`${capability.enabled ? '已启用' : '已禁用'} ${capability.name}`)
-  } catch (error) {
-    capability.enabled = !capability.enabled
-    ElMessage.error(`操作失败: ${error}`)
-  }
-}
-
 // 展开/收起能力详情
 function toggleExpand(name: string) {
   expandedCapability.value = expandedCapability.value === name ? null : name
@@ -183,8 +172,8 @@ onMounted(() => {
     <!-- 头部 -->
     <header class="registry-header">
       <div class="header-info">
-        <h2>能力注册表</h2>
-        <p>管理和查看所有可用的 Agent 能力</p>
+        <h2>可用能力</h2>
+        <p>查看 Agent 当前可调用的插件与 MCP 工具</p>
       </div>
       <button class="refresh-btn" @click="refresh" :disabled="loading">
         <Refresh :class="{ spinning: loading }" />
@@ -239,7 +228,7 @@ onMounted(() => {
 
     <div v-else-if="filteredCapabilities.length === 0" class="empty-state">
       <InfoFilled />
-      <p>{{ searchQuery ? '没有找到匹配的能力' : '暂无可用能力' }}</p>
+      <p>{{ searchQuery ? '没有找到匹配的能力' : selectedCategory !== 'all' || selectedSource !== 'all' ? '当前筛选条件下没有能力' : '暂无可用能力' }}</p>
     </div>
 
     <div v-else class="capabilities-list">
@@ -271,15 +260,14 @@ onMounted(() => {
               </div>
 
               <div class="capability-actions" @click.stop>
-                <button
+                <span
                   class="toggle-btn"
                   :class="{ enabled: capability.enabled }"
-                  @click="toggleCapability(capability)"
-                  :title="capability.enabled ? '禁用' : '启用'"
+                  :title="capability.enabled ? '已启用' : '已停用'"
                 >
                   <Check v-if="capability.enabled" />
                   <Close v-else />
-                </button>
+                </span>
               </div>
             </div>
 
@@ -336,9 +324,20 @@ onMounted(() => {
 
 <style scoped>
 .capability-registry {
+  --studio-bg: var(--s-bg);
+  --studio-text: var(--s-text);
+  --studio-text-muted: var(--s-dim);
+  --studio-border: var(--s-border);
+  --studio-input-bg: var(--s-panel);
+  --studio-button-bg: var(--s-panel);
+  --studio-button-hover: var(--s-muted);
+  --studio-card-bg: var(--s-panel);
+  --studio-primary: var(--s-accent);
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   background: var(--studio-bg);
   color: var(--studio-text);
 }
@@ -385,6 +384,13 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
+.refresh-btn svg,
+.search-box svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
 .spinning {
   animation: spin 1s linear infinite;
 }
@@ -411,6 +417,7 @@ onMounted(() => {
 
 .search-box input {
   flex: 1;
+  min-width: 0;
   border: none;
   background: transparent;
   outline: none;
@@ -562,6 +569,11 @@ onMounted(() => {
   font-size: 12px;
 }
 
+.capability-status svg {
+  width: 14px;
+  height: 14px;
+}
+
 .status-active {
   color: #4caf50;
 }
@@ -592,18 +604,17 @@ onMounted(() => {
   background: var(--studio-button-bg);
   border: 1px solid var(--studio-border);
   border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.toggle-btn:hover {
-  background: var(--studio-button-hover);
 }
 
 .toggle-btn.enabled {
   background: #4caf50;
   border-color: #4caf50;
   color: white;
+}
+
+.toggle-btn svg {
+  width: 16px;
+  height: 16px;
 }
 
 .capability-details {
@@ -708,7 +719,8 @@ onMounted(() => {
 }
 
 .empty-state svg {
-  font-size: 48px;
+  width: 48px;
+  height: 48px;
   margin-bottom: 16px;
   opacity: 0.5;
 }

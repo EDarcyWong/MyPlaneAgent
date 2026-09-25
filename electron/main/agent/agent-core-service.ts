@@ -4,6 +4,7 @@
  * 提供与 LocalAgentService 兼容的接口
  */
 
+import { runCoreChat, type ChatRunOptions } from './core/chat-runner.js'
 import { AgentCore } from './core/agent-core.js'
 import { CapabilityRegistry } from './core/capability-registry.js'
 import { SkillPlatform } from './core/skill-platform.js'
@@ -15,7 +16,7 @@ import type {
   AgentTask,
   AgentConfig,
   AgentEvent,
-  AgentProject
+  ExecutionResult
 } from '../../shared/types/index.js'
 import type { AgentConnection } from './model.js'
 import { EventEmitter } from 'node:events'
@@ -31,9 +32,13 @@ export interface AgentCoreServiceConfig {
 
 export interface AgentRunOptions {
   projectId?: string
+  model?: string
+  connection?: AgentConnection
   mode?: 'general' | 'coding' | 'documents'
   maxReplanAttempts?: number
+  maxSteps?: number
   temperature?: number
+  approve?: (capability: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<boolean>
 }
 
 /**
@@ -46,9 +51,8 @@ export class AgentCoreService extends EventEmitter {
   private mcpAdapter: MCPAdapter
   private capabilityRegistry: CapabilityRegistry
   private memory: AgentMemory
-  private modelClient: ModelClient
-  private agentCores: Map<string, AgentCore> = new Map()
   private runningTasks: Map<string, AbortController> = new Map()
+  private initialized = false
 
   constructor(private config: AgentCoreServiceConfig) {
     super()
@@ -75,11 +79,6 @@ export class AgentCoreService extends EventEmitter {
     // 初始化记忆系统
     this.memory = new AgentMemory(config.dataDir)
 
-    // 初始化模型客户端
-    this.modelClient = new ModelClient({
-      getConnection: config.getConnection,
-      diagnosticLog: config.diagnosticLog
-    })
   }
 
   /**
@@ -90,11 +89,12 @@ export class AgentCoreService extends EventEmitter {
       // 初始化 Skill Platform
       await this.skillPlatform.initialize()
       this.emit('skill-platform-ready', {
-        skills: this.skillPlatform.listSkills()
+        skills: this.skillPlatform.list()
       })
 
       // 初始化能力注册表
       await this.capabilityRegistry.initialize()
+      this.initialized = true
       this.emit('capability-registry-ready', {
         capabilities: this.capabilityRegistry.list()
       })
@@ -112,7 +112,9 @@ export class AgentCoreService extends EventEmitter {
   async runTask(
     task: AgentTask,
     options: AgentRunOptions = {}
-  ): Promise<void> {
+  ): Promise<ExecutionResult> {
+    if (!this.initialized) throw new Error('Agent Core is not initialized')
+    this.capabilityRegistry.refreshMCP()
     const taskId = task.id
 
     // 如果任务已在运行，抛出错误
@@ -126,7 +128,7 @@ export class AgentCoreService extends EventEmitter {
 
     try {
       // 获取或创建 Agent Core 实例
-      const agentCore = this.getAgentCore(options)
+      const agentCore = this.createAgentCore(options)
 
       // 设置事件监听
       agentCore.on((event: AgentEvent) => {
@@ -160,17 +162,24 @@ export class AgentCoreService extends EventEmitter {
 
       // 任务完成
       this.emit('task-result', { taskId, result })
+      return result
 
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         this.emit('task-cancelled', { taskId })
       } else {
         this.emit('task-error', { taskId, error })
-        throw error
       }
+      throw error
     } finally {
       this.runningTasks.delete(taskId)
     }
+  }
+
+  async runConversation(options: ChatRunOptions): Promise<void> {
+    if (!this.initialized) throw new Error('Agent Core is not initialized')
+    this.capabilityRegistry.refreshMCP()
+    return runCoreChat(this.capabilityRegistry, options)
   }
 
   /**
@@ -180,40 +189,33 @@ export class AgentCoreService extends EventEmitter {
     const controller = this.runningTasks.get(taskId)
     if (controller) {
       controller.abort()
-      this.runningTasks.delete(taskId)
     }
   }
 
   /**
    * 获取或创建 Agent Core 实例
    */
-  private getAgentCore(options: AgentRunOptions): AgentCore {
-    // 为不同的配置创建不同的实例
-    const configKey = JSON.stringify({
+  private createAgentCore(options: AgentRunOptions): AgentCore {
+    const config: AgentConfig = {
       mode: options.mode || 'general',
-      maxReplanAttempts: options.maxReplanAttempts || 2,
-      temperature: options.temperature || 0.2
-    })
-
-    if (!this.agentCores.has(configKey)) {
-      const config: AgentConfig = {
-        mode: options.mode || 'general',
-        maxReplanAttempts: options.maxReplanAttempts || 2,
-        autoApprove: false,
-        temperature: options.temperature || 0.2
-      }
-
-      const agentCore = new AgentCore(
-        this.capabilityRegistry,
-        this.modelClient,
-        this.memory,
-        config
-      )
-
-      this.agentCores.set(configKey, agentCore)
+      maxReplanAttempts: options.maxReplanAttempts ?? 2,
+      autoApprove: false,
+      temperature: options.temperature ?? 0.2,
+      model: options.model
     }
-
-    return this.agentCores.get(configKey)!
+    return new AgentCore(
+      this.capabilityRegistry,
+      new ModelClient({
+        getConnection: this.config.getConnection,
+        connection: options.connection,
+        model: options.model,
+        diagnosticLog: this.config.diagnosticLog
+      }),
+      this.memory,
+      config,
+      options.approve,
+      options.maxSteps
+    )
   }
 
   /**
@@ -248,6 +250,7 @@ export class AgentCoreService extends EventEmitter {
    * 列出所有可用能力
    */
   listCapabilities() {
+    this.capabilityRegistry.refreshMCP()
     return this.capabilityRegistry.list()
   }
 
@@ -255,7 +258,7 @@ export class AgentCoreService extends EventEmitter {
    * 列出所有 Skills
    */
   listSkills() {
-    return this.skillPlatform.listSkills()
+    return this.skillPlatform.list()
   }
 
   /**
@@ -265,10 +268,11 @@ export class AgentCoreService extends EventEmitter {
     id: string
     name: string
     command: string
-    args: string[]
+    args?: string[]
     env?: Record<string, string>
   }) {
     await this.mcpAdapter.addServer(config)
+    this.capabilityRegistry.refreshMCP()
     this.emit('mcp-server-added', { id: config.id })
   }
 
@@ -277,6 +281,7 @@ export class AgentCoreService extends EventEmitter {
    */
   async removeMCPServer(id: string) {
     await this.mcpAdapter.removeServer(id)
+    this.capabilityRegistry.refreshMCP()
     this.emit('mcp-server-removed', { id })
   }
 
@@ -297,13 +302,14 @@ export class AgentCoreService extends EventEmitter {
   async dispose(): Promise<void> {
     try {
       // 取消所有运行中的任务
-      for (const [taskId, controller] of this.runningTasks.entries()) {
-        controller.abort()
+      const taskIds = Array.from(this.runningTasks.keys())
+      for (const taskId of taskIds) {
+        const controller = this.runningTasks.get(taskId)
+        if (controller) {
+          controller.abort()
+        }
       }
       this.runningTasks.clear()
-
-      // 清理 Agent Core 实例
-      this.agentCores.clear()
 
       // 清理 MCP Adapter
       await this.mcpAdapter.dispose()
@@ -313,6 +319,7 @@ export class AgentCoreService extends EventEmitter {
 
       // 清理 Python Runtime
       await this.runtimeManager.dispose()
+      this.initialized = false
 
       this.emit('disposed')
     } catch (error) {
@@ -325,10 +332,11 @@ export class AgentCoreService extends EventEmitter {
    * 获取服务状态
    */
   getStatus() {
+    this.capabilityRegistry.refreshMCP()
     return {
-      initialized: true,
+      initialized: this.initialized,
       runningTasks: this.runningTasks.size,
-      skillsCount: this.skillPlatform.listSkills().length,
+      skillsCount: this.skillPlatform.list().length,
       capabilitiesCount: this.capabilityRegistry.list().length,
       mcpServers: this.mcpAdapter.listServers().length
     }

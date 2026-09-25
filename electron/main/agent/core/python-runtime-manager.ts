@@ -35,6 +35,7 @@ type Worker = {
 
 export class PythonRuntimeManager {
   private workers = new Map<string, Worker>()
+  private cleanupTimer: NodeJS.Timeout
   private config: RuntimeConfig
   private stats = {
     totalExecutions: 0,
@@ -58,7 +59,8 @@ export class PythonRuntimeManager {
     fs.mkdirSync(this.config.venvDir!, { recursive: true })
 
     // 定期清理空闲 Worker
-    setInterval(() => this.cleanupIdleWorkers(), 60000)
+    this.cleanupTimer = setInterval(() => this.cleanupIdleWorkers(), 60000)
+    this.cleanupTimer.unref()
   }
 
   /**
@@ -90,14 +92,16 @@ export class PythonRuntimeManager {
       const response = await new Promise<ExecutionResponse>((resolve, reject) => {
         const timer = setTimeout(() => {
           worker!.pending.delete(requestId)
-          worker!.status = 'idle'
+          worker!.status = 'error'
+          void this.stopWorker(request.skillId)
           reject(new Error(`Execution timeout: ${request.skillId}.${request.tool}`))
         }, timeoutMs)
 
         const abort = () => {
           worker!.pending.delete(requestId)
           clearTimeout(timer)
-          worker!.status = 'idle'
+          worker!.status = 'error'
+          void this.stopWorker(request.skillId)
           reject(new Error('Task cancelled'))
         }
 
@@ -111,7 +115,8 @@ export class PythonRuntimeManager {
           id: requestId,
           tool: request.tool,
           args: request.args,
-          workspace: request.workspace
+          workspace: request.workspace,
+          context: request.context
         }
 
         const line = JSON.stringify(message) + '\n'
@@ -469,5 +474,14 @@ export class PythonRuntimeManager {
           : 0,
       workersBySkill
     }
+  }
+
+  /**
+   * 清理资源
+   */
+  async dispose(): Promise<void> {
+    clearInterval(this.cleanupTimer)
+    await this.stopAll()
+    console.log('[Runtime] Disposed')
   }
 }

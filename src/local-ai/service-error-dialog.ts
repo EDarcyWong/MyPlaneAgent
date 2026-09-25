@@ -1,4 +1,4 @@
-import {ElMessageBox} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 
 const logEvent='myplane:open-application-logs'
 

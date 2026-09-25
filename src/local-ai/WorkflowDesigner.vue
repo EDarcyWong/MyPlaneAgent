@@ -7,7 +7,8 @@ import {
   ref,
   watch,
 } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import {ElMessage} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import {
   Aim,
   ChatLineSquare,
@@ -811,7 +812,22 @@ function initializeNew() {
   lastAutoSaveAttempt.value = lastSavedSnapshot.value;
   lastSavedAt.value = undefined;
 }
-function create() {
+async function createProject() {
+  try {
+    const directory = await api('agentChooseWorkspace');
+    if (!directory) return false;
+    const answer = await ElMessageBox.prompt('为工作目录命名', '新建工作流项目', { inputValue: directory.path.split('/').pop() || '新项目', inputPattern: /\S+/, inputErrorMessage: '请输入项目名称' });
+    const project = await api('agentCreateProject', { workspaceToken: directory.token, name: answer.value });
+    await load();
+    form.projectId = project.id;
+    return true;
+  } catch (cause) {
+    if (cause !== 'cancel' && cause !== 'close') ElMessage.error(String(cause));
+    return false;
+  }
+}
+async function create() {
+  if (!projects.value.length && !await createProject()) return;
   if (!props.windowMode) {
     void window.myplane.openWorkflowEditor();
     return;
@@ -1742,7 +1758,7 @@ onBeforeUnmount(() => {
           <h2>把重复任务，<br />变成清晰的工作流。</h2>
           <p>连接 AI 任务、条件判断与人工确认，让每一步按预期执行，结果都有记录可查。</p>
           <small v-if="projects.length">点击顶部的「＋」按钮创建第一个工作流。</small>
-          <small v-if="!projects.length">创建工作流前，请先在工作台添加项目。</small>
+          <small v-if="!projects.length">先创建项目，再创建第一个工作流。</small><button v-if="!projects.length" type="button" class="primary-button" @click="createProject">创建项目</button>
         </div>
         <div class="workflow-onboarding-preview" aria-hidden="true">
           <div class="workflow-preview-caption"><span class="workflow-preview-dot"></span> 流程预览</div>
@@ -1942,6 +1958,8 @@ onBeforeUnmount(() => {
           ><small>端口拖动创建连线；已有连线左拖新增目标、右拖切换目标</small>
         </div>
         <div class="workflow-editor-actions">
+          <select v-model="form.projectId" aria-label="工作流项目"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select>
+          <button type="button" title="添加项目" @click="createProject"><Plus /></button>
           <button type="button" class="workflow-help-button" aria-label="工作流帮助" title="打开工作流使用指南" @click="openWorkflowHelp">
             <QuestionFilled />帮助
           </button>

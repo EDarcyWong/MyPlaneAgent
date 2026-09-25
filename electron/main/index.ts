@@ -1,3 +1,5 @@
+import {configureBrowserPlugin} from './browser-plugin.js'
+import {InternalBrowser} from './internal-browser.js'
 import {app,BrowserWindow,dialog,Menu,nativeTheme,shell,Tray,type MenuItemConstructorOptions} from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -14,6 +16,8 @@ app.setPath('userData',dataDirectory)
 const logger=new ApplicationLogger(dataDirectory)
 const developmentUrl=!app.isPackaged?process.env.VITE_DEV_SERVER_URL:undefined
 const appIcon=path.join(directory,developmentUrl?'../../public/myplane-icon.png':'../../dist/myplane-icon.png')
+const browser=new InternalBrowser(directory,developmentUrl)
+configureBrowserPlugin(browser)
 let window:BrowserWindow|undefined
 let workflowEditorWindow:BrowserWindow|undefined
 let helpWindow:BrowserWindow|undefined
@@ -47,6 +51,7 @@ function installApplicationMenu(){
    {label:'全选',role:'selectAll',accelerator:'CmdOrCtrl+A'},
   ]},
   {label:'视图',submenu:[
+   {label:'内置浏览器',click:()=>void browser.open().catch(error=>logger.error('browser','无法打开浏览器',error))},
    {label:'重新加载',role:'reload',accelerator:'CmdOrCtrl+R'},{label:'强制重新加载',role:'forceReload',accelerator:'CmdOrCtrl+Shift+R'},
    ...(!app.isPackaged?[{label:'开发者工具',role:'toggleDevTools' as const,accelerator:process.platform==='darwin'?'Alt+Cmd+I':'Ctrl+Shift+I'}]:[]),
    {type:'separator'},
@@ -142,7 +147,7 @@ async function openHelpDocument(documentId='workflow'){
 process.on('uncaughtExceptionMonitor',error=>logger.error('process','未捕获异常',error))
 process.on('unhandledRejection',reason=>logger.error('process','未处理的 Promise 拒绝',reason))
 logger.info('app','应用启动',{version:app.getVersion(),platform:process.platform,arch:process.arch,packaged:app.isPackaged})
-if(!app.requestSingleInstanceLock()){logger.info('app','已有实例正在运行，当前实例退出');app.quit()}
+if(process.env.MYPLANE_AGENT_TEST_MODE!=='1'&&!app.requestSingleInstanceLock()){logger.info('app','已有实例正在运行，当前实例退出');app.quit()}
 else{
  app.on('second-instance',()=>{logger.info('app','收到第二实例启动请求');if(window)focus();else void createWindow()})
  app.on('window-all-closed',()=>{if(process.platform!=='darwin'&&!service?.hasEnabledAutomations())app.quit()})
@@ -155,11 +160,12 @@ else{
    tray=new Tray(appIcon);tray.setToolTip(app.name);tray.setContextMenu(Menu.buildFromTemplate([{label:'打开 MyPlaneAgent',click:()=>void createWindow()},{type:'separator'},{label:'退出',role:'quit'}]));tray.on('click',()=>void createWindow())
   }
   registerLocalAiStudio(()=>service!,()=>service?.dispose())
+  protectedHandle('browser:action',(event,action,value)=>browser.action(event.sender,action,value))
   protectedHandle('ai:open-link',async(_event,value:unknown)=>{
    if(typeof value!=='string'||value.length>8000)throw new Error('链接无效')
    const url=new URL(value)
    if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('仅支持无认证信息的 HTTP / HTTPS 链接')
-   await shell.openExternal(url.href)
+   await browser.open(url.href)
   })
   protectedHandle('workflow:open-editor',async(_event,value:unknown)=>{
    if(value!==undefined&&typeof value!=='string')throw new Error('工作流标识无效')

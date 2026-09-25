@@ -15,6 +15,10 @@ import type { MCPAdapter } from './mcp-adapter.js'
 
 export class CapabilityRegistry {
   private capabilities = new Map<string, Capability>()
+  private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal)=>Promise<unknown>;available:()=>boolean}>()
+  registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal)=>Promise<unknown>,available:()=>boolean=()=>true){
+    this.register(capability);this.builtinHandlers.set(capability.name,{run,available})
+  }
 
   constructor(
     private skillPlatform: SkillPlatform,
@@ -51,6 +55,13 @@ export class CapabilityRegistry {
     }
   }
 
+  refreshMCP(): void {
+    for (const [name, capability] of this.capabilities) {
+      if (capability.source.type === 'mcp') this.capabilities.delete(name)
+    }
+    for (const capability of this.mcpAdapter?.getAllCapabilities() || []) this.register(capability)
+  }
+
   /**
    * 从 Skill Platform 加载能力
    */
@@ -76,7 +87,7 @@ export class CapabilityRegistry {
         runtime: 'python-native',
         permissions: this.extractPermissions(skill.manifest.permissions),
         examples: tool.examples,
-        tags: [skillId, category]
+        tags: [skillId, category, ...(tool.risk !== 'read' ? ['requires-approval', `risk:${tool.risk || 'high'}`] : [])]
       })
     }
   }
@@ -135,7 +146,7 @@ export class CapabilityRegistry {
    * 列出能力
    */
   list(options?: CapabilityQueryOptions): Capability[] {
-    let capabilities = Array.from(this.capabilities.values())
+    let capabilities = Array.from(this.capabilities.values()).filter(capability=>this.builtinHandlers.get(capability.name)?.available()!==false)
 
     // 按分类过滤
     if (options?.category) {
@@ -219,7 +230,8 @@ export class CapabilityRegistry {
           toolName,
           request.args,
           signal,
-          request.workspace
+          request.workspace,
+          request.context
         )
 
       } else if (capability.runtime === 'mcp') {
@@ -231,8 +243,11 @@ export class CapabilityRegistry {
         return await this.mcpAdapter.execute(request, signal)
 
       } else if (capability.runtime === 'builtin') {
-        // TODO: 内置能力执行
-        throw new Error('Builtin runtime not yet implemented')
+        const handler=this.builtinHandlers.get(capability.name)
+        if(!handler||!handler.available())throw new Error('插件未启用或能力不可用')
+        signal.throwIfAborted()
+        output=await handler.run(request.args,signal)
+        signal.throwIfAborted()
 
       } else {
         throw new Error(`Unknown runtime: ${capability.runtime}`)
@@ -289,7 +304,7 @@ export class CapabilityRegistry {
    * 获取统计信息
    */
   getStats(): CapabilityStats {
-    const capabilities = Array.from(this.capabilities.values())
+    const capabilities = this.list()
 
     const byCategory: Record<string, number> = {}
     const byRuntime: Record<string, number> = {}

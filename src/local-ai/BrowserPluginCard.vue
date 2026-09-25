@@ -1,0 +1,9 @@
+<script setup lang="ts">
+import {onMounted,ref} from 'vue'
+const enabled=ref(false),busy=ref(false),error=ref('')
+onMounted(async()=>{try{enabled.value=(await window.myplane.browser('plugin-state')).automationEnabled}catch(cause){error.value=String(cause)}})
+async function toggle(){busy.value=true;error.value='';try{enabled.value=(await window.myplane.browser('enable-automation',!enabled.value)).automationEnabled}catch(cause){error.value=String(cause)}finally{busy.value=false}}
+async function open(){try{await window.myplane.browser('open')}catch(cause){error.value=String(cause)}}
+</script>
+<template><section class="browser-plugin-card"><div><strong>浏览器自动化 <small>内置插件 · 可停用</small></strong><p>让 Agent 打开网页、读取内容、点击画布、填写、切换选项和检查布局。需开启会话联网，操作遵循任务权限。</p><p v-if="error" class="error" role="alert">{{error}}</p></div><button @click="open">打开浏览器</button><button role="switch" :aria-checked="enabled" aria-label="启用浏览器自动化插件" :disabled="busy" @click="toggle">{{busy?'处理中…':enabled?'已启用':'启用插件'}}</button></section></template>
+<style scoped>.browser-plugin-card{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--s-border);flex:none;background:var(--s-panel);flex-wrap:wrap}.browser-plugin-card>div{flex:1;min-width:200px}.browser-plugin-card strong{font-size:13px}.browser-plugin-card small{font-size:10px;font-weight:400;color:var(--s-dim);margin-left:8px}.browser-plugin-card p{font-size:11px;color:var(--s-dim);margin:5px 0 0;line-height:1.6}.browser-plugin-card button{border:1px solid var(--s-border);border-radius:6px;padding:6px 12px;background:var(--s-panel);color:var(--s-text);font-size:12px;cursor:pointer}.browser-plugin-card button[aria-checked=true]{background:var(--s-accent);color:var(--s-on-accent)}.browser-plugin-card .error{color:var(--s-danger)}</style>

@@ -4,7 +4,8 @@ import path from 'node:path'
 import {readIntegrationJson,writeIntegrationJson} from '../integration-store.js'
 import type {AgentTask} from '../../shared/local-ai-agent.js'
 import type {AutomationRun,AutomationTask,AutomationTaskInput,AutomationTemplate,AutomationTrigger} from '../../shared/local-ai-automation.js'
-import {LocalAgentService} from './service.js'
+import type {LocalAgentService} from './service.js'
+import type {CoreWorkflowAdapter} from './core-workflow-adapter.js'
 
 const now=()=>new Date().toISOString()
 const minute=60_000
@@ -52,7 +53,7 @@ export class AutomationService {
  private timer?:ReturnType<typeof setInterval>
  private ticking=false
  private readonly timeouts=new Map<string,ReturnType<typeof setTimeout>>()
- constructor(private directory:string,private agent:LocalAgentService,private log?:(level:'info'|'warn'|'error',message:string)=>void,private notify?:(title:string,body:string)=>void,private workflows?:{exists:(id:string)=>boolean;start:(id:string,onUpdate:(run:{id:string;status:string;agentTaskIds:string[];summary?:string;error?:string})=>void)=>{id:string};cancel:(id:string)=>void}){this.tasksFile=path.join(directory,'tasks.json');this.runsFile=path.join(directory,'runs.json');this.recover();this.timer=setInterval(()=>this.scheduleTick(),15_000);this.timer.unref?.();this.scheduleTick()}
+ constructor(private directory:string,private agent:Pick<LocalAgentService, 'start' | 'stop'> | CoreWorkflowAdapter,private log?:(level:'info'|'warn'|'error',message:string)=>void,private notify?:(title:string,body:string)=>void,private workflows?:{exists:(id:string)=>boolean;start:(id:string,onUpdate:(run:{id:string;status:string;agentTaskIds:string[];summary?:string;error?:string})=>void)=>{id:string};cancel:(id:string)=>void},startScheduler=true){this.tasksFile=path.join(directory,'tasks.json');this.runsFile=path.join(directory,'runs.json');this.recover();if(startScheduler){this.timer=setInterval(()=>this.scheduleTick(),15_000);this.timer.unref?.();this.scheduleTick()}}
  private scheduleTick(){void this.tick().catch(error=>this.log?.('error','定时调度检查失败；'+String(error)))}
  templates(){return structuredClone(templates)}
  tasks(){const rows=readIntegrationJson<(AutomationTask&{projectId?:string})[]>(this.tasksFile,[]);if(!Array.isArray(rows))throw new Error('定时任务记录已损坏');if(rows.some(item=>'projectId' in item)){for(const item of rows)delete item.projectId;this.writeTasks(rows)}return rows.sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt))}

@@ -8,6 +8,7 @@ import type {AgentToolCommands} from './local-ai-tools.js'
 import type {StudioDeveloperCommands} from './local-ai-developer.js'
 import type {AutomationCommands} from './local-ai-automation.js'
 import type {WorkflowCommands} from './local-ai-workflow.js'
+import type {AgentEvent as CoreAgentEvent, ExecutionResult as CoreExecutionResult} from './types/agent.js'
 
 export type StudioSettings = LocalAiSettings & {
   source: 'external'|'managed'
@@ -20,6 +21,8 @@ export type StudioSettings = LocalAiSettings & {
   topP: number
   repeatPenalty: number
   systemPrompt: string
+  backgroundImage?: string
+  backgroundOpacity?: number
   theme: 'system'|'light'|'dark'
   appearanceStyle: 'minimal'|'ocean'|'paper'|'terminal'
 }
@@ -40,13 +43,17 @@ export type StudioServerModel = {id:string;name:string;loaded?:boolean;instanceI
 export type StudioRemoteModelCache = {apiFormat:string;endpoint:string;updatedAt:string;models:StudioServerModel[]}
 export type StudioConnection = {ok:boolean;endpoint:string;latencyMs:number;models:StudioServerModel[];error:string;provider:'lmstudio'|'openai'|'deepseek'|'anthropic'}
 export type StudioImage = {name:string;dataUrl:string}
-export type StudioMessage = {usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
-export type StudioSession = {projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
+export type StudioApprovalMode = 'ask'|'auto'|'full'
+export type StudioToolActivity = {id:string;capability:string;args:Record<string,unknown>;status:'waiting'|'running'|'complete'|'error'|'denied';output?:string}
+export type StudioProgress = {id:string;type:'progress';text:string;phase:'working'|'reviewing'|'context';createdAt:string}
+export type StudioExecutionEntry = StudioProgress | {id:string;type:'tool';activityId:string;createdAt:string}
+export type StudioMessage = {execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
+export type StudioSession = {pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
 export type StudioSessionSummary = Omit<StudioSession,'messages'> & {messageCount:number}
-export type StudioEvent = {type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
+export type StudioEvent = {type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
 export type StudioHardware = {platform:string;arch:string;cpu:string;threads:number;totalMemory:number;freeMemory:number}
 export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;hardware:StudioHardware;remoteModelCache:StudioRemoteModelCache[]}
-export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean}
+export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean;chatToolsSupported?:boolean}
 
 export type StudioCommands = {
   bootstrap:{input:undefined;output:StudioBootstrap}
@@ -76,11 +83,39 @@ export type StudioCommands = {
   loadExternal:{input:{id:string;unload?:boolean};output:StudioConnection}
   sessions:{input:undefined;output:StudioSessionSummary[]}
   session:{input:{id:string};output:StudioSession}
-  newSession:{input:undefined;output:StudioSession}
-  updateSession:{input:{id:string;projectId?:string;title?:string;model?:string;systemPrompt?:string};output:StudioSession}
+  newSession:{input:{projectId?:string}|undefined;output:StudioSession}
+  updateSession:{input:{id:string;pinned?:boolean;projectId?:string;title?:string;model?:string;systemPrompt?:string};output:StudioSession}
   deleteSession:{input:{id:string};output:void}
-  exportSession:{input:{id:string};output:boolean}
-  chat:{input:{sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean};output:{started:boolean}}
+  exportSession:{input:{id:string;format?:'md'|'pdf'|'json'};output:boolean}
+  chat:{input:{sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;workspaceToken?:string};output:{started:boolean}}
   compactSession:{input:{sessionId:string;requestId:string;model:string};output:{started:boolean}}
+  chatApprove:{input:{requestId:string;approvalId:string;approved:boolean};output:void}
   stopChat:{input:{requestId:string};output:void}
-}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands
+}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands
+
+export type AgentCoreUiEvent = {taskId:string;event:CoreAgentEvent}|{taskId:string;result:CoreExecutionResult}|{taskId:string;error:string}|{taskId:string;cancelled:true}|{taskId:string;approval:{id:string;capability:string;args:Record<string,unknown>}}
+export type AgentCoreCommands = {
+  agentCoreStatus:{input:undefined;output:{enabled:boolean;available:boolean;initialized:boolean;runningTasks:number;skillsCount:number;capabilitiesCount:number;mcpServers:number}}
+  agentCoreChooseWorkspace:{input:undefined;output:{path:string;token:string}|null}
+  agentCoreListCapabilities:{input:undefined;output:Array<{name:string;category:string;source:'builtin'|'skill'|'mcp';description:string;parameters:Array<{name:string;type:string;required:boolean;description?:string}>;enabled:boolean;status:'active'}>}
+  agentCoreRun:{input:{workspaceToken:string;model:string;prompt:string;mode:'general'|'coding'|'documents'};output:{taskId:string}}
+  agentCoreCancel:{input:{taskId:string};output:void}
+  agentCoreApprove:{input:{taskId:string;approvalId:string;approved:boolean};output:void}
+  agentCoreMcpList:{input:undefined;output:Array<{id:string;name:string;command:string;args:string[];connected:boolean}>}
+  agentCoreMcpAdd:{input:{id:string;name:string;command:string;args:string[]};output:void}
+  agentCoreMcpConnect:{input:{id:string};output:void}
+  agentCoreMcpDisconnect:{input:{id:string};output:void}
+  agentCoreMcpRemove:{input:{id:string};output:void}
+}
+
+export type SkillCommands = {
+  skillsList: {input: undefined; output: any[]}
+  skillsReload: {input: undefined; output: void}
+  skillGetContent: {input: {skillName: string}; output: {skillJson: any; indexPy: string; enginePy: string | null; readme: string}}
+  skillCompile: {input: {skillName: string; indexPy: string; enginePy?: string | null}; output: {success: boolean}}
+  skillSave: {input: {skillName: string; skillJson: any; indexPy: string; enginePy: string | null; readme: string}; output: void}
+  skillTestTool: {input: {skillName: string; toolName: string; args: any; workspace: string}; output: {output: string; elapsedMs: number}}
+  skillDelete: {input: {skillName: string}; output: void}
+  skillCreate: {input: {skillName: string}; output: void}
+  getDefaultWorkspace: {input: undefined; output: string}
+}

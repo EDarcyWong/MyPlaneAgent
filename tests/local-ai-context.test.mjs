@@ -85,6 +85,50 @@ test('summary truncation retries with bounded extra generation room and never us
  assert.ok(checkpoint);assert.ok(calls>=2);assert.deepEqual(messages,original)
 })
 
+test('large local contexts can finish reasoning summaries beyond the fixed 2048-token retry limit',async()=>{
+ const messages=[{role:'user',content:'检查项目，不要部署。'},{role:'assistant',content:'已检查的原始记录。'.repeat(5000)},{role:'user',content:'继续验证'}]
+ const original=structuredClone(messages),limits=[]
+ const settings={contextLength:32768,maxTokens:8192}
+ const checkpoint=await compactContext({history:messages,system,budget:settings,signal:signal(),summarize:async(rows,limit)=>{
+  limits.push(limit)
+  assert.ok(estimateTokens(rows)+limit<settings.contextLength)
+  assert.ok(limit<=settings.maxTokens)
+  assert.match(rows[0].content,/摘要最多 170 字/)
+  if(limit<=2048)throw new ModelOutputLimitError(limit)
+  return '<think>模型仍然进行了内部分析</think>检查项目，不要部署。已检查代码，待验证。'
+ }})
+ assert.deepEqual(limits.slice(0,2),[2048,8192])
+ assert.doesNotMatch(checkpoint.summary,/<think>|内部分析/)
+ assert.doesNotThrow(()=>assertContextFits(contextStatus(messages,system,checkpoint,settings)))
+ assert.deepEqual(messages,original)
+})
+
+test('summary input excludes thinking traces but keeps complete tool evidence and stored history',async()=>{
+ const call={id:'write1',type:'function',function:{name:'write_file',arguments:'{"path":"report.txt","content":"report"}'}}
+ const messages=[{role:'user',content:'生成报告，不要删除文件'},
+  {role:'assistant',content:'准备写入',reasoning_content:'PRIVATE_TRACE'.repeat(10000),tool_calls:[call]},
+  {role:'tool',tool_call_id:'write1',content:'已成功写入'},
+  {role:'assistant',content:'报告已写入'}, {role:'user',content:'验证结果'}]
+ const original=structuredClone(messages)
+ const checkpoint=await compactContext({history:messages,system,budget,force:true,signal:signal(),summarize:async rows=>{
+  assert.doesNotMatch(rows[1].content,/PRIVATE_TRACE|reasoning_content/)
+  assert.ok(rows[1].content.includes(JSON.stringify(call)))
+  assert.match(rows[1].content,/已成功写入|write1/)
+  return '已写入 report.txt；不要删除文件；待验证。'
+ }})
+ assert.ok(checkpoint);assert.deepEqual(messages,original)
+})
+
+test('summary exhaustion reports its own budget and recovery failure without task-output advice',async()=>{
+ await assert.rejects(compactContext({history:history(),system,budget,signal:signal(),summarize:async(_rows,limit)=>{throw new ModelOutputLimitError(limit)}}),error=>{
+  assert.ok(error instanceof ModelOutputLimitError)
+  assert.match(error.message,/历史摘要达到本次 1024 Token/)
+  assert.match(error.message,/无法安全恢复/)
+  assert.doesNotMatch(error.message,/本轮工具未执行|Error:|工作区默认值/)
+  return true
+ })
+})
+
 test('repeated summary truncation pauses after one retry without replacing checkpoint',async()=>{
  const messages=history(),previous={summary:'旧摘要',through:1,compactions:1,updatedAt:'before'},saved=structuredClone(previous);let calls=0
  await assert.rejects(compactContext({history:messages,system,checkpoint:previous,budget,force:true,signal:signal(),summarize:async(_rows,limit)=>{calls++;throw new ModelOutputLimitError(limit)}}),/截断/)
@@ -114,4 +158,74 @@ test('summary truncation retry obeys configured output cap and cancellation',asy
   }})
   if(cancel){await assert.rejects(run,/cancel summary/);assert.equal(calls,1)}else{assert.ok(await run);assert.ok(calls>=2)}
  }
+})
+
+test('a useful summary above the old fixed threshold is accepted if it fits and reduces history',async()=>{
+ const messages=[{role:'user',content:'保留数据，不要部署。'},{role:'assistant',content:'历史检查结果。'.repeat(4000)},{role:'user',content:'继续验证'}]
+ const next='已检查文件，尚未部署，需要继续验证。'.repeat(45)
+ assert.ok(estimateTokens(next)>1024)
+ const checkpoint=await compactContext({history:messages,system,budget:{contextLength:65536,maxTokens:32768},force:true,signal:signal(),summarize:async()=>next})
+ assert.equal(checkpoint.summary,next)
+ assert.doesNotThrow(()=>assertContextFits(contextStatus(messages,system,checkpoint,{contextLength:65536,maxTokens:32768})))
+})
+
+test('empty and oversized summaries retry with the original source and preserve the latest request',async()=>{
+ for(const bad of ['', '摘要'.repeat(10000)]){
+  let calls=0;const sources=[];const messages=history()
+  const checkpoint=await compactContext({history:messages,system,budget,force:true,signal:signal(),summarize:async rows=>{
+   sources.push(rows[1].content);return ++calls===1?bad:'保留数据；尚未部署。继续验证。'
+  }})
+  assert.ok(checkpoint);assert.ok(calls>=2);assert.equal(sources[0],sources[1])
+  assert.equal(contextMessages(messages,system,checkpoint).at(-1),messages.at(-1))
+ }
+})
+
+test('optional summary failure keeps original context usable without installing partial summaries',async()=>{
+ const messages=[{role:'user',content:'不要部署'},{role:'assistant',content:'检查记录。'.repeat(80)},{role:'user',content:'继续'}]
+ const original=structuredClone(messages);let calls=0
+ const result=await compactContext({history:messages,system,budget,force:true,signal:signal(),summarize:async()=>{calls++;return ''}})
+ assert.equal(result,undefined);assert.equal(calls,2);assert.deepEqual(messages,original)
+})
+
+test('mandatory compaction rejects repeated empty summaries without changing old checkpoint',async()=>{
+ const messages=history(),previous={summary:'保留数据，不部署',through:1,updatedAt:'before',compactions:1},original=structuredClone(previous)
+ let calls=0
+ await assert.rejects(compactContext({history:messages,system,checkpoint:previous,budget,force:true,signal:signal(),summarize:async()=>{calls++;return ''}}),/已自动重试一次/)
+ assert.equal(calls,2);assert.deepEqual(previous,original)
+})
+
+test('completed think blocks are excluded from summaries; cancellation does not trigger recovery',async()=>{
+ const messages=history()
+ const checkpoint=await compactContext({history:messages,system,budget,signal:signal(),summarize:async()=>'<think>内部分析</think>保留数据，尚未部署，继续验证。'})
+ assert.doesNotMatch(checkpoint.summary,/<think>|内部分析/)
+ const controller=new AbortController();let calls=0
+ await assert.rejects(compactContext({history:messages,system,budget,signal:controller.signal,summarize:async()=>{calls++;controller.abort();return ''}}))
+ assert.equal(calls,1)
+})
+
+test('repeated truncation recovers from source records without using partial generated output',async()=>{
+ const messages=[{role:'user',content:'查询成都天气，必须提供来源。'},{role:'assistant',content:'旧网页内容'.repeat(6000)},{role:'user',content:'继续，别猜测天气。'}]
+ const original=structuredClone(messages);let calls=0
+ const checkpoint=await compactContext({history:messages,system,budget,signal:signal(),summarize:async(_rows,limit)=>{calls++;throw new ModelOutputLimitError(limit)}})
+ assert.equal(calls,2);assert.equal(checkpoint.source,'recovery');assert.deepEqual(messages,original)
+ const rows=contextMessages(messages,system,checkpoint)
+ assert.equal(rows.at(-1),messages.at(-1));assert.match(checkpoint.summary,/必须提供来源|省略|不要重放/)
+ assert.doesNotThrow(()=>assertContextFits(contextStatus(messages,system,checkpoint,budget)))
+})
+
+test('source recovery preserves all tool identities, arguments and statuses with paired remaining turns',async()=>{
+ const ledger=[{id:'write1',capability:'agent.write_file',args:{path:'report.txt'},status:'complete',output:'结果'.repeat(4000)},{id:'deny1',capability:'agent.run_command',args:{command:'rm report.txt'},status:'denied',output:'用户拒绝'}]
+ const messages=[{role:'user',content:'创建报告，不要删除文件。'},{role:'assistant',content:'执行记录。\\n\\n本轮工具记录（资料）：\\n'.replaceAll('\\n','\n')+JSON.stringify(ledger)},{role:'user',content:'核实报告是否存在'}]
+ const checkpoint=await compactContext({history:messages,system,budget,signal:signal(),summarize:async()=>''})
+ assert.equal(checkpoint.source,'recovery')
+ const recovered=JSON.parse(checkpoint.summary)
+ const saved=recovered.records[0].executions
+ assert.deepEqual(saved.map(({id,capability,args,status})=>({id,capability,args,status})),ledger.map(({id,capability,args,status})=>({id,capability,args,status})))
+ assert.deepEqual(recovered.userRequests,['创建报告，不要删除文件。'])
+})
+
+test('source recovery refuses to drop user constraints or replace old images with guessed text',async()=>{
+ const {recoverContext}=await import('../dist-electron/main/local-ai-context.js')
+ assert.throws(()=>recoverContext([{role:'user',content:'不可省略的约束'.repeat(5000)}],system,undefined,budget,1),/无法安全恢复/)
+ assert.throws(()=>recoverContext([{role:'user',content:[{type:'image_url',image_url:{url:'data:image/png;base64,original'}}]}],system,undefined,budget,1),/包含图片/)
 })

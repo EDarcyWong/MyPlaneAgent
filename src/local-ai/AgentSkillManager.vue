@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import BrowserPluginCard from './BrowserPluginCard.vue'
+import { computed, defineAsyncComponent, onMounted, ref } from 'vue'
+import {ElMessage} from 'element-plus'
+const SkillCodeEditor = defineAsyncComponent(() => import('./SkillCodeEditor.vue'))
+import AgentCapabilityRegistry from './AgentCapabilityRegistry.vue'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import {
   Refresh,
   Check,
   VideoPlay,
-  Clock,
   Search,
   EditPen,
   Document,
@@ -13,8 +16,7 @@ import {
   MagicStick,
   FolderOpened,
   Plus,
-  Download,
-  Upload
+  Operation
 } from '@element-plus/icons-vue'
 
 // 类型定义
@@ -38,7 +40,7 @@ interface SkillInfo {
 }
 
 type Section = 'edit' | 'test' | 'info'
-type Filter = 'all' | 'file' | 'git' | 'network' | 'system' | 'general'
+type Filter = string
 
 // 状态
 const skills = ref<SkillInfo[]>([])
@@ -48,13 +50,25 @@ const error = ref('')
 const query = ref('')
 const filter = ref<Filter>('all')
 const section = ref<Section>('info')
+const view = ref<'manage' | 'capabilities'>('manage')
 
 // 编辑状态
-const editingFile = ref<'skill.json' | 'index.py' | 'README.md'>('skill.json')
+const editingFile = ref<'skill.json' | 'index.py' | 'engine.py' | 'README.md'>('skill.json')
 const skillJsonContent = ref('')
 const indexPyContent = ref('')
+const enginePyContent = ref<string | null>(null)
 const readmeContent = ref('')
 const baseline = ref('')
+
+const editorContent = computed({
+  get: () => editingFile.value === 'skill.json' ? skillJsonContent.value : editingFile.value === 'index.py' ? indexPyContent.value : editingFile.value === 'engine.py' ? enginePyContent.value || '' : readmeContent.value,
+  set: (value: string) => {
+    if (editingFile.value === 'skill.json') skillJsonContent.value = value
+    else if (editingFile.value === 'index.py') indexPyContent.value = value
+    else if (editingFile.value === 'engine.py') enginePyContent.value = value
+    else readmeContent.value = value
+  }
+})
 
 // 测试状态
 const testTool = ref('')
@@ -65,14 +79,10 @@ const testWorkspace = ref('')
 // 计算属性
 const selected = computed(() => skills.value.find(s => s.name === selectedSkill.value))
 
-const counts = computed(() => ({
-  all: skills.value.length,
-  file: skills.value.filter(s => s.category === 'file').length,
-  git: skills.value.filter(s => s.category === 'git').length,
-  network: skills.value.filter(s => s.category === 'network').length,
-  system: skills.value.filter(s => s.category === 'system').length,
-  general: skills.value.filter(s => s.category === 'general').length
-}))
+const categories = computed(() => [...new Set(skills.value.map(skill => skill.category))])
+const enabledCount = computed(() => skills.value.filter(skill => skill.loaded).length)
+const currentTool = computed(() => selected.value?.tools.find(tool => tool.name === testTool.value))
+const snapshot = () => JSON.stringify({skillJson: skillJsonContent.value, indexPy: indexPyContent.value, enginePy: enginePyContent.value, readme: readmeContent.value})
 
 const filtered = computed(() => {
   const word = query.value.trim().toLowerCase()
@@ -83,28 +93,15 @@ const filtered = computed(() => {
     }
     // 过滤搜索词
     if (word) {
-      return [skill.name, skill.displayName, skill.description]
+      return [skill.name, skill.displayName, skill.description, ...skill.tools.flatMap(tool => [tool.name, tool.description])]
         .some(v => v.toLowerCase().includes(word))
     }
     return true
   })
 })
 
-const categoryIcon = (category: string) => {
-  const icons = {
-    file: '📁',
-    git: '🔧',
-    network: '🌐',
-    system: '⚙️',
-    document: '📄',
-    test: '🧪',
-    general: '🔨'
-  }
-  return icons[category] || '📦'
-}
-
 const categoryLabel = (category: string) => {
-  const labels = {
+  const labels: Record<string, string> = {
     file: '文件',
     git: 'Git',
     network: '网络',
@@ -116,37 +113,18 @@ const categoryLabel = (category: string) => {
   return labels[category] || category
 }
 
-const dirty = computed(() => {
-  if (!selected.value) return false
-  const current = JSON.stringify({
-    skillJson: skillJsonContent.value,
-    indexPy: indexPyContent.value,
-    readme: readmeContent.value
-  })
-  return current !== baseline.value
-})
+const dirty = computed(() => !!selected.value && snapshot() !== baseline.value)
 
-// 方法
 async function load() {
-  busy.value = true
-  error.value = ''
-  try {
-    skills.value = await window.myplane.localAiStudio('skillsList')
-    if (!testWorkspace.value) {
-      testWorkspace.value = await window.myplane.localAiStudio('getDefaultWorkspace')
-    }
-  } catch (e) {
-    error.value = String(e).replace(/^Error: /, '')
-  } finally {
-    busy.value = false
-  }
+  skills.value = await window.myplane.localAiStudio('skillsList')
+  if (!testWorkspace.value) testWorkspace.value = await window.myplane.localAiStudio('getDefaultWorkspace')
 }
 
 async function refresh() {
   await run(async () => {
     await window.myplane.localAiStudio('skillsReload')
     await load()
-    ElMessage.success('已刷新 Skills')
+    ElMessage.success('已刷新插件')
   })
 }
 
@@ -156,27 +134,26 @@ async function loadSkillContent(skill: SkillInfo) {
       skillName: skill.name
     })
 
+    selectedSkill.value = skill.name
+    editingFile.value = 'skill.json'
     skillJsonContent.value = JSON.stringify(content.skillJson, null, 2)
     indexPyContent.value = content.indexPy
+    enginePyContent.value = content.enginePy
     readmeContent.value = content.readme
 
-    baseline.value = JSON.stringify({
-      skillJson: skillJsonContent.value,
-      indexPy: indexPyContent.value,
-      readme: readmeContent.value
-    })
+    baseline.value = snapshot()
 
     section.value = 'info'
     testTool.value = skill.tools[0]?.name || ''
     testArgs.value = '{}'
     testOutput.value = ''
   } catch (e) {
-    error.value = `加载 Skill 内容失败: ${e}`
+    throw new Error(`加载插件内容失败: ${e}`)
   }
 }
 
 async function selectSkill(skillName: string) {
-  if (skillName === selectedSkill.value) return
+  if (busy.value || skillName === selectedSkill.value) return
 
   if (dirty.value) {
     try {
@@ -194,11 +171,18 @@ async function selectSkill(skillName: string) {
     }
   }
 
-  selectedSkill.value = skillName
   const skill = skills.value.find(s => s.name === skillName)
   if (skill) {
-    await loadSkillContent(skill)
+    await run(() => loadSkillContent(skill))
   }
+}
+
+async function compileSkill() {
+  if (!selected.value) return
+  await run(async () => {
+    await window.myplane.localAiStudio('skillCompile', {skillName: selected.value!.name, indexPy: indexPyContent.value, enginePy: enginePyContent.value})
+    ElMessage.success('Python 编译通过')
+  })
 }
 
 async function saveSkill() {
@@ -206,24 +190,30 @@ async function saveSkill() {
 
   await run(async () => {
     try {
+      const skillName = selected.value!.name
+      const activeSection = section.value
+      const activeFile = editingFile.value
       const skillJson = JSON.parse(skillJsonContent.value)
 
       await window.myplane.localAiStudio('skillSave', {
         skillName: selected.value!.name,
         skillJson,
         indexPy: indexPyContent.value,
+        enginePy: enginePyContent.value,
         readme: readmeContent.value
       })
 
-      await refresh()
+      await load()
 
       // 重新加载内容以更新 baseline
-      const skill = skills.value.find(s => s.name === selected.value!.name)
+      const skill = skills.value.find(s => s.name === skillName)
       if (skill) {
         await loadSkillContent(skill)
       }
 
-      ElMessage.success('Skill 已保存')
+      section.value = activeSection
+      editingFile.value = activeFile
+      ElMessage.success('已保存并加载，可在对话中使用')
     } catch (e) {
       throw new Error(`保存失败: ${e}`)
     }
@@ -231,7 +221,7 @@ async function saveSkill() {
 }
 
 async function testSkillTool() {
-  if (!selected.value || !testTool.value) return
+  if (!selected.value || !testTool.value || dirty.value) return
 
   await run(async () => {
     try {
@@ -257,16 +247,32 @@ async function testSkillTool() {
   })
 }
 
+async function deleteSelectedSkill(){
+  const skill=selected.value;if(!skill||busy.value)return
+  try{await ElMessageBox.confirm(`删除“${skill.displayName}”后，其工具将不可用，插件文件会移到回收站。${dirty.value?'未保存的修改将丢失。':''}`,'删除插件',{type:'warning',confirmButtonText:'删除插件',cancelButtonText:'取消'})}catch{return}
+  await run(async()=>{
+    await window.myplane.localAiStudio('skillDelete',{skillName:skill.name})
+    selectedSkill.value='';baseline.value='';testOutput.value=''
+    await load()
+    if(filtered.value[0])await loadSkillContent(filtered.value[0])
+    ElMessage.success('插件已删除，文件已移到回收站')
+  })
+}
+
 async function createNewSkill() {
+  if (busy.value) return
+  if (dirty.value) {
+    try { await ElMessageBox.confirm('当前修改尚未保存，创建后将离开此插件。', '放弃未保存修改？', {confirmButtonText: '放弃修改', cancelButtonText: '继续编辑'}) } catch { return }
+  }
   try {
     const { value: skillName } = await ElMessageBox.prompt(
-      '输入 Skill 标识（小写字母、数字、连字符）',
-      '创建新 Skill',
+      '输入插件标识（小写字母、数字、连字符）',
+      '创建新插件',
       {
         confirmButtonText: '创建',
         cancelButtonText: '取消',
         inputPattern: /^[a-z][a-z0-9-]{0,63}$/,
-        inputErrorMessage: 'Skill 标识格式不正确'
+        inputErrorMessage: '插件标识格式不正确'
       }
     )
 
@@ -274,26 +280,16 @@ async function createNewSkill() {
       await window.myplane.localAiStudio('skillCreate', {
         skillName: skillName.trim()
       })
-      await refresh()
-      selectedSkill.value = skillName.trim()
+      await load()
       const skill = skills.value.find(s => s.name === skillName.trim())
       if (skill) {
         await loadSkillContent(skill)
       }
-      ElMessage.success(`Skill ${skillName} 已创建`)
+      ElMessage.success(`插件 ${skillName} 已创建`)
     })
   } catch {
     // 用户取消
   }
-}
-
-async function importSkill() {
-  ElMessage.info('导入功能开发中...')
-}
-
-async function exportSkill() {
-  if (!selected.value) return
-  ElMessage.info('导出功能开发中...')
 }
 
 function formatJson(field: 'skillJson' | 'args') {
@@ -323,29 +319,39 @@ async function run(work: () => Promise<void>) {
   }
 }
 
-onMounted(() => run(load))
+onMounted(() => run(async () => {
+  await load()
+  if (skills.value[0]) await loadSkillContent(skills.value[0])
+}))
+async function createFromToolbar(){view.value='manage';await createNewSkill()}
+defineExpose({ create: createFromToolbar })
 </script>
 
 <template>
-  <main class="skill-manager">
+  <main class="skill-manager" :aria-busy="busy">
+    <nav class="skill-view-tabs" aria-label="插件页面">
+      <button type="button" :class="{active:view==='manage'}" :aria-current="view==='manage'?'page':undefined" @click="view='manage'">插件管理</button>
+      <button type="button" :class="{active:view==='capabilities'}" :aria-current="view==='capabilities'?'page':undefined" @click="view='capabilities'">可用能力</button>
+    </nav>
     <p v-if="error" class="skill-error" role="alert">
       <Warning />
       <span>{{ error }}</span>
       <button @click="error = ''">关闭</button>
     </p>
 
-    <div class="skill-layout">
-      <!-- 左侧：Skill 列表 -->
+    <BrowserPluginCard v-if="view==='manage'"/>
+    <div v-show="view==='manage'" class="skill-layout">
+      <!-- 左侧：插件列表 -->
       <aside class="skill-browser">
         <header class="browser-head">
           <div>
-            <h2>Skills 管理</h2>
-            <span>{{ counts.all }} 个 Skill · Python Native</span>
+            <h2>插件管理</h2>
+            <span>{{ skills.length }} 个插件 · {{ enabledCount }} 个已启用</span>
           </div>
           <button
             class="icon-action"
             :disabled="busy"
-            title="刷新 Skills"
+            title="刷新插件"
             @click="refresh"
           >
             <Refresh />
@@ -353,11 +359,8 @@ onMounted(() => run(load))
         </header>
 
         <div class="browser-actions">
-          <button class="primary-button" @click="createNewSkill">
-            <Plus /> 新建 Skill
-          </button>
-          <button class="secondary-button" @click="importSkill">
-            <Upload /> 导入
+          <button class="primary-button" :disabled="busy" @click="createNewSkill">
+            <Plus /> 新建插件
           </button>
         </div>
 
@@ -365,22 +368,12 @@ onMounted(() => run(load))
           <Search />
           <input
             v-model="query"
-            placeholder="搜索 Skill..."
-            aria-label="搜索 Skill"
+            placeholder="搜索插件..."
+            aria-label="搜索插件"
           />
         </div>
 
-        <div class="skill-filters">
-          <button
-            v-for="cat in ['all', 'file', 'git', 'network', 'system', 'general'] as const"
-            :key="cat"
-            :class="{ active: filter === cat }"
-            @click="filter = cat"
-          >
-            {{ cat === 'all' ? '全部' : categoryLabel(cat) }}
-            <span>{{ counts[cat] }}</span>
-          </button>
-        </div>
+        <label class="skill-filters"><span>分类</span><select v-model="filter" aria-label="筛选插件分类"><option value="all">全部分类</option><option v-for="cat in categories" :key="cat" :value="cat">{{ categoryLabel(cat) }}</option></select><small>{{ filtered.length }} 项</small></label>
 
         <div class="skill-list">
           <button
@@ -390,13 +383,13 @@ onMounted(() => run(load))
               active: selectedSkill === skill.name,
               'not-loaded': !skill.loaded
             }"
-            @click="selectSkill(skill.name)"
+            :disabled="busy" :aria-pressed="selectedSkill === skill.name" @click="selectSkill(skill.name)"
           >
-            <span class="skill-icon">{{ categoryIcon(skill.category) }}</span>
+            <span class="skill-icon"><Operation /></span>
             <span class="skill-copy">
               <span class="skill-primary">
-                <strong>{{ skill.displayName }}</strong>
-                <i :class="{ loaded: skill.loaded }" />
+                <strong :title="skill.displayName">{{ skill.displayName }}</strong>
+                <i :class="{ loaded: skill.loaded }" :title="skill.loaded ? '已启用' : '未启用'" />
               </span>
               <small>
                 <code>{{ skill.name }}</code>
@@ -407,21 +400,21 @@ onMounted(() => run(load))
 
           <div v-if="!filtered.length" class="empty-skills">
             <Search />
-            <p>没有匹配的 Skill</p>
-            <button v-if="query" class="text-button" @click="query = ''">
-              清除搜索
+            <p>{{ busy ? '正在加载插件…' : skills.length ? '没有匹配的插件' : '还没有插件' }}</p>
+            <button v-if="query || filter !== 'all'" class="text-button" @click="query = ''; filter = 'all'">
+              清除筛选
             </button>
           </div>
         </div>
       </aside>
 
-      <!-- 右侧：Skill 详情/编辑 -->
+      <!-- 右侧：插件详情/编辑 -->
       <section class="skill-editor">
         <div v-if="!selected" class="empty-editor">
           <FolderOpened />
-          <p>选择一个 Skill 开始管理</p>
-          <button class="primary-button" @click="createNewSkill">
-            <Plus /> 创建新 Skill
+          <p>选择一个插件开始管理</p>
+          <button class="primary-button" :disabled="busy" @click="createNewSkill">
+            <Plus /> 创建新插件
           </button>
         </div>
 
@@ -436,19 +429,14 @@ onMounted(() => run(load))
               <p>{{ selected.name }} · {{ categoryLabel(selected.category) }}</p>
             </div>
             <div class="editor-actions">
-              <button
-                class="secondary-button"
-                :disabled="busy"
-                @click="exportSkill"
-              >
-                <Download /> 导出
-              </button>
+              <button class="secondary-button plugin-delete" :disabled="busy" @click="deleteSelectedSkill">删除插件</button>
+              <button class="secondary-button" :disabled="busy" @click="compileSkill">编译校验</button>
               <button
                 class="primary-button"
                 :disabled="busy || !dirty"
                 @click="saveSkill"
               >
-                <Check /> 保存
+                <Check /> 保存并使用
               </button>
             </div>
           </header>
@@ -458,7 +446,7 @@ onMounted(() => run(load))
               :class="{ active: section === 'info' }"
               @click="section = 'info'"
             >
-              <Document /> 信息
+              <Document /> 概览
             </button>
             <button
               :class="{ active: section === 'edit' }"
@@ -476,10 +464,12 @@ onMounted(() => run(load))
 
           <!-- 信息面板 -->
           <div v-show="section === 'info'" class="editor-pane info-pane">
+            <p class="skill-description">{{ selected.description || '尚未添加描述' }}</p>
+            <div class="overview-badges"><span :class="{enabled:selected.loaded}">{{ selected.loaded ? '已启用' : '未启用' }}</span><span>{{ selected.runtime }}</span><span>{{ selected.tools.length }} 个工具</span></div>
             <section class="info-section">
               <h3>基本信息</h3>
               <dl>
-                <dt>Skill 标识</dt>
+                <dt>插件标识</dt>
                 <dd><code>{{ selected.name }}</code></dd>
 
                 <dt>显示名称</dt>
@@ -494,17 +484,18 @@ onMounted(() => run(load))
                 <dt>运行时</dt>
                 <dd>{{ selected.runtime }}</dd>
 
-                <dt>描述</dt>
-                <dd>{{ selected.description }}</dd>
+                <dt>本地目录</dt>
+                <dd class="skill-path">{{ selected.skillPath }}</dd>
               </dl>
             </section>
 
             <section class="info-section">
-              <h3>包含的工具 ({{ selected.tools.length }})</h3>
+              <h3>提供的工具 ({{ selected.tools.length }})</h3>
               <div class="tools-list">
                 <div v-for="tool in selected.tools" :key="tool.name" class="tool-card">
-                  <code>{{ tool.name }}</code>
+                  <div class="tool-heading"><code>{{ tool.name }}</code><button class="text-button" @click="testTool = tool.name; section = 'test'">测试 <VideoPlay /></button></div>
                   <p>{{ tool.description }}</p>
+                  <details v-if="tool.inputSchema" class="tool-schema"><summary>参数说明</summary><pre>{{ JSON.stringify(tool.inputSchema, null, 2) }}</pre></details>
                 </div>
               </div>
             </section>
@@ -525,6 +516,7 @@ onMounted(() => run(load))
               >
                 index.py
               </button>
+              <button v-if="enginePyContent !== null" :class="{ active: editingFile === 'engine.py' }" @click="editingFile = 'engine.py'">engine.py</button>
               <button
                 :class="{ active: editingFile === 'README.md' }"
                 @click="editingFile = 'README.md'"
@@ -534,34 +526,17 @@ onMounted(() => run(load))
             </div>
 
             <div class="editor-toolbar">
-              <span>{{ editingFile }}</span>
+              <span>{{ editingFile }} · {{ dirty ? '有未保存修改' : '已保存' }}</span>
               <button
                 v-if="editingFile === 'skill.json'"
                 class="text-button"
-                @click="formatJson('skillJson')"
+                :disabled="busy" @click="formatJson('skillJson')"
               >
                 <MagicStick /> 格式化
               </button>
             </div>
 
-            <textarea
-              v-if="editingFile === 'skill.json'"
-              v-model="skillJsonContent"
-              spellcheck="false"
-              class="code-editor"
-            />
-            <textarea
-              v-else-if="editingFile === 'index.py'"
-              v-model="indexPyContent"
-              spellcheck="false"
-              class="code-editor"
-            />
-            <textarea
-              v-else
-              v-model="readmeContent"
-              spellcheck="false"
-              class="code-editor"
-            />
+            <SkillCodeEditor :key="selected.name" v-model="editorContent" :filename="editingFile" :readonly="busy" @save="saveSkill"/>
           </div>
 
           <!-- 测试面板 -->
@@ -571,17 +546,18 @@ onMounted(() => run(load))
                 <h3>测试工具</h3>
                 <button
                   class="primary-button"
-                  :disabled="busy || !testTool"
+                  :disabled="busy || !testTool || dirty"
                   @click="testSkillTool"
                 >
                   <VideoPlay /> 运行测试
                 </button>
               </header>
 
+              <p class="test-hint">测试会实际执行工具，使用已保存的版本。{{ dirty ? '当前有修改，请先保存并使用。' : '' }}</p><p v-if="currentTool" class="test-hint">{{ currentTool.description }}</p><details v-if="currentTool?.inputSchema" class="tool-schema"><summary>查看参数格式</summary><pre>{{ JSON.stringify(currentTool.inputSchema, null, 2) }}</pre></details>
               <div class="test-controls">
                 <label>
                   <span>选择工具</span>
-                  <select v-model="testTool">
+                  <select v-model="testTool" :disabled="busy">
                     <option value="">选择要测试的工具</option>
                     <option
                       v-for="tool in selected.tools"
@@ -595,7 +571,7 @@ onMounted(() => run(load))
 
                 <label>
                   <span>工作目录</span>
-                  <input v-model="testWorkspace" placeholder="/path/to/workspace" />
+                  <input v-model="testWorkspace" :disabled="busy" placeholder="/path/to/workspace" />
                 </label>
 
                 <label>
@@ -607,6 +583,7 @@ onMounted(() => run(load))
                   </span>
                   <textarea
                     v-model="testArgs"
+                    :readonly="busy"
                     rows="10"
                     spellcheck="false"
                   />
@@ -627,578 +604,10 @@ onMounted(() => run(load))
         </template>
       </section>
     </div>
+    <section v-if="view==='capabilities'" class="skill-capability-view" aria-label="可用能力"><AgentCapabilityRegistry/></section>
   </main>
 </template>
 
-<style scoped>
-.skill-manager {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: #f5f5f5;
-}
+<style scoped src="./skill-manager.css"></style>
 
-.skill-error {
-  background: #fef0f0;
-  color: #f56c6c;
-  padding: 12px 16px;
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  border-bottom: 1px solid #fbc4c4;
-}
-
-.skill-error button {
-  margin-left: auto;
-  padding: 4px 12px;
-  background: transparent;
-  border: 1px solid #f56c6c;
-  color: #f56c6c;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.skill-layout {
-  flex: 1;
-  display: flex;
-  overflow: hidden;
-}
-
-/* 左侧浏览器 */
-.skill-browser {
-  width: 320px;
-  background: white;
-  border-right: 1px solid #e0e0e0;
-  display: flex;
-  flex-direction: column;
-}
-
-.browser-head {
-  padding: 20px;
-  border-bottom: 1px solid #e0e0e0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.browser-head h2 {
-  margin: 0 0 4px 0;
-  font-size: 18px;
-}
-
-.browser-head span {
-  font-size: 13px;
-  color: #666;
-}
-
-.icon-action {
-  padding: 8px;
-  background: transparent;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.icon-action:hover:not(:disabled) {
-  background: #f5f5f5;
-}
-
-.icon-action:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.browser-actions {
-  padding: 12px 20px;
-  display: flex;
-  gap: 8px;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.primary-button {
-  flex: 1;
-  padding: 8px 16px;
-  background: #409eff;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  font-size: 14px;
-}
-
-.primary-button:hover:not(:disabled) {
-  background: #66b1ff;
-}
-
-.primary-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.secondary-button {
-  padding: 8px 16px;
-  background: white;
-  color: #606266;
-  border: 1px solid #dcdfe6;
-  border-radius: 6px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 14px;
-}
-
-.secondary-button:hover:not(:disabled) {
-  background: #f5f5f5;
-}
-
-.skill-search {
-  padding: 12px 20px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.skill-search input {
-  flex: 1;
-  padding: 8px 12px;
-  border: 1px solid #dcdfe6;
-  border-radius: 6px;
-  font-size: 14px;
-}
-
-.skill-filters {
-  display: flex;
-  flex-wrap: wrap;
-  padding: 12px 20px;
-  gap: 8px;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.skill-filters button {
-  padding: 6px 12px;
-  background: white;
-  border: 1px solid #dcdfe6;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.skill-filters button.active {
-  background: #409eff;
-  color: white;
-  border-color: #409eff;
-}
-
-.skill-filters button span {
-  opacity: 0.7;
-  font-size: 12px;
-}
-
-.skill-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
-}
-
-.skill-list > button {
-  width: 100%;
-  padding: 12px;
-  margin-bottom: 6px;
-  background: white;
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
-  cursor: pointer;
-  text-align: left;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  transition: all 0.2s;
-}
-
-.skill-list > button:hover {
-  background: #f5f5f5;
-  border-color: #409eff;
-}
-
-.skill-list > button.active {
-  background: #ecf5ff;
-  border-color: #409eff;
-}
-
-.skill-list > button.not-loaded {
-  opacity: 0.6;
-}
-
-.skill-icon {
-  font-size: 24px;
-  flex-shrink: 0;
-}
-
-.skill-copy {
-  flex: 1;
-  min-width: 0;
-}
-
-.skill-primary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-
-.skill-primary strong {
-  font-size: 14px;
-}
-
-.skill-primary i {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #ddd;
-}
-
-.skill-primary i.loaded {
-  background: #67c23a;
-}
-
-.skill-copy small {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: #909399;
-}
-
-.skill-copy code {
-  background: #f5f5f5;
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 11px;
-}
-
-.empty-skills {
-  text-align: center;
-  padding: 40px 20px;
-  color: #909399;
-}
-
-.empty-skills svg {
-  width: 48px;
-  height: 48px;
-  margin-bottom: 16px;
-  opacity: 0.3;
-}
-
-/* 右侧编辑器 */
-.skill-editor {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: white;
-  overflow: hidden;
-}
-
-.empty-editor {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  color: #909399;
-  gap: 16px;
-}
-
-.empty-editor svg {
-  width: 64px;
-  height: 64px;
-  opacity: 0.3;
-}
-
-.editor-head {
-  padding: 20px 24px;
-  border-bottom: 1px solid #e0e0e0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.editor-title {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 4px;
-}
-
-.editor-title h2 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.unsaved, .saved {
-  padding: 4px 8px;
-  font-size: 12px;
-  border-radius: 4px;
-}
-
-.unsaved {
-  background: #fef0f0;
-  color: #f56c6c;
-}
-
-.saved {
-  background: #f0f9ff;
-  color: #409eff;
-}
-
-.editor-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.editor-tabs {
-  display: flex;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.editor-tabs button {
-  padding: 12px 24px;
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #606266;
-  transition: all 0.2s;
-}
-
-.editor-tabs button:hover {
-  color: #409eff;
-}
-
-.editor-tabs button.active {
-  color: #409eff;
-  border-bottom-color: #409eff;
-}
-
-.editor-pane {
-  flex: 1;
-  overflow-y: auto;
-  padding: 24px;
-}
-
-/* 信息面板 */
-.info-section {
-  margin-bottom: 32px;
-}
-
-.info-section h3 {
-  margin: 0 0 16px 0;
-  font-size: 16px;
-  color: #303133;
-}
-
-.info-section dl {
-  display: grid;
-  grid-template-columns: 120px 1fr;
-  gap: 12px;
-  margin: 0;
-}
-
-.info-section dt {
-  color: #909399;
-  font-size: 14px;
-}
-
-.info-section dd {
-  margin: 0;
-  color: #303133;
-  font-size: 14px;
-}
-
-.tools-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.tool-card {
-  padding: 12px 16px;
-  background: #f5f5f5;
-  border-radius: 8px;
-}
-
-.tool-card code {
-  display: block;
-  font-size: 13px;
-  color: #409eff;
-  margin-bottom: 6px;
-}
-
-.tool-card p {
-  margin: 0;
-  font-size: 13px;
-  color: #606266;
-}
-
-/* 编辑面板 */
-.edit-pane {
-  display: flex;
-  flex-direction: column;
-  padding: 0;
-}
-
-.file-tabs {
-  display: flex;
-  border-bottom: 1px solid #e0e0e0;
-  padding: 0 24px;
-}
-
-.file-tabs button {
-  padding: 12px 16px;
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  color: #606266;
-}
-
-.file-tabs button.active {
-  color: #409eff;
-  border-bottom-color: #409eff;
-}
-
-.editor-toolbar {
-  padding: 12px 24px;
-  border-bottom: 1px solid #e0e0e0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.editor-toolbar span {
-  font-size: 13px;
-  color: #909399;
-  font-family: monospace;
-}
-
-.text-button {
-  padding: 4px 12px;
-  background: transparent;
-  border: 1px solid #dcdfe6;
-  border-radius: 4px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: #606266;
-}
-
-.text-button:hover {
-  color: #409eff;
-  border-color: #409eff;
-}
-
-.code-editor {
-  flex: 1;
-  padding: 16px 24px;
-  border: none;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  resize: none;
-  background: #fafafa;
-}
-
-/* 测试面板 */
-.test-section {
-  max-width: 800px;
-}
-
-.test-section > header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 24px;
-}
-
-.test-section h3 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.test-controls {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin-bottom: 24px;
-}
-
-.test-controls label {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.test-controls label > span {
-  font-size: 14px;
-  color: #606266;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.test-controls input,
-.test-controls select,
-.test-controls textarea {
-  padding: 8px 12px;
-  border: 1px solid #dcdfe6;
-  border-radius: 6px;
-  font-size: 14px;
-  font-family: inherit;
-}
-
-.test-controls textarea {
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  resize: vertical;
-}
-
-.test-result {
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.test-result > header {
-  padding: 12px 16px;
-  background: #f5f5f5;
-  border-bottom: 1px solid #e0e0e0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.test-result pre {
-  padding: 16px;
-  margin: 0;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  overflow-x: auto;
-}
-</style>
+<style scoped>button.plugin-delete{color:var(--s-danger);border-color:transparent}button.plugin-delete:hover{border-color:var(--s-danger)}</style>

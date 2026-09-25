@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {computed,onMounted,reactive,ref} from 'vue'
-import {ElMessage,ElMessageBox} from 'element-plus'
+import {ElMessage} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import {Refresh,Check,VideoPlay,Clock,Search,EditPen,Document,Warning,MagicStick} from '@element-plus/icons-vue'
 import type {AgentProject} from '../../electron/shared/local-ai-agent'
 import type {AgentToolRisk,AgentToolView} from '../../electron/shared/local-ai-tools'

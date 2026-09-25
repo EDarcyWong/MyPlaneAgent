@@ -23,13 +23,24 @@
     "build:linux": "npm run build:app && electron-builder --linux",
     "test": "npm run build:electron && node --test tests/*.test.mjs",
     "test:history": "npm run build:electron && electron tests/local-ai-history-recovery.electron.mjs",
-    "test:smoke": "npm run build:app && electron tests/standalone.electron.mjs"
+    "test:smoke": "npm run build:app && electron tests/agent-core-standalone.electron.mjs"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.13",
     "@element-plus/icons-vue": "2.3.2",
+    "@lezer/highlight": "^1.2.4",
     "@modelcontextprotocol/client": "2.0.0",
     "@xmldom/xmldom": "0.8.15",
     "ajv": "8.20.0",
+    "codemirror": "^6.0.2",
     "dompurify": "3.4.15",
     "element-plus": "2.14.5",
     "exceljs": "4.4.0",
@@ -72,6 +83,10 @@
       {
         "from": "python",
         "to": "python"
+      },
+      {
+        "from": "skills",
+        "to": "skills"
       }
     ],
     "mac": {

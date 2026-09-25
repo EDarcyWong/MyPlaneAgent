@@ -1,0 +1,35 @@
+.app-message-box-overlay{background:rgb(16 20 24 / 14%);backdrop-filter:none}
+.app-message-box.el-message-box{
+ --el-color-primary:var(--s-accent,#30343b);--el-text-color-primary:var(--s-text,#24272d);--el-text-color-regular:var(--s-dim,#656b75);
+ --el-bg-color:var(--s-panel,#fff);--el-fill-color-blank:var(--s-panel,#fff);--el-border-color:var(--s-border,#e2e4e8);--el-color-danger:var(--s-danger,#c74747);
+ width:min(360px,calc(100vw - 40px));max-width:calc(100vw - 40px);max-height:calc(100dvh - 40px);overflow:auto;
+ padding:0;border:1px solid var(--s-border,#e2e4e8);border-radius:14px;background:color-mix(in srgb,var(--s-panel,#fff) 88%,var(--s-muted,#f3f4f6));color:var(--s-text,#24272d);
+ box-shadow:0 22px 70px #0003,0 0 0 1px #00000008,inset 0 1px 0 #ffffff30;text-align:center;font-family:inherit;
+}
+.app-message-box .el-message-box__header{position:relative;padding:24px 24px 0}
+.app-message-box .el-message-box__title{font-size:15px;line-height:1.4;font-weight:650;letter-spacing:-.2px;color:var(--s-text,#24272d)}
+.app-message-box .el-message-box__headerbtn{top:18px;right:16px;width:30px;height:30px;border-radius:8px}
+.app-message-box .el-message-box__headerbtn:hover{background:var(--s-muted,#f3f4f6)}
+.app-message-box .el-message-box__headerbtn .el-message-box__close{color:var(--s-dim,#656b75);font-size:17px}
+.app-message-box .el-message-box__content{padding:10px 24px 0;font-size:13px;line-height:1.6;color:var(--s-dim,#656b75)}
+.app-message-box .el-message-box__container{display:block}
+.app-message-box .el-message-box__status{display:none}
+.app-message-box .el-message-box__message{min-width:0;padding:0!important;overflow-wrap:anywhere;white-space:pre-wrap}
+.app-message-box .el-message-box__message p{margin:0;line-height:1.6}
+.app-message-box .el-message-box__input{padding-top:14px}
+.app-message-box .el-input__wrapper{padding:2px 12px;border-radius:7px;background:var(--s-bg,#f8f9fb);box-shadow:0 0 0 1px var(--s-border,#e2e4e8) inset}
+.app-message-box .el-input__wrapper.is-focus{box-shadow:0 0 0 1px var(--s-accent,#30343b) inset,0 0 0 3px var(--s-accent-soft,#ebedf0)}
+.app-message-box .el-input__inner{height:30px;padding:0;border:0;border-radius:0;outline:none;background:transparent;box-shadow:none;color:var(--s-text,#24272d);font-size:13px}
+.app-message-box .el-textarea__inner{padding:10px 12px;min-height:100px;border:0;border-radius:7px;background:var(--s-bg,#f8f9fb);color:var(--s-text,#24272d);line-height:1.7}
+.app-message-box .el-message-box__errormsg{padding-top:7px;font-size:12px;color:var(--s-danger,#c74747)}
+.app-message-box .el-message-box__btns{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;padding:20px 24px 24px;border:0;background:transparent}
+.app-message-box .el-message-box__btns .el-button{flex:1;height:auto;min-height:32px;min-width:0;max-width:100%;margin:0;padding:7px 12px;border:1px solid var(--s-border,#e2e4e8);border-radius:7px;background:var(--s-panel,#fff);color:var(--s-text,#24272d);font-size:13px;font-weight:550;line-height:1.4;white-space:normal;box-shadow:0 1px 2px #00000005}
+.app-message-box .el-message-box__btns .el-button:hover{background:var(--s-muted,#f3f4f6);border-color:var(--s-dim,#656b75)}
+.app-message-box .el-message-box__btns .el-button--primary{background:var(--s-accent,#30343b);border-color:transparent;color:var(--s-on-accent,#fff)}
+.app-message-box .el-message-box__btns .el-button--primary:hover{background:color-mix(in srgb,var(--s-accent,#30343b) 88%,var(--s-text,#24272d));border-color:transparent}
+.app-message-box--danger .el-message-box__btns .el-button--primary{background:#b93c3c;color:#fff}
+.app-message-box--danger .el-message-box__btns .el-button--primary:hover{background:#a33232}
+.app-message-box :is(button,textarea):focus-visible{outline:2px solid var(--s-accent,#30343b);outline-offset:3px}
+@media(prefers-reduced-motion:reduce){.app-message-box,.app-message-box *{transition:none!important;animation:none!important}}
+
+.app-message-box .el-input__inner:focus-visible{outline:none}

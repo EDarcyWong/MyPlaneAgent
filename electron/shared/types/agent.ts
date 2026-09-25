@@ -46,6 +46,7 @@ export type AgentPlan = {
 export type ExecutionResult = {
   success: boolean
   outputs: unknown[]
+  answer?: string
   errors?: string[]
   elapsedMs: number
   stepResults?: Array<{
@@ -60,7 +61,7 @@ export type ExecutionResult = {
 /**
  * Agent 模式
  */
-export type AgentMode = 'auto' | 'manual' | 'verify'
+export type AgentMode = 'general' | 'coding' | 'documents' | 'auto' | 'manual' | 'verify'
 
 /**
  * Agent 状态
@@ -109,6 +110,7 @@ export type AgentEvent =
   | { type: 'planning_started'; taskId: string }
   | { type: 'plan_created'; plan: AgentPlan }
   | { type: 'execution_started'; taskId: string }
+  | { type: 'step_started'; taskId: string; step: number }
   | { type: 'step_completed'; taskId: string; step: number; result: unknown }
   | { type: 'step_failed'; taskId: string; step: number; error: string }
   | { type: 'execution_completed'; taskId: string; result: ExecutionResult }

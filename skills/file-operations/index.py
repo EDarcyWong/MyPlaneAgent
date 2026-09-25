@@ -15,6 +15,18 @@ class FileOperationsSkill:
 
     IGNORED = {'.git', 'node_modules', 'dist', '__pycache__', '.next', 'build'}
 
+    @staticmethod
+    def resolve_path(workspace: str, relative_path: str) -> str:
+        if not workspace or not os.path.isdir(workspace):
+            raise ValueError('Workspace does not exist')
+        if not isinstance(relative_path, str) or os.path.isabs(relative_path):
+            raise ValueError('Path must be relative to workspace')
+        root = os.path.realpath(workspace)
+        target = os.path.realpath(os.path.join(root, relative_path))
+        if os.path.commonpath((root, target)) != root:
+            raise ValueError('Path escapes workspace')
+        return target
+
     def __init__(self):
         self.skill_id = os.getenv('SKILL_ID', 'file-operations')
         print(f"FileOperationsSkill initialized: {self.skill_id}", file=sys.stderr, flush=True)
@@ -42,7 +54,7 @@ class FileOperationsSkill:
         start_line = args.get('startLine', 1)
         end_line = args.get('endLine')
 
-        file_path = os.path.join(workspace, rel_path)
+        file_path = self.resolve_path(workspace, rel_path)
 
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"File not found: {rel_path}")
@@ -83,7 +95,7 @@ class FileOperationsSkill:
         rel_path = args['path']
         content = args['content']
 
-        file_path = os.path.join(workspace, rel_path)
+        file_path = self.resolve_path(workspace, rel_path)
 
         # 确保目录存在
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -105,7 +117,7 @@ class FileOperationsSkill:
         rel_path = args.get('path', '.')
         depth = args.get('depth', 4)
 
-        base_path = os.path.join(workspace, rel_path)
+        base_path = self.resolve_path(workspace, rel_path)
 
         if not os.path.isdir(base_path):
             raise NotADirectoryError(f"Not a directory: {rel_path}")
@@ -121,7 +133,7 @@ class FileOperationsSkill:
                     if entry.name in self.IGNORED:
                         continue
 
-                    rel = os.path.relpath(entry.path, workspace)
+                    rel = os.path.relpath(entry.path, os.path.realpath(workspace))
                     rel = rel.replace('\\', '/')
 
                     if entry.is_dir(follow_symlinks=False):

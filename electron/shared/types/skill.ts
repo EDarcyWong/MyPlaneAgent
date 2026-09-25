@@ -21,6 +21,7 @@ export type ToolDefinition = {
   description: string
   parameters: Record<string, unknown>  // JSON Schema
   returns?: Record<string, unknown>
+  risk?: 'read' | 'write' | 'high'
   examples?: Array<{
     input: Record<string, unknown>
     output: unknown
@@ -89,6 +90,7 @@ export type SkillManifest = {
   version: string                      // 语义化版本
   category: string                     // 分类：file/git/browser/coding/...
   description: string
+  enabled?: boolean
   author?: string
   icon?: string
   homepage?: string

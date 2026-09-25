@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {computed,onBeforeUnmount,onMounted,reactive,ref,watch} from 'vue'
-import {ElMessage,ElMessageBox} from 'element-plus'
+import {ElMessage} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import {AlarmClock,Delete,Edit,RefreshRight,VideoPause,VideoPlay} from '@element-plus/icons-vue'
 import type {AutomationRun,AutomationTask,AutomationTaskInput,AutomationTemplate} from '../../electron/shared/local-ai-automation'
 import type {StudioServerModel} from '../../electron/shared/local-ai-studio'

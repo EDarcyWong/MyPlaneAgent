@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import SessionExportMenu from './SessionExportMenu.vue'
 import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch,type UnwrapNestedRefs} from 'vue'
 import {FolderOpened,FolderAdd,EditPen,VideoPause,Check,Close,Document,Cpu,ArrowRight,ArrowDown,ArrowUp,Search,Tools,Grid,InfoFilled,ChatDotRound,Download,MoreFilled,Delete,Setting,Connection} from '@element-plus/icons-vue'
-import {ElMessageBox,ElDropdown,ElDropdownMenu,ElDropdownItem,ElDialog} from 'element-plus'
+import {ElDropdown, ElDropdownMenu, ElDropdownItem, ElDialog} from 'element-plus'
+import {AppMessageBox as ElMessageBox} from './message-box'
 import AgentProjectActions from './AgentProjectActions.vue'
 import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
 import AgentProjectSettings from './AgentProjectSettings.vue'
@@ -427,7 +429,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
      <div v-show="!collapsedGroups.has(group.id)" :id="'agent-group-'+(group.id||'standalone')" class="agent-task-list">
       <div v-for="item in group.tasks" :key="item.kind+item.id" class="workspace-history-row">
        <button class="agent-task-item" :class="{selected:item.kind==='agent'?task?.id===item.id:engine==='chat'&&ch.session?.id===item.id}" :data-kind="item.kind" :title="item.title" :disabled="locked" @click="openEntry(item)"><strong>{{item.title}}</strong><span><i v-if="item.status==='running'||item.status==='waiting'" class="history-active-dot"></i>{{item.kind==='chat'?'对话':item.status==='completed'?'任务':statusLabel(item.status)}} · {{new Date(item.updatedAt).toLocaleDateString()}}</span></button>
-       <details v-if="!locked" class="workspace-row-menu"><summary aria-label="会话操作"><MoreFilled/></summary><div><button v-if="item.kind==='chat'" @click="renameChat(item)">重命名</button><button class="danger-text" @click="removeEntry(item)">删除会话</button></div></details>
+       <details data-floating-menu v-if="!locked" class="workspace-row-menu"><summary aria-label="会话操作"><MoreFilled/></summary><div><button v-if="item.kind==='chat'" @click="renameChat(item)">重命名</button><button class="danger-text" @click="removeEntry(item)">删除会话</button></div></details>
       </div>
       <p v-if="!group.tasks.length" class="agent-group-empty">暂无会话</p>
      </div>
@@ -442,7 +444,7 @@ onBeforeUnmount(()=>{clearInterval(clockTimer);clearTimeout(tooltipTimer);clearT
     <div class="workspace-heading"><strong :title="currentConversation?.title">{{hasConversation?currentConversation?.title:'新会话'}}</strong><button class="agent-workspace-picker" :disabled="locked" :title="workspacePath||'可选：选择项目文件夹'" @click="chooseWorkspace"><FolderOpened/><span>{{workspaceName}}</span><ArrowDown/></button></div>
     <TokenUsageDisplay v-if="hasConversation" class="agent-token-usage" :usage="currentConversation?.usage" :pending="active||ch.sending" label="Tokens" compact/>
     <button v-if="filePreview" class="agent-icon workspace-preview-toggle" :class="{active:filePreviewOpen}" :title="filePreviewOpen?'隐藏文件区域':'显示文件区域'" :aria-label="filePreviewOpen?'隐藏文件区域':'显示文件区域'" @click="toggleFilePreview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="3"/><path d="M14.5 4v16"/></svg></button>
-    <button v-if="engine==='chat'&&ch.session?.messages.length" class="agent-icon workspace-export" :disabled="locked" title="导出会话" aria-label="导出会话" @click="ch.exportSession"><Download/></button>
+    <SessionExportMenu v-if="engine==='chat'&&ch.session?.messages.length" :disabled="locked" @select="ch.exportSession"/>
     <AgentProjectSettings v-if="project" :project="project" :disabled="locked" @updated="value=>{projects=projects.map(item=>item.id===value.id?value:item)}"/>
     <span class="workspace-local"><i :class="{online}"/>{{online?'已连接':'未连接'}}</span>
    </header>

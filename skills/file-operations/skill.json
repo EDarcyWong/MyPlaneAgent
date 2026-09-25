@@ -5,14 +5,12 @@
   "category": "file",
   "description": "提供文件读写、列表、搜索等基础操作",
   "author": "MyPlaneAgent",
-
   "runtime": {
     "type": "python",
     "version": ">=3.9",
     "entry": "index.py",
     "venv": false
   },
-
   "capabilities": {
     "tools": [
       {
@@ -35,8 +33,11 @@
               "description": "结束行号"
             }
           },
-          "required": ["path"]
-        }
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "read"
       },
       {
         "name": "write",
@@ -53,8 +54,12 @@
               "description": "文件内容"
             }
           },
-          "required": ["path", "content"]
-        }
+          "required": [
+            "path",
+            "content"
+          ]
+        },
+        "risk": "write"
       },
       {
         "name": "list",
@@ -73,20 +78,23 @@
               "default": 4
             }
           }
-        }
+        },
+        "risk": "read"
       }
     ]
   },
-
   "permissions": {
     "fileSystem": {
-      "read": ["**/*"],
-      "write": ["**/*"]
+      "read": [
+        "**/*"
+      ],
+      "write": [
+        "**/*"
+      ]
     },
     "network": false,
     "process": false
   },
-
   "dependencies": {
     "python": []
   }

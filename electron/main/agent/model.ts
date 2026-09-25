@@ -1,3 +1,4 @@
+import { requestBudget, readModelCapacityError, rememberModelCapacity, ModelContextCapacityError } from './model-budget.js'
 import {isDeepSeek,deepseekThinking} from '../../shared/local-ai-providers.js'
 import {readTokenUsage,mergeTokenUsage,type TokenUsage} from '../../shared/local-ai-usage.js'
 import {record,sseData} from '../local-ai-utils.js'
@@ -12,7 +13,7 @@ export type AgentAnswer=Omit<AgentMessage,'content'>&{content:string|null;reason
 export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean;apiFormat?:RemoteApiFormat}
 export class ModelFormatError extends Error {constructor(message:string){super(message);this.name='ModelFormatError'}}
 export const agentModelTiming={firstResponseMs:10*60*1000,idleMs:5*60*1000,totalMs:30*60*1000}
-type RequestOptions={onResponse?:(text:string)=>void;tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
+type RequestOptions={temperature?:number;onResponse?:(text:string)=>void;tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
 const llamaGrammarOnlyKeywords=new Set(['minLength','maxLength','minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf','minItems','maxItems','minProperties','maxProperties','pattern'])
 function llamaSchema(value:unknown):unknown{
  if(Array.isArray(value))return value.map(llamaSchema)
@@ -23,6 +24,29 @@ export function llamaToolDefinitions(tools:ToolDefinition[]):ToolDefinition[]{
  return tools.map(tool=>({...tool,function:{...tool.function,parameters:llamaSchema(tool.function.parameters) as Record<string,unknown>}}))
 }
 export async function requestAgentModel(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions={}):Promise<AgentAnswer>{
+ // Local chat templates often accept exactly one system turn, at the beginning.
+ // Preserve instruction order and every conversation/tool turn when combining it.
+ const systems = messages.filter(message => message.role === 'system')
+ if (systems.length) {
+  const content = systems.every(message => typeof message.content === 'string' || message.content === null)
+    ? systems.map(message => message.content || '').join('\n\n')
+    : systems.flatMap(message => Array.isArray(message.content) ? message.content : message.content ? [{type:'text' as const,text:message.content}] : [])
+  messages = [{role:'system',content}, ...messages.filter(message => message.role !== 'system')]
+ }
+
+ const budget = requestBudget(connection, model, messages, options.tools)
+ try { return await requestAgentModelOnce(budget, model, messages, signal, options) }
+ catch (error) {
+  signal.throwIfAborted()
+  if (!(error instanceof ModelContextCapacityError)) throw error
+  rememberModelCapacity(connection, model, error.capacity)
+  const retry = requestBudget(connection, model, messages, options.tools, error.inputTokens)
+  if (retry.maxTokens >= budget.maxTokens) throw error
+  // Only a rejected HTTP request is retried: no streamed answer or tool execution is replayed.
+  return requestAgentModelOnce(retry, model, messages, signal, options)
+ }
+}
+async function requestAgentModelOnce(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions):Promise<AgentAnswer>{
  const timing={...agentModelTiming,...options.timing},timeout=new AbortController(),combined=AbortSignal.any([signal,timeout.signal])
  const abort=(message:string)=>timeout.abort(new Error(message+' 本轮未执行工具，可检查模型状态后继续任务。'))
  const minutes=(ms:number)=>`${Math.max(1,Math.round(ms/60000))} 分钟`
@@ -37,7 +61,7 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
   const thinking=options.summary?false:options.thinking
   const responseCharacterLimit=Math.min(8*1024*1024,Math.max(1024*1024,connection.maxTokens*8)),responseWireLimit=Math.min(32*1024*1024,responseCharacterLimit*3)
   if(connection.apiFormat==='anthropic')return await requestAnthropic(connection,model,messages,combined,options,requestTools,responseCharacterLimit,responseWireLimit,acceptUsage,activity)
-  const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:`Bearer ${connection.key}`}:{})},body:JSON.stringify({model,messages:messages.map(({reasoning_content,...message})=>({...message,...(isDeepSeek(connection.endpoint)&&reasoning_content!==undefined?{reasoning_content}:{})})),...deepseekThinking(connection.endpoint,thinking!==false),...(!requestTools||!requestTools.length?{}:{tools:requestTools,tool_choice:'auto'}),...(connection.localLlama&&thinking!==undefined?{chat_template_kwargs:{enable_thinking:thinking}}:{}),stream:true,stream_options:{include_usage:true},temperature:0.2,max_tokens:connection.maxTokens}),signal:combined})
+  const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:`Bearer ${connection.key}`}:{})},body:JSON.stringify({model,messages:messages.map(({reasoning_content,...message})=>({...message,...(isDeepSeek(connection.endpoint)&&reasoning_content!==undefined?{reasoning_content}:{})})),...deepseekThinking(connection.endpoint,thinking!==false),...(!requestTools||!requestTools.length?{}:{tools:requestTools,tool_choice:'auto'}),...(connection.localLlama&&thinking!==undefined?{chat_template_kwargs:{enable_thinking:thinking}}:{}),stream:true,stream_options:{include_usage:true},temperature:options.temperature??0.2,max_tokens:connection.maxTokens}),signal:combined})
   if(!response.body)throw new Error('模型响应为空')
   let data:Record<string,unknown>
   if(response.ok&&response.headers.get('content-type')?.includes('text/event-stream')){
@@ -82,6 +106,8 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
    try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>responseWireLimit)throw new Error('模型响应超过应用单轮容量，请缩小任务');parts.push(value);if(value.length)activity()}}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
    const text=Buffer.concat(parts).toString('utf8');options.onResponse?.(text)
    if(!response.ok){
+    const capacityError = response.status === 400 ? readModelCapacityError(text) : undefined
+    if (capacityError) throw capacityError
     let code='';try{code=String(record(record(JSON.parse(text)).error).code||'')}catch{/* Preserve non-JSON errors below. */}
     if(response.status===404&&code==='model_not_found')throw new Error(`模型不存在或实例已失效（${model}）。请刷新模型列表，重新选择已加载的模型后继续任务。`)
     if(response.status===400&&/failed to (?:initialize samplers: failed to )?parse grammar/i.test(text))throw new Error('本地模型服务无法解析工具调用语法。已使用 llama.cpp 兼容 Schema；若重启应用后仍出现此错误，请更新本地运行时并重新测试模型的工具能力。')
