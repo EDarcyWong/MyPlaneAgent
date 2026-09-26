@@ -241,7 +241,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
     let streamedContent = '', streamedReasoning = ''
     let response
     let retryInput = input
-    try { for (let retry = 0; retry < 3; retry++) {
+    try { for (let retry = 0; retry < 6; retry++) {
      options.signal.throwIfAborted()
      options.onRequest()
      streamedContent = ''; streamedReasoning = ''
@@ -295,7 +295,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
     const candidate = responseSegments.length ? responseSegments.join('') + candidatePart : candidatePart
     responseSegments=[];responseContinuationCount=0
     if (!streamedReasoning && response.reasoning) options.onReasoning(response.reasoning)
-    history.push({ ...response, role: 'assistant', reasoning_content: response.reasoning })
+    history.push({ ...response, content:candidate, role: 'assistant', reasoning_content: response.reasoning })
     if (!response.tool_calls?.length) {
       if (denied) { options.onOutcome?.('blocked'); options.onContent(candidate || '操作已被拒绝，已停止执行。'); return }
       const researchRequest=options.messages.filter(m=>m.role==='user').some(m=>typeof m.content==='string'&&/(天气|预报|联网|查询|查找|https?:\/\/|www\.)/.test(m.content))
