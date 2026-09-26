@@ -9,6 +9,14 @@ from unittest.mock import patch
 sys.path.insert(0, 'skills/agent-tools')
 import index as skill
 
+parser = skill.WebPageText()
+parser.feed('<html><style>' + 'noise' * 10000 + '</style><nav>Navigation</nav><main><h1>26日（今天）</h1><p>阴转中雨</p><p>31/24℃</p></main></html>')
+assert '26日（今天）' in parser.text()
+assert '阴转中雨' in parser.text()
+assert '31/24℃' in parser.text()
+assert 'noise' not in parser.text()
+assert 'Navigation' not in parser.text()
+
 def lookup(address):
     return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (address, 443))]
 with patch.object(skill.socket, 'getaddrinfo', return_value=lookup('198.18.0.20')):

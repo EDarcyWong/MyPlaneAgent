@@ -43,7 +43,6 @@ import {
   ZoomIn,
   ZoomOut,
 } from "@element-plus/icons-vue";
-import type { AgentProject } from "../../electron/shared/local-ai-agent";
 import type { StudioSettings } from "../../electron/shared/local-ai-studio";
 import { ruleOperators, isDecision } from "../../electron/shared/workflow-decisions";
 import type { WorkflowRule } from "../../electron/shared/local-ai-workflow";
@@ -78,7 +77,6 @@ const props = withDefaults(
   api = window.myplane.localAiStudio;
 const definitions = ref<WorkflowDefinition[]>([]),
   runs = ref<WorkflowRun[]>([]),
-  projects = ref<AgentProject[]>([]),
   editing = ref(false),
   selectedId = ref(""),
   historyId = ref(""),
@@ -112,7 +110,10 @@ type FormNode = {
   fastMode: boolean;
   approvalMode: "ask" | "auto" | "full" | "unrestricted";
   inputSignalMode: "all" | "any";
-  branchMode: "ai" | "rules";
+  branchMode: "direct" | "ai" | "rules";
+  judgeMode: "classify" | "legacy";
+  judgeInput: string;
+  unknownBranchId: string;
   sourceNodeId: string;
   operator: "succeeded" | "failed";
   rules: WorkflowRule[];
@@ -221,13 +222,13 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
       isDecision(type)
         ? ['成立', type === 'switch' ? '默认' : '不成立'].map((name, i) => ({id:`decision_${nodeSequence}_${i}`,name:type === 'switch' && i === 0 ? '匹配 1' : name,condition:'',color:i ? '#d45b68' : '#2f9b74',targetNodeIds:[],outputValue:'{"result":""}'}))
         : type === "ai-judge"
-        ? ["条件成立", "默认兜底"].map((name, i) => ({id:`ai_${nodeSequence}_${i}`,name,condition:i ? "始终：前面的判断条件均不成立时选择此分支" : "输入内容符合任务中描述的判断标准",color:i ? "#d45b68" : "#2f9b74",targetNodeIds:[],outputValue:'{"result":""}'}))
+        ? ["符合条件", "不符合条件", "无法判断"].map((name, i) => ({id:`ai_${nodeSequence}_${i}`,name,condition:["输入明确符合判断标准", "输入明确不符合判断标准", "输入缺失、含糊或无法确定"][i],color:["#2f9b74", "#347fc5", "#d45b68"][i],targetNodeIds:[],outputValue:'{"result":"","reason":""}'}))
         : type === "agent"
         ? [
             {
               id: `result_${nodeSequence}`,
-              name: "默认结果",
-              condition: "任务完成且结果符合预期时选择此分支",
+              name: "任务结果",
+              condition: "",
               color: "#347fc5",
               targetNodeIds: [],
               outputValue: '{"result":""}',
@@ -272,7 +273,10 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     fastMode: true,
     approvalMode: "ask",
     inputSignalMode: "any",
-    branchMode: "ai",
+    branchMode: type === "agent" ? "direct" : "ai",
+    judgeMode: type === "ai-judge" ? "classify" : "legacy",
+    judgeInput: "",
+    unknownBranchId: type === "ai-judge" ? branches[2].id : "",
     sourceNodeId: "",
     operator: "succeeded",
     rules: [{kind:'text',left:'',operator:'eq',right:''}], ruleMode:'all',
@@ -296,7 +300,6 @@ const fresh = () => ({
   id: "",
   name: "新建工作流",
   description: "",
-  projectId: "",
   enabled: true,
   timeoutMinutes: 120,
   entryNodeIds: [] as string[],
@@ -498,9 +501,7 @@ function redo() {
   }
   if (canRedo.value) restoreHistory(historyIndex.value + 1);
 }
-const projectName = (id: string) =>
-    projects.value.find((item) => item.id === id)?.name || "项目已移除",
-  date = (value?: string) =>
+const date = (value?: string) =>
     value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
 const status = (value: string) =>
   (
@@ -702,10 +703,11 @@ function outputJsonError(value?: string) {
   }
 }
 function branchOutputError(node: FormNode, branch: FormBranch) {
+  if (node.type === "agent" || (node.type === "ai-judge" && node.judgeMode === "classify")) return "";
   if ((branch.outputValue?.length || 0) > 4000) return "输出内容不能超过 4000 个字符";
   const syntaxError = workflowJsonError(branch.outputValue);
   if (syntaxError) return syntaxError;
-  if ((node.type === "agent" || node.type === "ai-judge") && node.branchMode === "ai") return outputJsonError(branch.outputValue);
+  if (node.type === "ai-judge" && node.branchMode === "ai") return outputJsonError(branch.outputValue);
 
   return "";
 }
@@ -795,14 +797,12 @@ function selectNode(id: string, event: PointerEvent) {
 }
 async function load() {
   try {
-    const [nextDefinitions, nextRuns, nextProjects] = await Promise.all([
+    const [nextDefinitions, nextRuns] = await Promise.all([
       api("workflowDefinitions"),
       api("workflowRuns", { limit: 200 }),
-      api("agentProjects"),
     ]);
     definitions.value = nextDefinitions;
     runs.value = nextRuns;
-    projects.value = nextProjects;
   } catch (cause) {
     error.value = String(cause).replace(/^Error: /, "");
   }
@@ -817,7 +817,7 @@ function addNode(type: FormNode["type"] = "agent") {
 function initializeNew() {
   saveErrorNodeIds.value = new Set();
   centerCanvas();
-  Object.assign(form, fresh(), { projectId: projects.value[0]?.id || "" });
+  Object.assign(form, fresh());
   addNode();
   form.entryNodeIds = form.nodes[0]?.id ? [form.nodes[0].id] : [];
   editing.value = true;
@@ -828,29 +828,14 @@ function initializeNew() {
   lastAutoSaveAttempt.value = lastSavedSnapshot.value;
   lastSavedAt.value = undefined;
 }
-async function createProject() {
-  try {
-    const directory = await api('agentChooseWorkspace');
-    if (!directory) return false;
-    const answer = await ElMessageBox.prompt('为工作目录命名', '新建工作流项目', { inputValue: directory.path.split('/').pop() || '新项目', inputPattern: /\S+/, inputErrorMessage: '请输入项目名称' });
-    const project = await api('agentCreateProject', { workspaceToken: directory.token, name: answer.value });
-    await load();
-    form.projectId = project.id;
-    return true;
-  } catch (cause) {
-    if (cause !== 'cancel' && cause !== 'close') ElMessage.error(String(cause));
-    return false;
-  }
-}
 async function create() {
-  if (!projects.value.length && !await createProject()) return;
   if (!props.windowMode) {
     void window.myplane.openWorkflowEditor();
     return;
   }
   initializeNew();
 }
-const canCreate = computed(() => projects.value.length > 0);
+const canCreate = computed(() => true);
 defineExpose({ create, canCreate });
 function fromNode(
   node: WorkflowNode,
@@ -909,7 +894,11 @@ function fromNode(
     id: node.id,
     name: node.name,
     type: node.type,
-    branches,
+    branches: node.type === "agent"
+      ? branches.map(branch => ({ ...branch, condition: "", outputValue: '{"result":""}' }))
+      : node.type === "ai-judge" && node.config.judgeMode === "classify"
+        ? branches.map(branch => ({ ...branch, outputValue: '{"result":"","reason":""}' }))
+        : branches,
     instruction: (node.type === "agent" || node.type === "ai-judge") ? node.config.instruction : "",
     model: (node.type === "agent" || node.type === "ai-judge") ? node.config.model || "" : props.model || "",
     modelRef: (node.type === "agent" || node.type === "ai-judge") ? node.config.modelRef : undefined,
@@ -921,7 +910,10 @@ function fromNode(
     approvalMode: (node.type === "agent" || node.type === "ai-judge") ? node.config.approvalMode : "ask",
     inputSignalMode:
       (node.type === "agent" || node.type === "ai-judge") ? node.config.inputSignalMode || "all" : "all",
-    branchMode: (node.type === "agent" || node.type === "ai-judge") ? node.config.branchMode || "ai" : "ai",
+    branchMode: node.type === "agent" ? "direct" : "ai",
+    judgeMode: node.type === "ai-judge" ? node.config.judgeMode || "legacy" : "legacy",
+    judgeInput: node.type === "ai-judge" ? node.config.judgeInput || "" : "",
+    unknownBranchId: node.type === "ai-judge" ? node.config.unknownBranchId || "" : "",
     sourceNodeId:
       node.type === "condition" || node.type === "route"
         ? node.config.sourceNodeId
@@ -965,7 +957,6 @@ function initializeEdit(item: WorkflowDefinition) {
     id: item.id,
     name: item.name,
     description: item.description,
-    projectId: item.projectId,
     enabled: item.enabled,
     timeoutMinutes: item.timeoutMinutes,
     entryNodeIds: [
@@ -1068,6 +1059,10 @@ function payload(): WorkflowDefinitionInput {
           approvalMode: node.approvalMode,
           inputSignalMode: node.inputSignalMode,
           branchMode: node.branchMode,
+          ...(node.type === "ai-judge" ? {
+            judgeMode: node.judgeMode,
+            ...(node.judgeMode === "classify" ? { judgeInput: node.judgeInput, unknownBranchId: node.unknownBranchId } : {}),
+          } : {}),
         },
       };
     if (node.type === 'judge' || node.type === 'predicate') return {...base,type:node.type,config:{rules:node.rules.map(rule=>({...rule})),mode:node.ruleMode}};
@@ -1125,7 +1120,6 @@ function payload(): WorkflowDefinitionInput {
     ...(form.id ? { id: form.id } : {}),
     name: form.name,
     description: form.description,
-    projectId: form.projectId,
     enabled: form.enabled,
     timeoutMinutes: Number(form.timeoutMinutes),
     entryNodeId: form.entryNodeIds[0] || "",
@@ -1469,7 +1463,7 @@ function addBranch(node: FormNode) {
       branchColors[index % branchColors.length],
     output =
       node.type === "join" || node.type === "data" || ((node.type === "agent" || node.type === "ai-judge") && node.branchMode === "ai")
-        ? '{"result":""}'
+        ? node.type === "ai-judge" && node.judgeMode === "classify" ? '{"result":"","reason":""}' : '{"result":""}'
         : undefined;
   node.branches.splice(node.type === "ai-judge" ? Math.max(0, index - 1) : index, 0, {
     id: `branch_${Date.now().toString(36)}_${++nodeSequence}`,
@@ -1509,7 +1503,7 @@ function insertOutputReference(branch: FormBranch, item: UpstreamReference) {
   }
 }
 function removeBranch(node: FormNode, branch: FormBranch) {
-  if (node.type === "ai-judge" && node.branches.length <= 2) return;
+  if (node.type === "ai-judge" && (node.branches.length <= (node.judgeMode === "classify" ? 3 : 2) || branch.id === node.unknownBranchId)) return;
   if (["agent", "join", "data"].includes(node.type) && node.branches.length <= 1) return;
   node.branches.splice(node.branches.indexOf(branch), 1);
   if (
@@ -1783,8 +1777,7 @@ onBeforeUnmount(() => {
           <span class="workflow-onboarding-kicker">从一个想法开始</span>
           <h2>把重复任务，<br />变成清晰的工作流。</h2>
           <p>连接 AI 任务、条件判断与人工确认，让每一步按预期执行，结果都有记录可查。</p>
-          <small v-if="projects.length">点击顶部的「＋」按钮创建第一个工作流。</small>
-          <small v-if="!projects.length">先创建项目，再创建第一个工作流。</small><button v-if="!projects.length" type="button" class="primary-button" @click="createProject">创建项目</button>
+          <small>点击顶部的「＋」按钮创建第一个工作流。</small>
         </div>
         <div class="workflow-onboarding-preview" aria-hidden="true">
           <div class="workflow-preview-caption"><span class="workflow-preview-dot"></span> 流程预览</div>
@@ -1826,7 +1819,7 @@ onBeforeUnmount(() => {
               <small>v{{ item.version }}</small>
             </span>
             <strong class="workflow-item-name" :title="item.name">{{ item.name }}</strong>
-            <span class="workflow-item-meta"><span>{{ item.projectId ? projectName(item.projectId) : "未设置项目" }}</span><span>{{ item.nodes.length }} 个节点</span></span>
+            <span class="workflow-item-meta"><span>{{ item.nodes.length }} 个节点</span></span>
           </button>
           <div class="workflow-actions">
             <button class="workflow-run-action" @click.stop="action(item, 'run')"><VideoPlay />运行</button
@@ -1984,8 +1977,6 @@ onBeforeUnmount(() => {
           ><small>端口拖动创建连线；已有连线左拖新增目标、右拖切换目标</small>
         </div>
         <div class="workflow-editor-actions">
-          <select v-model="form.projectId" aria-label="工作流项目"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select>
-          <button type="button" title="添加项目" @click="createProject"><Plus /></button>
           <button type="button" class="workflow-help-button" aria-label="工作流帮助" title="打开工作流使用指南" @click="openWorkflowHelp">
             <QuestionFilled />帮助
           </button>
@@ -2464,15 +2455,20 @@ onBeforeUnmount(() => {
             </section>
             <template v-if="(selectedNode.type === 'agent' || selectedNode.type === 'ai-judge')"
               ><label
-                >{{ selectedNode.type === "ai-judge" ? "判断任务与标准" : "执行内容" }}<textarea
+                >{{ selectedNode.type === "ai-judge" && selectedNode.judgeMode === "classify" ? "判断问题" : selectedNode.type === "ai-judge" ? "判断任务与标准" : "执行内容" }}<textarea
                   v-model="selectedNode.instruction"
                   rows="8"
                   required
-	                  placeholder="描述任务；可引用 {{input.上游节点ID.name}} 或 {{数据变量 1.result}}"
+	                  :placeholder="selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify' ? '例如：上海市今天是否会下雨？' : '描述任务；可引用上游字段或数据变量'"
                 ></textarea>
               </label>
+              <label v-if="selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify'"
+                >判断输入<select v-model="selectedNode.judgeInput" required>
+                  <option value="" disabled>选择直接连接的上游字段</option>
+                  <option v-for="item in upstreamOutputReferences(selectedNode.id)" :key="item.expression" :value="item.expression">{{ item.sourceName }} · {{ item.label }}</option>
+                </select></label>
               <p class="workflow-field-note">
-                {{ selectedNode.type === "ai-judge" ? "AI 会按顺序评估自然语言条件，只选择一个分支，并按该分支的 JSON 格式输出。" : "AI 完成任务后，按唯一输出分支的 JSON 格式输出结果。" }}
+                {{ selectedNode.type === "ai-judge" && selectedNode.judgeMode === "classify" ? "只根据选定输入分类，返回分支和理由；无法确定时走“无法判断”分支。原输入会继续传给下游。" : selectedNode.type === "ai-judge" ? "AI 会按顺序评估自然语言条件，只选择一个分支，并按该分支的 JSON 格式输出。" : "任务完成后，唯一输出分支会将 AI 的完整回答放入 result 字段。" }}
               </p>
               <label
                 >模型来源<select v-model="selectedNode.modelSource">
@@ -2744,9 +2740,9 @@ onBeforeUnmount(() => {
                       : selectedNode.type === "data"
                         ? "变量设置完成后直接输出；一个输出分支可连接多个下游"
                       : selectedNode.type === "ai-judge"
-                      ? "AI 按顺序判断自然语言条件，每次只选择一个分支"
+                      ? selectedNode.judgeMode === "classify" ? "只选择一个分类分支；输入和理由传给下游" : "AI 按顺序判断自然语言条件，每次只选择一个分支"
                       : selectedNode.type === "agent"
-                      ? "有且只有一个输出分支；可连接多个下游"
+                      ? "任务完成后以 result 字段传递 AI 回答；一个分支可连接多个下游"
                       : "按顺序匹配第一条规则"
                   }}</small>
                 </div>
@@ -2765,9 +2761,9 @@ onBeforeUnmount(() => {
                 :key="branch.id"
               >
                 <header>
-                  <strong>{{ selectedNode.type === 'notify' ? (index === 0 ? '发送成功分支' : index === 1 ? '发送失败分支' : '旧版多余分支，请删除') : selectedNode.type === 'approval' ? (index === 0 ? '批准分支' : '拒绝分支') : selectedNode.type === 'switch' ? (branch.id === selectedNode.defaultBranchId ? '默认分支' : '匹配分支 ' + (index + 1)) : ['judge','predicate'].includes(selectedNode.type) ? (index === 0 ? '成立分支' : '不成立分支') : '分支 ' + (index + 1) }}</strong
+                  <strong>{{ selectedNode.type === 'notify' ? (index === 0 ? '发送成功分支' : index === 1 ? '发送失败分支' : '旧版多余分支，请删除') : selectedNode.type === 'approval' ? (index === 0 ? '批准分支' : '拒绝分支') : selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify' && branch.id === selectedNode.unknownBranchId ? '无法判断分支' : selectedNode.type === 'switch' ? (branch.id === selectedNode.defaultBranchId ? '默认分支' : '匹配分支 ' + (index + 1)) : ['judge','predicate'].includes(selectedNode.type) ? (index === 0 ? '成立分支' : '不成立分支') : '分支 ' + (index + 1) }}</strong
                   ><button
-                    v-if="!isDecision(selectedNode.type) && (selectedNode.type !== 'ai-judge' || selectedNode.branches.length > 2) && selectedNode.type !== 'approval' && (selectedNode.type !== 'notify' || selectedNode.branches.length > 2) && (!['agent', 'join', 'data'].includes(selectedNode.type) || selectedNode.branches.length > 1)"
+                    v-if="!isDecision(selectedNode.type) && (selectedNode.type !== 'ai-judge' || (selectedNode.branches.length > (selectedNode.judgeMode === 'classify' ? 3 : 2) && branch.id !== selectedNode.unknownBranchId)) && selectedNode.type !== 'approval' && (selectedNode.type !== 'notify' || selectedNode.branches.length > 2) && (!['agent', 'join', 'data'].includes(selectedNode.type) || selectedNode.branches.length > 1)"
                     type="button"
                     title="删除分支"
                     @click="removeBranch(selectedNode, branch)"
@@ -2785,7 +2781,9 @@ onBeforeUnmount(() => {
                     >颜色<input v-model="branch.color" type="color" required
                   /></label>
                 </div>
-                <label v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)"
+                <p v-if="selectedNode.type === 'agent'" class="workflow-field-note">输出格式固定为 <code>{"result":""}</code>；运行时填入 AI 的完整回答，无需配置判断条件。</p>
+                <p v-if="selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify'" class="workflow-field-note">输出固定为 <code>{"result":"原输入","reason":"判断理由"}</code>。</p>
+                <label v-if="!['agent', 'join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)"
                   >{{
                     (selectedNode.type === "agent" || selectedNode.type === "ai-judge") &&
                     selectedNode.branchMode === "ai"
@@ -2809,17 +2807,18 @@ onBeforeUnmount(() => {
                     maxlength="500"
                     list="workflow-branch-conditions"
                     placeholder="例如 变量：risk 等于：high" /></label
-                ><small v-if="!['join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)">{{
+                ><small v-if="!['agent', 'join', 'data', 'approval', 'notify'].includes(selectedNode.type) && !isDecision(selectedNode.type)">{{
                   (selectedNode.type === "agent" || selectedNode.type === "ai-judge") &&
                   selectedNode.branchMode === "ai"
                     ? "描述业务语义，AI 将在所有分支中选择唯一最符合的一条。"
                     : "支持执行状态、摘要/错误包含，以及变量等于、不等于、包含、大小或为空。"
                 }}</small
-                ><div class="workflow-json-toolbar">
+                ><div v-if="selectedNode.type !== 'agent' && !(selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify')" class="workflow-json-toolbar">
                   <label :for="`workflow-output-${branch.id}`">输出内容</label>
                   <button type="button" :disabled="!branch.outputValue?.trim()" @click="formatBranchOutput(branch)">格式化</button>
                 </div>
                 <textarea
+                    v-if="selectedNode.type !== 'agent' && !(selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify')"
                     :id="`workflow-output-${branch.id}`"
                     v-model="branch.outputValue"
                     :rows="selectedNode.type === 'join' ? 6 : 4"
@@ -2828,16 +2827,16 @@ onBeforeUnmount(() => {
                     :aria-describedby="`workflow-output-error-${branch.id}`"
                     placeholder='{"result":""}'
                 ></textarea>
-                <small :id="`workflow-output-error-${branch.id}`" :class="{ danger: branchOutputError(selectedNode, branch) }" aria-live="polite">{{
+                <small v-if="selectedNode.type !== 'agent' && !(selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify')" :id="`workflow-output-error-${branch.id}`" :class="{ danger: branchOutputError(selectedNode, branch) }" aria-live="polite">{{
                   branchOutputError(selectedNode, branch) ||
-                  ((selectedNode.type === 'agent' || selectedNode.type === 'ai-judge') && selectedNode.branchMode === 'ai'
+                  (selectedNode.type === 'ai-judge' && selectedNode.branchMode === 'ai'
                     ? '填写合法 JSON：固定值原样保留，空字符串由 AI 填写，引用值由程序自动填入。'
                     : selectedNode.type === 'join'
                       ? '填写合法 JSON，固定值原样输出；引用值保留原始类型。引用缺失或不唯一时会报错。'
                       : branch.outputValue?.trim() ? 'JSON 格式正确；固定值原样输出，支持引用上游字段或数据变量。' : '输出内容可留空；填写时请使用合法 JSON，可包含固定值或引用值。')
                 }}</small>
                 <div
-                  v-if="upstreamReferences.length"
+                  v-if="selectedNode.type !== 'agent' && !(selectedNode.type === 'ai-judge' && selectedNode.judgeMode === 'classify') && upstreamReferences.length"
                   class="workflow-reference-actions"
                 >
                   <button

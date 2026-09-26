@@ -6,8 +6,8 @@ export type WorkflowInputParameter={name:string;description:string;value?:string
 export type WorkflowVariableAssignment={name:string;value:string}
 export type WorkflowModelRef={source:'current';id?:string;name?:string}|{source:'local';id:string;name?:string}|{source:'remote';id:string;name?:string;apiFormat:RemoteApiFormat;endpoint:string;profileId?:string;contextLength?:number}
 export type WorkflowNodeBase={id:string;name:string;branches?:WorkflowBranch[];onSuccess?:string;onFailure?:string}
-export type WorkflowAgentNode=WorkflowNodeBase&{type:'agent';config:{instruction:string;model?:string;modelRef?:WorkflowModelRef;modelSource?:'current'|'specified';mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode;inputs?:WorkflowInputParameter[];inputSignalMode?:'all'|'any';branchMode?:'ai'|'rules'}}
-export type WorkflowAiJudgeNode=WorkflowNodeBase&{type:'ai-judge';config:WorkflowAgentNode['config']}
+export type WorkflowAgentNode=WorkflowNodeBase&{type:'agent';config:{instruction:string;model?:string;modelRef?:WorkflowModelRef;modelSource?:'current'|'specified';mode:Exclude<AgentMode,'chat'>;maxSteps:number;fastMode:boolean;approvalMode:AgentApprovalMode;inputs?:WorkflowInputParameter[];inputSignalMode?:'all'|'any';branchMode?:'direct'|'ai'|'rules'}}
+export type WorkflowAiJudgeNode=WorkflowNodeBase&{type:'ai-judge';config:WorkflowAgentNode['config']&{judgeMode?:'classify'|'legacy';judgeInput?:string;unknownBranchId?:string}}
 export type WorkflowConditionNode=WorkflowNodeBase&{type:'condition';config:{sourceNodeId:string;operator:'succeeded'|'failed'}}
 export type WorkflowRouteNode=WorkflowNodeBase&{type:'route';config:{sourceNodeId:string}}
 export type WorkflowDataNode=WorkflowNodeBase&{type:'data';config:{assignments:WorkflowVariableAssignment[]}}
@@ -21,11 +21,11 @@ export type WorkflowSwitchNode=WorkflowNodeBase&{type:'switch';config:{value:str
 export type WorkflowNode=WorkflowAiJudgeNode|WorkflowDecisionNode|WorkflowSwitchNode|WorkflowAgentNode|WorkflowConditionNode|WorkflowRouteNode|WorkflowDataNode|WorkflowJoinNode|WorkflowApprovalNode|WorkflowNotifyNode|WorkflowEndNode
 export type WorkflowLayout={nodes:Record<string,{x:number;y:number}>;start?:{x:number;y:number}}
 
-export type WorkflowDefinition={id:string;name:string;description:string;projectId?:string;enabled:boolean;version:number;entryNodeId:string;entryNodeIds?:string[];nodes:WorkflowNode[];layout?:WorkflowLayout;timeoutMinutes:number;createdAt:string;updatedAt:string}
+export type WorkflowDefinition={id:string;name:string;description:string;enabled:boolean;version:number;entryNodeId:string;entryNodeIds?:string[];nodes:WorkflowNode[];layout?:WorkflowLayout;timeoutMinutes:number;createdAt:string;updatedAt:string}
 export type WorkflowDefinitionInput=Omit<WorkflowDefinition,'id'|'version'|'createdAt'|'updatedAt'>&{id?:string}
 export type WorkflowNodeRun={nodeId:string;nodeName:string;type:WorkflowNode['type'];status:'running'|'waiting'|'succeeded'|'failed'|'skipped';startedAt:string;finishedAt?:string;agentTaskId?:string;summary?:string;error?:string;branchId?:string;branchName?:string;outputValue?:string;approval?:{title?:string;approveLabel:string;rejectLabel:string;deadline?:string;decision?:'approved'|'rejected'|'timeout';decidedAt?:string;note?:string;onTimeout?:'reject'|'fail'}}
 export type WorkflowRunLog={at:string;level:'info'|'warn'|'error';message:string;nodeId?:string}
-export type WorkflowRun={id:string;workflowId:string;workflowName:string;workflowVersion:number;projectId?:string;status:'running'|'waiting'|'succeeded'|'failed'|'cancelled';executionRemainingMs?:number;executionStartedAt?:string;currentNodeId?:string;pendingNodeIds?:string[];nodeInputSignals?:Record<string,string[]>;variables?:Record<string,string>;nodeVariables?:Record<string,Record<string,string>>;nodeRuns:WorkflowNodeRun[];logs?:WorkflowRunLog[];agentTaskIds:string[];startedAt:string;finishedAt?:string;error?:string;summary?:string;resumedFromRunId?:string}
+export type WorkflowRun={id:string;workflowId:string;workflowName:string;workflowVersion:number;status:'running'|'waiting'|'succeeded'|'failed'|'cancelled';executionRemainingMs?:number;executionStartedAt?:string;currentNodeId?:string;pendingNodeIds?:string[];nodeInputSignals?:Record<string,string[]>;variables?:Record<string,string>;nodeVariables?:Record<string,Record<string,string>>;nodeRuns:WorkflowNodeRun[];logs?:WorkflowRunLog[];agentTaskIds:string[];startedAt:string;finishedAt?:string;error?:string;summary?:string;resumedFromRunId?:string}
 
 export type WorkflowCommands={
  workflowDefinitions:{input:undefined;output:WorkflowDefinition[]}

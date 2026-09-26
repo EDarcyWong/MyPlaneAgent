@@ -95,6 +95,9 @@ export class AgentPlanner {
 ## 用户任务
 ${task.description}
 
+## 当前日期
+${new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })}
+
 ## 上下文
 - 工作区: ${task.context.workspace}
 ${task.context.files ? `- 相关文件: ${task.context.files.join(', ')}` : ''}
@@ -115,6 +118,8 @@ ${capabilityList}
    - args: 参数对象
    - dependsOn: 依赖的步骤索引（可选）
 4. 提供规划理由（reasoning）
+5. 参数必须是可直接执行的具体值。不要写 {{step0...}} 一类占位符；执行器不会替换占位符。如需读取网页，请使用已知的完整公网 URL。
+6. 只使用上方列出的能力名称，不要编造浏览器等能力。
 
 ## 输出格式（JSON）
 \`\`\`json
@@ -153,7 +158,8 @@ ${capabilityList}
       const parsed = JSON.parse(jsonText)
 
       // 验证基本结构
-      if (!parsed.reasoning || typeof parsed.reasoning !== 'string') {
+      const reasoning = parsed.reasoning ?? parsed.reason
+      if (!reasoning || typeof reasoning !== 'string') {
         throw new Error('Missing or invalid reasoning')
       }
 
@@ -163,17 +169,19 @@ ${capabilityList}
 
       // 验证每个步骤
       const steps: AgentPlanStep[] = parsed.steps.map((step: any, index: number) => {
-        if (!step.capability || typeof step.capability !== 'string') {
+        const capability = step.capability ?? step.action
+        const args = step.args ?? step.params
+        if (!capability || typeof capability !== 'string') {
           throw new Error(`Step ${index}: missing or invalid capability`)
         }
 
-        if (!step.args || typeof step.args !== 'object') {
+        if (!args || typeof args !== 'object' || Array.isArray(args)) {
           throw new Error(`Step ${index}: missing or invalid args`)
         }
 
         return {
-          capability: step.capability,
-          args: step.args,
+          capability,
+          args,
           dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn : undefined,
           optional: step.optional === true
         }
@@ -182,7 +190,7 @@ ${capabilityList}
       return {
         taskId,
         steps,
-        reasoning: parsed.reasoning,
+        reasoning,
         estimatedTime: parsed.estimatedTime,
         createdAt: Date.now()
       }
@@ -330,6 +338,9 @@ ${capabilityList}
 ## 原始任务
 ${task.description}
 
+## 当前日期
+${new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })}
+
 ## 之前的计划
 理由: ${previousPlan.reasoning}
 
@@ -346,7 +357,9 @@ ${capabilityList}
 1. 分析失败原因
 2. 生成**不同**的执行计划，避免相同的错误
 3. 考虑使用不同的能力或不同的参数
-4. 输出 JSON 格式的新计划
+4. 参数必须是可直接执行的具体值，不要使用 {{step0...}} 一类占位符；只使用上方列出的能力名称
+5. 只输出完整 JSON 对象，不要代码块或额外文字，使用以下字段：
+{"reasoning":"替代方案的理由","steps":[{"capability":"上方列出的能力名称","args":{},"dependsOn":[]}]}
 
 请生成替代方案：
 `.trim()

@@ -44,7 +44,40 @@ def safe_public_url(url, proxy_mapping=False):
     return parsed, port, addresses[0]
 
 
-def web_fetch(args, redirects=0):
+class WebPageText(HTMLParser):
+    HIDDEN = {'script', 'style', 'svg', 'nav', 'footer', 'noscript'}
+    BLOCK = {'br', 'div', 'p', 'li', 'tr', 'section', 'article', 'main', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if self.hidden_depth:
+            self.hidden_depth += 1
+        elif tag in self.HIDDEN:
+            self.hidden_depth = 1
+        elif tag in self.BLOCK:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if self.hidden_depth:
+            self.hidden_depth -= 1
+        elif tag in self.BLOCK:
+            self.parts.append('\n')
+
+    def handle_data(self, data):
+        if not self.hidden_depth and data.strip():
+            self.parts.append(data.strip())
+
+    def text(self):
+        return '\n'.join(' '.join(line.split()) for line in ''.join(
+            part if part == '\n' else ' ' + part + ' ' for part in self.parts
+        ).splitlines() if line.strip())
+
+
+def web_fetch(args, redirects=0, raw_html=False):
     url = args['url']
     scheme = urllib.parse.urlparse(url).scheme
     proxy_url = urllib.request.getproxies().get(scheme)
@@ -82,16 +115,22 @@ def web_fetch(args, redirects=0):
         if response.status in (301, 302, 303, 307, 308) and response.getheader('location'):
             if redirects >= 4:
                 raise ValueError('Too many redirects')
-            return web_fetch({**args, 'url': urllib.parse.urljoin(url, response.getheader('location'))}, redirects + 1)
+            return web_fetch({**args, 'url': urllib.parse.urljoin(url, response.getheader('location'))}, redirects + 1, raw_html)
         if response.status >= 300:
             raise ValueError(f'HTTP {response.status}')
         kind = response.getheader('content-type', 'text/plain').split(';', 1)[0].strip().lower()
         if kind not in ('text/html', 'text/plain', 'application/json', 'application/xml', 'text/xml', 'application/rss+xml'):
             raise ValueError('Response is not text')
-        raw = response.read(maximum * 4 + 1)
+        raw = response.read(2_000_001)
         charset = response.headers.get_content_charset() or 'utf-8'
         content = raw.decode(charset, 'replace')
-        return {'url': url, 'contentType': kind, 'text': content[:maximum], 'truncated': len(content) > maximum}
+        if kind == 'text/html' and not raw_html:
+            parser = WebPageText()
+            parser.feed(content)
+            content = parser.text()
+            if not content:
+                raise ValueError('Web page has no readable text')
+        return {'url': url, 'contentType': kind, 'text': content[:maximum], 'truncated': len(raw) > 2_000_000 or len(content) > maximum}
     finally:
         if connection is not None:
             connection.close()
@@ -124,7 +163,7 @@ def web_search(args):
     url = 'https://html.duckduckgo.com/html/?' + urllib.parse.urlencode({'q': query})
     links = []
     try:
-        page = web_fetch({'url': url, 'maxCharacters': 30000})
+        page = web_fetch({'url': url, 'maxCharacters': 30000}, raw_html=True)
         parser = SearchLinks()
         parser.feed(page['text'])
         links = parser.links

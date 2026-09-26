@@ -128,6 +128,60 @@ test('workflow executes agent, condition and notification nodes with versioned h
  assert.equal(result.id,run.id);assert.deepEqual(result.nodeRuns.map(node=>node.status),['succeeded','succeeded','succeeded']);assert.equal(result.workflowVersion,2);assert.deepEqual(notifications,[{title:'完成',body:'检查已完成'}])
 })
 
+test('new workflows run without a project in their own workspace',async t=>{
+ const h=await harness(t,()=>response('独立执行完成')),workflow=new WorkflowService(path.join(h.root,'workflow'),h.agent);t.after(()=>workflow.dispose())
+ const definition=workflow.save({name:'独立工作流',description:'',enabled:true,timeoutMinutes:5,entryNodeId:'agent',nodes:[agentNode('agent')]})
+ assert.equal('projectId' in definition,false)
+ const run=workflow.start(definition.id)
+ await until(()=>workflow.runs(definition.id)[0]?.status==='succeeded')
+ const task=h.agent.get(workflow.runs(definition.id)[0].agentTaskIds[0])
+ assert.equal('projectId' in run,false)
+ assert.equal(task.projectless,true)
+ assert.equal(task.projectId,undefined)
+ assert.equal(task.workspace,fs.realpathSync(path.join(h.root,'workflow','workspaces',definition.id)))
+})
+
+test('legacy project bindings are removed from workflow storage and execution',async t=>{
+ const h=await harness(t,()=>response('完成')),directory=path.join(h.root,'workflow'),workflow=new WorkflowService(directory,h.agent);t.after(()=>workflow.dispose())
+ const definition=workflow.save({name:'旧工作流',description:'',projectId:h.project.id,enabled:true,timeoutMinutes:5,entryNodeId:'agent',nodes:[agentNode('agent')]})
+ assert.equal('projectId' in definition,false)
+ const run=workflow.start(definition.id)
+ await until(()=>workflow.runs(definition.id)[0]?.status==='succeeded')
+ assert.equal('projectId' in run,false)
+ assert.equal(h.agent.get(workflow.runs(definition.id)[0].agentTaskIds[0]).projectless,true)
+ workflow.dispose()
+ for(const name of ['definitions','versions','runs']){
+  const file=path.join(directory,`${name}.json`),rows=JSON.parse(fs.readFileSync(file,'utf8'))
+  fs.writeFileSync(file,JSON.stringify(rows.map(row=>({...row,projectId:h.project.id}))))
+ }
+ const reopened=new WorkflowService(directory,h.agent);t.after(()=>reopened.dispose())
+ for(const name of ['definitions','versions','runs']){
+  const rows=JSON.parse(fs.readFileSync(path.join(directory,`${name}.json`),'utf8'))
+  assert.ok(rows.length)
+  assert.ok(rows.every(row=>!('projectId' in row)),`${name} still contains a project binding`)
+ }
+ assert.equal('projectId' in reopened.definitions()[0],false)
+ assert.equal('projectId' in reopened.runs()[0],false)
+})
+
+test('Agent direct output forwards its complete answer without branch selection',async t=>{
+ const answer='回答：'+ '甲'.repeat(2100),h=await harness(t,()=>response(answer)),notifications=[]
+ const workflow=new WorkflowService(path.join(h.root,'workflow'),h.agent,undefined,(_title,body)=>notifications.push(body));t.after(()=>workflow.dispose())
+ const definition=workflow.save({name:'直接输出回答',description:'',enabled:true,timeoutMinutes:5,entryNodeId:'agent',nodes:[
+  {...agentNode('agent'),config:{...agentNode('agent').config,branchMode:'direct'},branches:[{id:'answer',name:'回答',condition:'旧条件不应执行',color:'#347fc5',outputValue:'{"old":""}',targetNodeIds:['notify']}]},
+  {id:'notify',name:'接收回答',type:'notify',config:{title:'回答',body:'{{input.agent.result}}'},branches:[]}
+ ]})
+ assert.equal(definition.nodes[0].branches[0].condition,'')
+ assert.equal(definition.nodes[0].branches[0].outputValue,undefined)
+ workflow.start(definition.id)
+ await until(()=>workflow.runs(definition.id)[0]?.status==='succeeded')
+ const result=workflow.runs(definition.id)[0]
+ assert.equal(result.nodeRuns[0].outputValue,JSON.stringify({result:answer}))
+ assert.equal(result.nodeRuns[0].summary.length,2000)
+ assert.deepEqual(notifications,[answer])
+ assert.equal(JSON.stringify(h.requests[0]).includes('"branchId"'),false)
+})
+
 test('workflow rejects cycles and can retry from a failed node',async t=>{
  const h=await harness(t,n=>n===0?{}:response('重试成功')),workflow=new WorkflowService(path.join(h.root,'workflow'),h.agent);t.after(()=>workflow.dispose())
  assert.throws(()=>workflow.save({name:'循环',description:'',projectId:h.project.id,enabled:true,timeoutMinutes:5,entryNodeId:'a',nodes:[{...agentNode('a','b')},{...agentNode('b','a')}]}),/不允许循环/)
@@ -719,6 +773,73 @@ test('AI judgement calls the model with upstream data and executes only the chos
   assert.ok(!run.nodeRuns.some(node=>node.nodeId===(choice==='yes'?'rejected':'accepted')))
   assert.match(JSON.stringify(h.requests),/服务很贴心/)
  }
+})
+
+test('AI classification routes weather answers and preserves the original input',async t=>{
+ for (const [choice,forecast] of [
+  ['rain','上海今天有阵雨，最高气温 25℃。'],
+  ['dry','上海今天晴，无降雨。'],
+  ['unknown','暂未取得上海今天的天气预报。']
+ ]) {
+  const h=await harness(t,n=>response(n===0?forecast:JSON.stringify({branchId:choice,reason:choice==='unknown'?'没有今天的预报':'根据预报判断'})))
+  const workflow=new WorkflowService(path.join(h.root,'classify-weather'),h.agent);t.after(()=>workflow.dispose())
+  const branch=(id,target,condition)=>({id,name:id,condition,color:'#347fc5',targetNodeIds:[target],outputValue:'{"ignored":""}'})
+  const saved=workflow.save({name:'天气判断',description:'',enabled:true,timeoutMinutes:1,entryNodeId:'weather',nodes:[
+   {...agentNode('weather'),config:{...agentNode('weather').config,instruction:'查询上海市今天的天气预报',branchMode:'direct'},branches:[branch('result','judge','')]},
+   {...agentNode('judge'),type:'ai-judge',config:{...agentNode('judge').config,instruction:'判断上海市今天是否会下雨',mode:'general',judgeMode:'classify',judgeInput:'{{input.weather.result}}',unknownBranchId:'unknown'},branches:[branch('rain','rain-end','今天明确有雨'),branch('dry','dry-end','今天明确无雨'),branch('unknown','unknown-end','预报缺失或无法确定')]},
+   ...['rain','dry','unknown'].map(id=>({id:`${id}-end`,name:`${id}结束`,type:'end',config:{status:'succeeded',summary:id},branches:[]}))
+  ]})
+  assert.equal(saved.nodes[1].branches[0].outputValue,undefined)
+  workflow.start(saved.id)
+  await until(()=>workflow.runs(saved.id)[0]?.status==='succeeded')
+  const run=workflow.runs(saved.id)[0],judgement=run.nodeRuns.find(node=>node.nodeId==='judge')
+  assert.equal(judgement.branchId,choice)
+  assert.deepEqual(JSON.parse(judgement.outputValue),{result:forecast,reason:choice==='unknown'?'没有今天的预报':'根据预报判断'})
+  assert.ok(run.nodeRuns.some(node=>node.nodeId===`${choice}-end`))
+  assert.equal(h.requests.length,2)
+  assert.match(JSON.stringify(h.requests[1]),/上海市今天是否会下雨/)
+  assert.match(JSON.stringify(h.requests[1]),/上海今天/)
+  assert.equal(JSON.stringify(h.requests[1]).includes('outputFormat'),false)
+ }
+})
+
+test('AI classification accepts a direct JSON decision when the Agent found no forecast',async t=>{
+ const summary='未能获取到上海今天的实际天气预报信息，无法确定是否下雨。'
+ const h=await harness(t,()=>response(summary)),calls=[]
+ const workflow=new WorkflowService(path.join(h.root,'direct-classifier'),h.agent,undefined,undefined,undefined,undefined,undefined,async(model,connection,prompt,signal)=>{
+  calls.push({model,connection,prompt,signal})
+  return '```json\n{"branchId":"unknown","reason":"没有今天的天气预报数据"}\n```'
+ });t.after(()=>workflow.dispose())
+ const branch=(id,target,condition)=>({id,name:id,condition,color:'#347fc5',targetNodeIds:[target]})
+ const saved=workflow.save({name:'天气未知分类',description:'',enabled:true,timeoutMinutes:1,entryNodeId:'weather',nodes:[
+  {...agentNode('weather'),config:{...agentNode('weather').config,instruction:'查询上海市今天的天气预报',branchMode:'direct'},branches:[branch('result','judge','')]},
+  {...agentNode('judge'),type:'ai-judge',config:{...agentNode('judge').config,instruction:'上海市今天是否会下雨？',judgeMode:'classify',judgeInput:'{{input.weather.result}}',unknownBranchId:'unknown'},branches:[branch('rain','rain-end','有雨'),branch('dry','dry-end','无雨'),branch('unknown','unknown-end','无法判断')]},
+  ...['rain','dry','unknown'].map(id=>({id:`${id}-end`,name:`${id}结束`,type:'end',config:{status:'succeeded',summary:id},branches:[]}))
+ ]})
+ workflow.start(saved.id)
+ await until(()=>workflow.runs(saved.id)[0]?.status==='succeeded')
+ const run=workflow.runs(saved.id)[0],judgement=run.nodeRuns.find(node=>node.nodeId==='judge')
+ assert.equal(judgement.branchId,'unknown')
+ assert.deepEqual(JSON.parse(judgement.outputValue),{result:summary,reason:'没有今天的天气预报数据'})
+ assert.equal(calls.length,1)
+ assert.match(calls[0].prompt,/无法确定是否下雨/)
+ assert.equal(h.requests.length,1,'分类器不应进入 Agent 任务规划')
+})
+
+test('AI classification sends a missing field to the uncertain branch without calling a model',async t=>{
+ const h=await harness(t,()=>response('模型不应被调用')),workflow=new WorkflowService(path.join(h.root,'missing-weather'),h.agent);t.after(()=>workflow.dispose())
+ const branch=(id,target,condition,outputValue)=>({id,name:id,condition,color:'#347fc5',targetNodeIds:target?[target]:[],...(outputValue?{outputValue}:{})})
+ const saved=workflow.save({name:'缺失天气',description:'',enabled:true,timeoutMinutes:1,entryNodeId:'source',nodes:[
+  {id:'source',name:'输入',type:'data',config:{assignments:[{name:'other',value:'无天气'}]},branches:[branch('next','judge','','{"other":"无天气"}')]},
+  {...agentNode('judge'),type:'ai-judge',config:{...agentNode('judge').config,instruction:'今天是否下雨',judgeMode:'classify',judgeInput:'{{input.source.result}}',unknownBranchId:'unknown'},branches:[branch('rain','rain-end','有雨'),branch('dry','dry-end','无雨'),branch('unknown','unknown-end','信息不足')]},
+  ...['rain','dry','unknown'].map(id=>({id:`${id}-end`,name:`${id}结束`,type:'end',config:{status:'succeeded',summary:id},branches:[]}))
+ ]})
+ workflow.start(saved.id)
+ await until(()=>workflow.runs(saved.id)[0]?.status==='succeeded')
+ const judgement=workflow.runs(saved.id)[0].nodeRuns.find(node=>node.nodeId==='judge')
+ assert.equal(judgement.branchId,'unknown')
+ assert.deepEqual(JSON.parse(judgement.outputValue),{result:null,reason:'判断输入缺失'})
+ assert.equal(h.requests.length,0)
 })
 
 test('AI judgement rejects an unknown model branch instead of following a fallback',async t=>{

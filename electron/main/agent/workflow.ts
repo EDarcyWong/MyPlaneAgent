@@ -1,6 +1,7 @@
 import { variableReference, mapVariableReferences } from '../../shared/workflow-variable-references.js';
 import { isDecision, validateDecision, evaluateRule, decisionValue, typedDecisionValue } from '../../shared/workflow-decisions.js';
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { WorkflowValidationError } from "../../shared/workflow-validation.js";
 import path from "node:path";
 import {
@@ -51,11 +52,12 @@ export class WorkflowService {
   private readonly runsFile: string;
   private readonly callbacks = new Map<string, (run: WorkflowRun) => void>();
   private readonly activeAgents = new Map<string, string>();
+  private readonly classifierControllers = new Map<string, AbortController>();
   private readonly pendingLocalAgents: { definition: WorkflowDefinition; runId: string; nodeId: string }[] = [];
   private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly timeouts = new Map<string, ReturnType<typeof setTimeout>>();
   constructor(
-    directory: string,
+    private readonly directory: string,
     private agent: Pick<LocalAgentService, 'start' | 'stop' | 'projects' | 'logModelConversation'> | CoreWorkflowAdapter,
     private log?: (level: "info" | "warn" | "error", message: string) => void,
     private notify?: (title: string, body: string) => void | boolean,
@@ -65,11 +67,25 @@ export class WorkflowService {
       ref: WorkflowModelRef | undefined,
       legacyModel: string | undefined,
     ) => Promise<WorkflowModelPlan>,
+    private classify?: (
+      model: string,
+      connection: AgentConnection | undefined,
+      prompt: string,
+      signal: AbortSignal,
+    ) => Promise<string>,
   ) {
     this.definitionsFile = path.join(directory, "definitions.json");
     this.versionsFile = path.join(directory, "versions.json");
     this.runsFile = path.join(directory, "runs.json");
+    this.removeLegacyProjectBindings();
     this.recover();
+  }
+  private removeLegacyProjectBindings() {
+    for (const file of [this.definitionsFile, this.versionsFile, this.runsFile]) {
+      const rows = readIntegrationJson<Record<string, unknown>[]>(file, []);
+      if (!Array.isArray(rows) || !rows.some((row) => row && "projectId" in row)) continue;
+      writeIntegrationJson(file, rows.map(({ projectId: _legacy, ...row }) => row));
+    }
   }
   private modelRef(input: unknown, label: string): WorkflowModelRef | undefined {
     if (!input || typeof input !== "object") return;
@@ -183,7 +199,9 @@ export class WorkflowService {
       sourceBranches = Array.isArray(input.branches)
         ? input.branches
         : legacyBranches;
-    const aiBranchMode =
+    const directAgent = input.type === "agent" && (!input.config?.branchMode || input.config.branchMode === "direct"),
+      classifyJudge = input.type === "ai-judge" && input.config?.judgeMode === "classify",
+      aiBranchMode =
         input.type === "ai-judge" || (input.type === "agent" && input.config?.branchMode === "ai"),
       branchIds = new Set<string>(),
       branches = sourceBranches.map((branch, index) => {
@@ -197,7 +215,7 @@ export class WorkflowService {
             `节点“${name}”第 ${index + 1} 条分支名称`,
             80,
           ),
-          condition = input.type === "join" || input.type === "data" || input.type === "approval" || (input.type === "notify" && input.config?.fixedBranches) || isDecision(input.type) ? "" : text(
+          condition = directAgent || input.type === "join" || input.type === "data" || input.type === "approval" || (input.type === "notify" && input.config?.fixedBranches) || isDecision(input.type) ? "" : text(
             branch.condition,
             `节点“${name}”分支“${branchName}”的判断条件`,
             500,
@@ -208,7 +226,7 @@ export class WorkflowService {
         branchIds.add(id);
         if (!/^#[0-9a-f]{6}$/i.test(color))
           throw new Error(`节点“${name}”分支“${branchName}”的颜色无效`);
-        if (!aiBranchMode && input.type !== "join" && input.type !== "data" && input.type !== "approval" && !(input.type === "notify" && input.config?.fixedBranches) && !isDecision(input.type))
+        if (!aiBranchMode && !directAgent && input.type !== "join" && input.type !== "data" && input.type !== "approval" && !(input.type === "notify" && input.config?.fixedBranches) && !isDecision(input.type))
           this.validateBranchCondition(condition, name, branchName);
         const rawTargets = Array.isArray(branch.targetNodeIds)
             ? branch.targetNodeIds
@@ -228,7 +246,7 @@ export class WorkflowService {
           )
         )
           throw new Error(`节点“${name}”分支“${branchName}”的输出目标无效`);
-        const outputValue = text(
+        const outputValue = directAgent || classifyJudge ? "" : text(
           branch.outputValue,
           `节点“${name}”分支“${branchName}”的输出值`,
           4000,
@@ -250,9 +268,17 @@ export class WorkflowService {
       });
     const base = { id: text(input.id, "节点 ID", 80), name, branches };
     if (input.type === "agent" || input.type === "ai-judge") {
-      if (input.type === "ai-judge" && branches.length < 2)
-        throw new Error(`AI 判断“${base.name}”至少需要两个输出分支`);
-      const branchMode = input.type === "ai-judge" ? "ai" : input.config?.branchMode || "ai",
+      if (directAgent && branches.length !== 1)
+        throw new Error(`Agent“${base.name}”必须有且只有一个输出分支`);
+      if (input.type === "ai-judge" && branches.length < (classifyJudge ? 3 : 2))
+        throw new Error(`AI 判断“${base.name}”至少需要${classifyJudge ? "三个" : "两个"}输出分支`);
+      if (classifyJudge) {
+        if (!/^\{\{\s*input\.[^.{}\s]+(?:\.[^{}\s]+)*\s*\}\}$/.test(input.config.judgeInput || ""))
+          throw new Error(`AI 判断“${base.name}”请选择有效的上游输入字段`);
+        if (!branches.some(branch => branch.id === input.config.unknownBranchId))
+          throw new Error(`AI 判断“${base.name}”缺少无法判断分支`);
+      }
+      const branchMode = input.type === "ai-judge" ? "ai" : input.config?.branchMode || "direct",
         modelRef = this.modelRef(input.config?.modelRef, `节点“${base.name}”的模型`),
         modelSource =
           input.config?.modelSource ||
@@ -265,7 +291,7 @@ export class WorkflowService {
           input.config?.approvalMode,
         ) ||
         !["all", "any"].includes(input.config?.inputSignalMode || "all") ||
-        !["ai", "rules"].includes(branchMode) ||
+        !["direct", "ai", "rules"].includes(branchMode) ||
         !["current", "specified"].includes(modelSource) ||
         (modelSource === "specified" &&
           !String(input.config?.model || modelRef?.id || "").trim())
@@ -301,7 +327,7 @@ export class WorkflowService {
           inputNames.add(parameterName);
           return { name: parameterName, description, ...(value ? { value } : {}) };
         });
-      if (branchMode === "ai") {
+      if (branchMode === "ai" && !classifyJudge) {
         if (!branches.length)
           throw new Error(`Agent“${base.name}”至少需要一个输出分支`);
         for (const branch of branches)
@@ -327,6 +353,11 @@ export class WorkflowService {
           inputs,
           inputSignalMode: input.config.inputSignalMode || "all",
           branchMode,
+          ...(classifyJudge ? {
+            judgeMode: "classify" as const,
+            judgeInput: text(input.config.judgeInput, "判断输入", 300),
+            unknownBranchId: text(input.config.unknownBranchId, "无法判断分支", 80),
+          } : input.type === "ai-judge" ? { judgeMode: "legacy" as const } : {}),
         },
       };
     }
@@ -527,10 +558,6 @@ export class WorkflowService {
     previous?: WorkflowDefinition,
   ): WorkflowDefinition {
     if (
-      !this.agent.projects().some((project) => project.id === input.projectId)
-    )
-      throw new Error("请选择有效项目");
-    if (
       !Array.isArray(input.nodes) ||
       !input.nodes.length ||
       input.nodes.length > 100
@@ -565,6 +592,13 @@ export class WorkflowService {
     const map = new Map(nodes.map((node) => [node.id, node])),
       visiting = new Set<string>(),
       visited = new Set<string>();
+    for (const node of nodes) {
+      if (node.type !== "ai-judge" || node.config.judgeMode !== "classify") continue;
+      const sourceId = node.config.judgeInput!.match(/^\{\{\s*input\.([^.{}\s]+)/)?.[1];
+      const source = sourceId ? map.get(sourceId) : undefined;
+      if (!source?.branches?.some(branch => branch.targetNodeIds?.includes(node.id)))
+        throw new WorkflowValidationError(`AI 判断“${node.name}”的输入必须来自直接连接的上游节点`, [node.id]);
+    }
     const targets = (node: WorkflowNode) =>
       node.branches?.flatMap((branch) => branch.targetNodeIds || []) || [];
     const walk = (id: string) => {
@@ -651,7 +685,6 @@ export class WorkflowService {
       id: previous?.id || randomUUID(),
       name: text(input.name, "工作流名称", 100),
       description: text(input.description, "工作流说明", 1000, true),
-      projectId: input.projectId,
       enabled: input.enabled !== false,
       version: (previous?.version || 0) + 1,
       entryNodeId,
@@ -745,7 +778,6 @@ export class WorkflowService {
         workflowId: definition.id,
         workflowName: definition.name,
         workflowVersion: definition.version,
-        projectId: definition.projectId,
         status: "running",
         currentNodeId: entry,
         pendingNodeIds: entries.slice(1),
@@ -1088,6 +1120,14 @@ export class WorkflowService {
     }
     return inputs;
   }
+  private classificationInput(
+    definition: WorkflowDefinition,
+    node: Extract<WorkflowNode, { type: "ai-judge" }>,
+    run: WorkflowRun,
+  ) {
+    const expression = node.config.judgeInput?.match(/^\{\{\s*([^{}]+?)\s*\}\}$/)?.[1];
+    return expression ? this.templateReference(expression, definition, node, run) : undefined;
+  }
   private agentPrompt(
     definition: WorkflowDefinition,
     node: Extract<WorkflowNode, { type: "agent" | "ai-judge" }>,
@@ -1120,6 +1160,23 @@ export class WorkflowService {
           })),
       },
       expanded = this.render(node.config.instruction, run, { definition, node });
+    if (node.type === "ai-judge" && node.config.judgeMode === "classify") {
+      const value = this.classificationInput(definition, node, run),
+        branches = (node.branches || []).map((branch, index) => ({
+          order: index + 1,
+          id: branch.id,
+          name: branch.name,
+          condition: branch.condition,
+          uncertain: branch.id === node.config.unknownBranchId,
+        }));
+      return `你是工作流分类器。仅根据给定输入判断，不查询新信息，不执行任务，也不改写原始输入。
+判断问题：${expanded}
+输入字段：${node.config.judgeInput}
+输入内容：${this.compactJson(value === undefined ? null : value, 9000)}
+可选分支：${this.compactJson(branches, 5000)}
+按 order 从小到大选择第一条明确成立的条件；输入缺失、信息含糊或无法确定时，选择 uncertain 为 true 的分支。
+只返回 JSON 对象，且只能包含 branchId 和 reason 两个字符串字段。reason 简短说明依据，不要输出原始输入或其他字段。`;
+    }
     if (node.config.branchMode !== "ai")
       return `${expanded}\n\n${inputPrompt}\n\n工作流上下文：\n${this.compactJson(context)}`;
     const branches = (node.branches || []).map((branch, index) => ({
@@ -1191,6 +1248,28 @@ export class WorkflowService {
       throw new Error(`AI 返回的输出不符合分支“${branch.name}”的 JSON 格式`);
     return { branch, output: value.output as Record<string, unknown> };
   }
+  private aiClassification(
+    source: string,
+    node: Extract<WorkflowNode, { type: "ai-judge" }>,
+  ) {
+    let response: unknown;
+    try {
+      response = JSON.parse(source.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim());
+    } catch {
+      throw new Error('AI 判断应只返回 {"branchId":"分支 ID","reason":"判断理由"}');
+    }
+    if (!response || typeof response !== "object" || Array.isArray(response))
+      throw new Error("AI 判断结果必须是 JSON 对象");
+    const value = response as Record<string, unknown>;
+    if (Object.keys(value).sort().join(",") !== "branchId,reason" ||
+      typeof value.branchId !== "string" || typeof value.reason !== "string" ||
+      !value.reason.trim() || value.reason.length > 1000)
+      throw new Error("AI 判断结果只能包含有效的 branchId 和 reason 字符串");
+    const branchId = value.branchId === "__NO_MATCH__" ? node.config.unknownBranchId : value.branchId;
+    const branch = node.branches?.find(item => item.id === branchId);
+    if (!branch) throw new Error("AI 返回了不存在的输出分支");
+    return { branch, reason: value.reason.trim() };
+  }
   private async execute(
     definition: WorkflowDefinition,
     runId: string,
@@ -1213,6 +1292,16 @@ export class WorkflowService {
     this.persist(run);
     try {
       if (node.type === "agent" || node.type === "ai-judge") {
+        if (node.type === "ai-judge" && node.config.judgeMode === "classify" &&
+            this.classificationInput(definition, node, run) === undefined) {
+          const branch = node.branches!.find(item => item.id === node.config.unknownBranchId)!;
+          nodeRun.status = "succeeded";
+          nodeRun.summary = "判断输入缺失";
+          nodeRun.outputValue = JSON.stringify({ result: null, reason: "判断输入缺失" });
+          nodeRun.finishedAt = now();
+          this.persist(run);
+          return this.advance(definition, run, node, true, branch);
+        }
         const legacyModel =
             node.config.modelSource === "specified"
               ? node.config.model
@@ -1233,9 +1322,40 @@ export class WorkflowService {
           plan = this.prepareModel
             ? await this.prepareModel(node.config.modelRef, legacyModel)
             : { model: legacyModel || node.config.model || "" },
-          result = this.agent.start(
+          workspace = path.join(this.directory, "workspaces", definition.id);
+        if (node.type === "ai-judge" && node.config.judgeMode === "classify" && this.classify) {
+          const model = plan.model || legacyModel || node.config.model;
+          if (!model) throw new Error("当前连接尚未选择模型；请先选择可用模型");
+          const controller = new AbortController();
+          this.classifierControllers.set(run.id, controller);
+          if (plan.label)
+            this.trace(run, "info", `节点“${node.name}”使用当前模型：${plan.label}`, node.id);
+          try {
+            const answer = await this.classify(model, plan.connection, prompt, controller.signal);
+            const current = this.runs(undefined, 2000).find((item) => item.id === run.id);
+            if (!current || current.status !== "running") return;
+            const currentNode = [...current.nodeRuns].reverse().find((item) => item.nodeId === node.id && item.status === "running");
+            if (!currentNode) return;
+            const input = this.classificationInput(definition, node, current);
+            const decision = this.aiClassification(answer, node);
+            currentNode.status = "succeeded";
+            currentNode.branchId = decision.branch.id;
+            currentNode.branchName = decision.branch.name;
+            currentNode.summary = decision.reason;
+            currentNode.outputValue = JSON.stringify({ result: input ?? null, reason: decision.reason });
+            currentNode.finishedAt = now();
+            this.persist(current);
+            await this.advance(definition, current, node, true, decision.branch);
+          } finally {
+            this.classifierControllers.delete(run.id);
+          }
+          return;
+        }
+        fs.mkdirSync(workspace, { recursive: true });
+        const result = this.agent.start(
             {
-              projectId: definition.projectId,
+              projectless: true,
+              workspace,
               hidden: true,
               mode: node.config.mode,
               model: (() => {
@@ -1405,7 +1525,7 @@ export class WorkflowService {
       .find((item) => item.nodeId === node.id && item.status === "running");
     if (!nodeRun) return;
     const success = task.status === "completed",
-      summary = [...task.events]
+      answer = [...task.events]
         .reverse()
         .find(
           (event) =>
@@ -1413,12 +1533,36 @@ export class WorkflowService {
             event.text &&
             !event.text.startsWith("本次模型未调用工具"),
         )
-        ?.text.slice(0, 2000);
+        ?.text || "";
     nodeRun.error = task.error || undefined;
-    nodeRun.summary = summary;
+    nodeRun.summary = answer.slice(0, 2000);
+    if (success && node.type === "ai-judge" && node.config.judgeMode === "classify")
+      try {
+        const input = this.classificationInput(definition, node, run),
+          decision = input === undefined
+            ? { branch: node.branches!.find(branch => branch.id === node.config.unknownBranchId)!, reason: "判断输入缺失" }
+            : this.aiClassification(answer, node);
+        nodeRun.status = "succeeded";
+        nodeRun.branchId = decision.branch.id;
+        nodeRun.branchName = decision.branch.name;
+        nodeRun.summary = decision.reason;
+        nodeRun.outputValue = JSON.stringify({ result: input ?? null, reason: decision.reason });
+        nodeRun.finishedAt = now();
+        this.persist(run);
+        void this.advance(definition, run, node, true, decision.branch);
+        return;
+      } catch (error) {
+        this.agent.logModelConversation(task.id, error, this.log ? message=>this.log!("error", `[工作流 ${definition.name} / 节点 ${node.name} / 运行 ${run.id}] ${message}`) : undefined);
+        nodeRun.status = "failed";
+        nodeRun.error = String(error);
+        nodeRun.finishedAt = now();
+        this.persist(run);
+        this.fail(run.id, String(error));
+        return;
+      }
     if (success && node.config.branchMode === "ai")
       try {
-        const decision = this.aiDecision(summary || "", node);
+        const decision = this.aiDecision(answer, node);
         nodeRun.status = "succeeded";
         nodeRun.branchId = decision.branch.id;
         nodeRun.branchName = decision.branch.name;
@@ -1440,9 +1584,14 @@ export class WorkflowService {
         return;
       }
     nodeRun.status = success ? "succeeded" : "failed";
+    if (success && node.type === "agent" && node.config.branchMode === "direct")
+      nodeRun.outputValue = JSON.stringify({ result: answer });
     nodeRun.finishedAt = now();
     this.persist(run);
-    void this.advance(definition, run, node, success);
+    void this.advance(definition, run, node, success,
+      node.type === "agent" && node.config.branchMode === "direct"
+        ? (success ? node.branches?.[0] : null)
+        : undefined);
   }
   private launchNextLocalAgent() {
     if (this.activeAgents.size) return;
@@ -1474,6 +1623,10 @@ export class WorkflowService {
     run: WorkflowRun,
     node: WorkflowNode,
   ) {
+    if (node.type === "ai-judge" && node.config.judgeMode === "classify") {
+      const sourceId = node.config.judgeInput?.match(/^\{\{\s*input\.([^.{}\s]+)/)?.[1];
+      return !!sourceId && (run.nodeInputSignals?.[node.id] || []).includes(sourceId);
+    }
     const mode =
       node.type === "join"
         ? node.config.mode
@@ -1515,7 +1668,10 @@ export class WorkflowService {
     );
     if (waiting) {
       const received = new Set(run.nodeInputSignals?.[waiting.id] || []),
-        missing = this.incomingSources(definition, waiting.id)
+        expected = waiting.type === "ai-judge" && waiting.config.judgeMode === "classify"
+          ? [waiting.config.judgeInput!.match(/^\{\{\s*input\.([^.{}\s]+)/)![1]]
+          : this.incomingSources(definition, waiting.id),
+        missing = expected
           .filter((source) => !received.has(source))
           .map(
             (id) => definition.nodes.find((node) => node.id === id)?.name || id,
@@ -1567,7 +1723,8 @@ export class WorkflowService {
       if (
         branch.outputValue &&
         node.type !== "join" &&
-        !((node.type === "agent" || node.type === "ai-judge") && node.config.branchMode === "ai")
+        !((node.type === "agent" || node.type === "ai-judge") &&
+          (node.config.branchMode === "ai" || node.config.branchMode === "direct"))
       ) {
         try {
           nodeRun.outputValue = renderWorkflowJsonTemplate(branch.outputValue,
@@ -1633,6 +1790,8 @@ export class WorkflowService {
     this.emit(run);
   }
   private finish(run: WorkflowRun) {
+    this.classifierControllers.get(run.id)?.abort();
+    this.classifierControllers.delete(run.id);
     run.currentNodeId = undefined;
     run.pendingNodeIds = [];
     for (let index = this.pendingLocalAgents.length-1;index>=0;index--) if (this.pendingLocalAgents[index].runId === run.id) this.pendingLocalAgents.splice(index,1);
@@ -1684,6 +1843,8 @@ export class WorkflowService {
     if (changed) this.writeRuns(rows);
   }
   dispose() {
+    for (const controller of this.classifierControllers.values()) controller.abort();
+    this.classifierControllers.clear();
     for (const run of this.runs(undefined, 2000).filter((row) =>
       row.status === "running",
     ))

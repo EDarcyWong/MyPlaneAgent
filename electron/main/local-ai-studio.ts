@@ -329,6 +329,20 @@ export class LocalAiStudioService extends LocalAiService {
       },
       () => this.inferenceSettings().source === "managed",
       (ref, legacyModel) => this.prepareWorkflowModel(ref, legacyModel),
+      async (model, selectedConnection, prompt, signal) => {
+        const connection = selectedConnection || this.agentConnection();
+        const answer = await requestAgentModel(
+          { ...connection, maxTokens: Math.min(connection.maxTokens, 512) },
+          model,
+          [
+            { role: "system", content: "你是工作流分类器。只根据用户提供的输入分类，返回要求的 JSON；不得执行任务或补充外部事实。" },
+            { role: "user", content: prompt },
+          ],
+          signal,
+          { tools: false, thinking: false, temperature: 0 },
+        );
+        return answer.content || "";
+      },
     );
     this.automation = new AutomationService(
       path.join(dataRoot, "local-ai-automations"),
@@ -443,7 +457,10 @@ export class LocalAiStudioService extends LocalAiService {
             else if (entry.name === 'agent-tools') {
               // Upgrade the known shipped runtime while preserving user-edited Skill code.
               const entryPath = path.join(destination, 'index.py');
-              if (existsSync(entryPath) && createHash('sha256').update(readFileSync(entryPath)).digest('hex') === '97b5a11b0df3579bdcb3ef5e221b3ad38c8197dc737032242e2c561eeab86f22')
+              if (existsSync(entryPath) && new Set([
+                '97b5a11b0df3579bdcb3ef5e221b3ad38c8197dc737032242e2c561eeab86f22',
+                '8022fb6a001ff9749f7710ef6754e5fa16ed8d7aa633d6e373c33de6c75cdadb',
+              ]).has(createHash('sha256').update(readFileSync(entryPath)).digest('hex')))
                 cpSync(path.join(bundledSkills, entry.name, 'index.py'), entryPath);
             }
           }
