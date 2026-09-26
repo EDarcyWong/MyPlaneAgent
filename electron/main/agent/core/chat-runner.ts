@@ -268,7 +268,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
         options.onContent(responseSegments.join('')+'\n\n[回答达到分段上限，已保留以上完整生成内容；可继续对话要求从此处续写。]')
         return
       }
-      if (++toolOutputLimitRetries >= 3) { pause(`模型连续三次达到输出上限（本次 ${error.maxTokens} Tokens），已停止重试.${breakdown}截断的工具调用均未执行。${error.output&&error.output.reasoning>truncatedText.length+error.output.arguments?'请求已关闭思考，但服务仍返回大量思考内容，请检查模型服务的思考开关或模板。':'已要求单个小范围步骤，模型仍未返回完整结果。请根据已有执行记录继续尚未完成部分。'}`); return }
+      if (++toolOutputLimitRetries >= 3) { pause(`模型连续三次达到输出上限（本次 ${error.maxTokens} Tokens），已停止重试。${breakdown}截断的工具调用均未执行。${error.output&&error.output.reasoning>truncatedText.length+error.output.arguments?'请求已关闭思考，但服务仍返回大量思考内容，请检查模型服务的思考开关或模板。':'已要求单个小范围步骤，模型仍未返回完整结果。请根据已有执行记录继续尚未完成部分。'}`); return }
       outputRecovery = true
       turnTools=allowedTools.map(tool=>({...tool,function:{...tool.function,parameters:recoveryToolSchema(tool.function.parameters)}}))
       options.onProgress?.(`正在启用小步骤恢复。${breakdown}`, 'working')
