@@ -13,7 +13,17 @@ if(import.meta.hot)import.meta.hot.dispose(disposeFloatingMenus)
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
-if(params.get('surface')==='browser'){
+if(!window.myplane){
+ document.title='请从桌面应用打开 · MyPlaneAgent'
+ const root=document.querySelector('#app')
+ if(root){
+  const panel=document.createElement('main');panel.setAttribute('role','alert');panel.style.cssText='max-width:620px;margin:12vh auto;padding:28px;line-height:1.8'
+  const heading=document.createElement('h1');heading.textContent='此页面需要 MyPlaneAgent 桌面接口'
+  const explanation=document.createElement('p');explanation.textContent='当前页面未连接桌面应用，无法读取会话或调用本机功能。如果在内置浏览器中打开了应用地址，请返回 MyPlaneAgent 主窗口使用；浏览器用于浏览网页。'
+  const recovery=document.createElement('p');recovery.textContent='如果这是应用主窗口，请完全退出后重新启动；仍无法恢复时，请检查预加载脚本是否完整安装。'
+  panel.append(heading,explanation,recovery);root.replaceChildren(panel)
+ }
+}else if(params.get('surface')==='browser'){
  void import('./local-ai/InternalBrowser.vue').then(({default:InternalBrowser})=>createApp(InternalBrowser).mount('#app'))
 }else if(params.get('surface')==='help'){
  document.title='工作流使用指南 · MyPlaneAgent'

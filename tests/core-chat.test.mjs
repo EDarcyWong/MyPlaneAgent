@@ -18,13 +18,128 @@ async function withModel(call, work, reviewCall) {
     const isReview=input.messages.some(item=>item.role==='system'&&String(item.content).includes('你是任务完成检查器'))
     const message=isReview ? (reviewCall ? await reviewCall(input) : {content:JSON.stringify({status:'complete',reason:'已完成',nextStep:''})}) : await call(input,requests.length)
     response.setHeader('content-type','application/json')
-    response.end(JSON.stringify({choices:[{finish_reason:message.tool_calls?'tool_calls':'stop',message}],usage:{prompt_tokens:30,completion_tokens:5}}))
+    response.end(JSON.stringify({choices:[{finish_reason:message.finish_reason || (message.tool_calls?'tool_calls':'stop'),message}],usage:{prompt_tokens:30,completion_tokens:5}}))
   })
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
   try{await work({endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:1024,contextLength:8192},requests)}finally{await new Promise(resolve=>server.close(resolve))}
 }
+
+test('chat discards truncated tool calls and recovers with bounded output without executing partial work',async()=>{
+ const executions=[], progress=[];let count=0,usage=0
+ await withModel((input,n)=>n===1?{...toolCall(input,'agent.web_search',{query:'truncated'}),finish_reason:'length'}:n===2?toolCall(input,'agent.web_search',{query:'complete'}):{content:'已有完整查询结果'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{executions.push(request.args.query);return {success:true,output:{text:'result'}}}},options(connection,{approvalMode:'full',onRequest:()=>count++,onUsage:()=>usage++,onProgress:text=>progress.push(text)}))
+  assert.deepEqual(executions,['complete'])
+  assert.ok(progress.some(text=>text.includes('缩小本轮工作量')))
+  assert.ok(requests[1].messages.some(m=>String(m.content).includes('不要继续拼接被截断的 JSON')))
+  assert.equal(requests[1].messages.some(m=>m.role==='assistant'&&m.tool_calls),false)
+  assert.ok(requests.every(r=>r.max_tokens<=connection.contextLength/2));assert.ok(requests[1].max_tokens>requests[0].max_tokens);assert.ok(count>=3);assert.ok(usage>=3)
+ })
+})
+
+test('chat repeated truncation stops after three requests and preserves a blocked outcome',async()=>{
+ let content='',outcome
+ await withModel(()=>({content:'残缺的答案',finish_reason:'length'}),async(connection,requests)=>{
+  await runCoreChat({list:()=>[],execute:()=>assert.fail('must not execute')},options(connection,{onContent:text=>content+=text,onOutcome:value=>outcome=value}))
+  assert.equal(requests.length,3);assert.equal(outcome,'blocked');assert.match(content,/连续三次/);assert.ok(!content.includes('残缺的答案'))
+ })
+})
+
+test('chat output recovery grows 2048 to 4096 to 8192 without replaying truncated tools',async()=>{
+ const executed=[]
+ await withModel((input,n)=>n<=2?{...toolCall(input,'agent.web_search',{query:'discard-'+n}),finish_reason:'length'}:n===3?toolCall(input,'agent.web_search',{query:'valid'}):{content:'已获得结果'},async(connection,requests)=>{
+  const configured={...connection,maxTokens:2048,contextLength:32768}
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{executed.push(request.args.query);return {success:true,output:'查询结果'}}},options(configured,{approvalMode:'full'}))
+  assert.deepEqual(requests.slice(0,3).map(r=>r.max_tokens),[2048,4096,8192])
+  assert.deepEqual(executed,['valid']);assert.equal(configured.maxTokens,2048)
+ })
+})
+
+test('chat recovery stops when context capacity prevents output budget growth',async()=>{
+ let outcome,content=''
+ await withModel(()=>({content:'partial',finish_reason:'length'}),async(connection,requests)=>{
+  await runCoreChat({list:()=>[],execute:()=>assert.fail('must not execute')},options({...connection,maxTokens:2048,contextLength:4096},{onContent:text=>content+=text,onOutcome:value=>outcome=value}))
+  assert.equal(outcome,'blocked');assert.equal(requests.length,2);assert.ok(requests.every(r=>r.max_tokens<=2048));assert.match(content,/无法继续提高额度/)
+ })
+})
+
+test('small-step recovery constrains schemas and rejects oversized complete arguments before execution',async()=>{
+ const executed=[]
+ await withModel((input,n)=>n===1?{content:'too long',finish_reason:'length'}:n===2?toolCall(input,'agent.web_search',{query:'x'.repeat(2049)}):n===3?toolCall(input,'agent.web_search',{query:'small'}):{content:'已核对结果'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{executed.push(request.args.query);return {success:true,output:'result'}}},options(connection,{approvalMode:'full'}))
+  assert.deepEqual(executed,['small'])
+  assert.equal(requests[1].tools[0].function.parameters.properties.query.maxLength,2048)
+  assert.ok(requests[2].messages.some(m=>m.role==='tool'&&m.content.includes('2048')))
+ })
+})
+
+test('truncation diagnostics distinguish reasoning from tool arguments',async()=>{
+ let content=''
+ await withModel(()=>({content:'',reasoning_content:'r'.repeat(100),finish_reason:'length'}),async(connection)=>{
+  await runCoreChat({list:()=>[],execute:()=>assert.fail('must not execute')},options(connection,{onContent:text=>content+=text}))
+  assert.match(content,/思考 100 字符/);assert.match(content,/服务仍返回大量思考内容/)
+ })
+})
+
+test('chat truncation recovery respects cancellation before another request',async()=>{
+ const controller=new AbortController()
+ await withModel(()=>({content:'partial',finish_reason:'length'}),async(connection,requests)=>{
+  await assert.rejects(runCoreChat({list:()=>[],execute:()=>assert.fail('must not execute')},options(connection,{signal:controller.signal,onProgress:text=>{if(text.includes('缩小本轮工作量'))controller.abort(new Error('cancel recovery'))}})),/cancel recovery/)
+  assert.equal(requests.length,1)
+ })
+})
 const toolCall=(input,name,args)=>({role:'assistant',content:null,tool_calls:[{id:'call1',type:'function',function:{name:input.tools.find(tool=>tool.function.description.startsWith(name+':')).function.name,arguments:JSON.stringify(args)}}]})
 const options=(connection,overrides={})=>({connection,model:'test-model',messages:[{role:'user',content:'搜索今日天气'}],workspace:tmpdir(),filesEnabled:false,webEnabled:true,approvalMode:'ask',signal:new AbortController().signal,onRequest(){},onUsage(){},onContent(){},onReasoning(){},onActivity(){},approve:async()=>true,...overrides})
+
+test('changed queries with identical search evidence switch to page reading and then restore search',async()=>{
+ const calls=[],progress=[]
+ await withModel((input,n)=>n<=3?toolCall(input,'agent.web_search',{query:'北京天气 '+n}):n===4?toolCall(input,'agent.web_fetch',{query:'https://example.com/weather'}):{content:'已核对预报'},async(connection,requests)=>{
+  const registry={list:()=>[capability('agent.web_search'),capability('agent.web_fetch')],execute:async request=>{calls.push(request.capability);return {success:true,output:request.capability==='agent.web_search'?{query:request.args.query,searchedAt:String(calls.length),results:[{url:'https://example.com/weather',title:'北京预报',snippet:'预报页面'}]}:{text:'27日（明天）晴'}}}}
+  await runCoreChat(registry,options(connection,{approvalMode:'full',onProgress:text=>progress.push(text)}))
+  assert.equal(requests[3].tools.some(t=>t.function.description.startsWith('agent.web_search:')),false)
+  assert.equal(requests[4].tools.some(t=>t.function.description.startsWith('agent.web_search:')),true)
+  assert.ok(progress.some(text=>text.includes('搜索结果重复')))
+  assert.deepEqual(calls,['agent.web_search','agent.web_search','agent.web_search','agent.web_fetch'])
+  assert.equal(requests.at(-1).messages.at(-1).role,'user')
+  assert.match(requests.at(-1).messages.at(-1).content,/JSON 检查结果/)
+ })
+})
+
+test('research handoff is corrected into a page read; failed text fetch can use authorized browser readers',async()=>{
+ const names=['agent.web_fetch','browser.open','browser.read_page'],calls=[]
+ const caps=names.map(name=>({...capability(name),...(name.startsWith('browser.')?{source:{type:'builtin'},runtime:'builtin'}:{})}))
+ await withModel((input,n)=>n===1?{content:'建议您访问中国天气网查询。'}:n<=4?toolCall(input,names[n-2],{query:'https://example.com/weather'}):{content:'页面预报已读取，未提供降雨概率'},async(connection,requests)=>{
+  await runCoreChat({list:()=>caps,execute:async request=>{calls.push(request.capability);return request.capability==='agent.web_fetch'?{success:false,error:'页面正文依赖动态加载'}:{success:true,output:{text:'27日 晴',url:'https://example.com/weather'}}}},options(connection,{approvalMode:'full',messages:[{role:'user',content:'请访问 https://example.com/weather 查询北京明天天气'}]}))
+  assert.deepEqual(calls,names)
+  assert.ok(requests[1].messages.some(m=>m.role==='system'&&m.content.includes('把已授权的查询交回用户')))
+  assert.ok(requests[0].messages.some(m=>m.role==='system'&&m.content.includes('不得从“晴”推断精确降雨概率')))
+ })
+})
+
+test('stale network denial in continued history is corrected with actual tool names before review',async()=>{
+ let executed=0,text=''
+ await withModel((input,n)=>n===1?{content:'当前可用的工具中**没有联网搜索或网页读取能力**，http_request 仅限 localhost。'}:n===2?toolCall(input,'agent.web_search',{query:'上海明天天气'}):{content:'已取得天气资料'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search'),capability('agent.web_fetch')],execute:async()=>{executed++;return {success:true,output:'天气资料'}}},options(connection,{messages:[{role:'user',content:'上海明天下雨不？'},{role:'assistant',content:'没有联网搜索或网页读取能力'},{role:'user',content:'继续'}],approvalMode:'full',onContent:value=>text+=value}))
+  assert.equal(executed,1);assert.equal(text,'已取得天气资料')
+  assert.ok(requests[0].messages.some(m=>m.role==='system'&&m.content.includes('agent.web_search → cap_0_agent_web_search')))
+  assert.ok(requests[1].messages.some(m=>m.role==='system'&&m.content.includes('与实际工具列表不符')))
+  assert.equal(requests[1].messages.filter(m=>m.role==='assistant').length,1,'discard the new false claim while keeping original history')
+ })
+})
+test('persistent false denial stops after one correction and reports actual availability',async()=>{
+ let text='',outcome=''
+ await withModel(()=>({content:'没有联网搜索或网页读取能力'}),async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>assert.fail('no fabricated tool execution')},options(connection,{onContent:value=>text+=value,onOutcome:value=>outcome=value}))
+  assert.equal(requests.length,2);assert.equal(outcome,'blocked');assert.match(text,/本轮已提供联网/);assert.doesNotMatch(text,/没有联网搜索/)
+ })
+})
+test('network disabled does not trigger a false denial correction',async()=>{
+ await withModel(()=>({content:'没有联网搜索或网页读取能力'}),async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>assert.fail('network is disabled')},options(connection,{webEnabled:false}))
+  assert.equal(requests.length,2,'normal answer and completion review only')
+  assert.equal(requests[0].tools,undefined)
+  assert.ok(!requests.some(r=>r.messages.some(m=>m.role==='system'&&m.content.includes('本轮已实际提供'))))
+ })
+})
 
 test('project chat initializes local Git before inference, while ordinary chat leaves its directory untouched',async()=>{
  const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-git-'))

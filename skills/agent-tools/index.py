@@ -19,10 +19,24 @@ import engine
 WRITE_TOOLS = {'write_file', 'replace_text', 'apply_patch', 'create_document', 'create_spreadsheet', 'run_command', 'run_test'}
 
 
-def safe_public_url(url, proxy_mapping=False):
+def encoded_public_url(url):
+    if any(ord(char) < 32 or ord(char) == 127 for char in url):
+        raise ValueError('Control characters are not allowed in URLs')
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('Only public HTTP/HTTPS URLs are allowed')
+    hostname = parsed.hostname.encode('idna').decode('ascii')
+    authority = '[' + hostname + ']' if ':' in hostname else hostname
+    if parsed.port is not None:
+        authority += ':' + str(parsed.port)
+    # Preserve existing escapes and query separators (including +); encode only
+    # characters that cannot be sent in an HTTP request target.
+    quote = lambda value: urllib.parse.quote(value, safe="/%:@!$&'()*+,;=-._~?")
+    return urllib.parse.urlunparse((parsed.scheme, authority, quote(parsed.path), quote(parsed.params), quote(parsed.query), ''))
+
+
+def safe_public_url(url, proxy_mapping=False):
+    parsed = urllib.parse.urlparse(encoded_public_url(url))
     hostname = parsed.hostname.lower().rstrip('.')
     if hostname == 'localhost' or hostname.endswith(('.localhost', '.local', '.internal')):
         raise ValueError('Local hostnames are not allowed')
@@ -52,8 +66,12 @@ class WebPageText(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.hidden_depth = 0
+        self.links = []
+        self.link = None
 
     def handle_starttag(self, tag, attrs):
+        if tag == 'a' and not self.hidden_depth:
+            self.link = {'url': dict(attrs).get('href', ''), 'title': ''}
         if self.hidden_depth:
             self.hidden_depth += 1
         elif tag in self.HIDDEN:
@@ -62,6 +80,10 @@ class WebPageText(HTMLParser):
             self.parts.append('\n')
 
     def handle_endtag(self, tag):
+        if tag == 'a' and self.link is not None:
+            if self.link['url'] and len(self.links) < 300:
+                self.links.append(self.link)
+            self.link = None
         if self.hidden_depth:
             self.hidden_depth -= 1
         elif tag in self.BLOCK:
@@ -70,6 +92,8 @@ class WebPageText(HTMLParser):
     def handle_data(self, data):
         if not self.hidden_depth and data.strip():
             self.parts.append(data.strip())
+            if self.link is not None:
+                self.link['title'] += data.strip() + ' '
 
     def text(self):
         return '\n'.join(' '.join(line.split()) for line in ''.join(
@@ -78,7 +102,7 @@ class WebPageText(HTMLParser):
 
 
 def web_fetch(args, redirects=0, raw_html=False):
-    url = args['url']
+    url = encoded_public_url(args['url'])
     scheme = urllib.parse.urlparse(url).scheme
     proxy_url = urllib.request.getproxies().get(scheme)
     proxy = urllib.parse.urlparse(proxy_url) if proxy_url else None
@@ -124,13 +148,26 @@ def web_fetch(args, redirects=0, raw_html=False):
         raw = response.read(2_000_001)
         charset = response.headers.get_content_charset() or 'utf-8'
         content = raw.decode(charset, 'replace')
+        links = []
         if kind == 'text/html' and not raw_html:
             parser = WebPageText()
             parser.feed(content)
             content = parser.text()
+            seen = set()
+            for link in parser.links:
+                try:
+                    href = encoded_public_url(urllib.parse.urljoin(url, link['url']))
+                    if href in seen:
+                        continue
+                    seen.add(href)
+                    links.append({'url': href, 'title': link['title'].strip()[:200]})
+                    if len(links) >= 60:
+                        break
+                except ValueError:
+                    continue
             if not content:
                 raise ValueError('Web page has no readable text')
-        return {'url': url, 'contentType': kind, 'text': content[:maximum], 'truncated': len(raw) > 2_000_000 or len(content) > maximum}
+        return {'url': url, 'contentType': kind, 'text': content[:maximum], 'truncated': len(raw) > 2_000_000 or len(content) > maximum, **({'links': links, 'linksNote': '页面链接仅供导航参考，未访问核验；读取时仍需执行公网地址校验。'} if links else {})}
     finally:
         if connection is not None:
             connection.close()
@@ -139,56 +176,87 @@ def web_fetch(args, redirects=0, raw_html=False):
 
 
 class SearchLinks(HTMLParser):
-    def __init__(self):
+    def __init__(self, provider='DuckDuckGo'):
         super().__init__()
         self.links = []
         self.current = None
+        self.provider = provider
+        self.heading = False
+        self.result = False
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
-        if tag == 'a' and 'result__a' in attributes.get('class', ''):
+        if tag == 'h3':
+            self.heading = True
+            if self.current is not None:
+                self.result = True
+        if tag == 'a':
             self.current = {'url': attributes.get('href', ''), 'title': ''}
+            self.result = self.heading or 'result__a' in attributes.get('class', '')
     def handle_data(self, data):
         if self.current is not None:
             self.current['title'] += data
     def handle_endtag(self, tag):
         if tag == 'a' and self.current is not None:
-            self.links.append(self.current)
+            if self.result:
+                self.links.append(self.current)
             self.current = None
+        if tag == 'h3':
+            self.heading = False
 
 
 def web_search(args):
     query = str(args['query']).strip()
     if not query or len(query) > 300:
         raise ValueError('Search query must have 1–300 characters')
-    url = 'https://html.duckduckgo.com/html/?' + urllib.parse.urlencode({'q': query})
-    links = []
-    try:
-        page = web_fetch({'url': url, 'maxCharacters': 30000}, raw_html=True)
-        parser = SearchLinks()
-        parser.feed(page['text'])
-        links = parser.links
-    except (ValueError, OSError):
-        pass
-    provider = 'DuckDuckGo'
-    if not links:
-        provider = 'Bing'
-        page = web_fetch({'url': 'https://www.bing.com/search?' + urllib.parse.urlencode({'format': 'rss', 'q': query, 'mkt': 'zh-CN', 'setlang': 'zh-hans'}), 'maxCharacters': 30000})
-        document = ElementTree.fromstring(page['text'])
-        links = [{'url': item.findtext('link', ''), 'title': item.findtext('title', ''), 'snippet': item.findtext('description', '')} for item in document.findall('./channel/item')]
-    rows = []
+    engines = {
+        'Google': 'https://www.google.com/search?' + urllib.parse.urlencode({'q': query, 'num': 10}),
+        'Bing': 'https://www.bing.com/search?' + urllib.parse.urlencode({'format': 'rss', 'q': query, 'mkt': 'zh-CN'}),
+        'Baidu': 'https://www.baidu.com/s?' + urllib.parse.urlencode({'wd': query, 'rn': 10}),
+        'DuckDuckGo': 'https://html.duckduckgo.com/html/?' + urllib.parse.urlencode({'q': query}),
+    }
+    order = ['Baidu', 'Bing', 'Google'] if any('\u3400' <= char <= '\u9fff' for char in query) else ['Google', 'Bing', 'Baidu']
+    providers = []
+    for provider in order + ['DuckDuckGo']:
+        try:
+            page = web_fetch({'url': engines[provider], 'maxCharacters': 30000}, raw_html=True)
+            if provider == 'Bing':
+                document = ElementTree.fromstring(page['text'])
+                links = [{'url': item.findtext('link', ''), 'title': item.findtext('title', ''), 'snippet': item.findtext('description', '')} for item in document.findall('./channel/item')]
+            else:
+                parser = SearchLinks(provider)
+                parser.feed(page['text'])
+                links = parser.links
+            rows = search_rows(links, provider, args.get('limit', 5))
+            providers.append({'name': provider, 'status': 'ok', 'count': len(rows)})
+            if rows:
+                return {'query': query, 'provider': provider, 'providers': providers, 'results': rows}
+        except (ValueError, OSError, ElementTree.ParseError):
+            providers.append({'name': provider, 'status': 'failed'})
+    return {'query': query, 'provider': 'multi-engine', 'providers': providers, 'results': [], 'message': '主流搜索引擎及备用引擎均未返回可用结果，请调整关键词或稍后重试。'}
+
+
+def search_rows(links, provider, limit):
+    rows, seen = [], set()
     for link in links:
         target = link['url']
         parsed = urllib.parse.urlparse(target)
+        if provider == 'Google' and parsed.path == '/url':
+            params = urllib.parse.parse_qs(parsed.query)
+            target = params.get('q', params.get('url', ['']))[0]
         if parsed.path == '/l/':
             target = urllib.parse.parse_qs(parsed.query).get('uddg', [''])[0]
         try:
             safe_public_url(target, proxy_mapping=bool(urllib.request.getproxies().get(urllib.parse.urlparse(target).scheme)))
         except Exception:
             continue
-        rows.append({'title': link['title'].strip(), 'url': target, 'snippet': link.get('snippet', '')[:1200]})
-        if len(rows) >= max(1, min(10, int(args.get('limit', 5)))):
+        target = urllib.parse.urldefrag(target)[0]
+        if target in seen:
+            continue
+        seen.add(target)
+        rows.append({'title': link['title'].strip(), 'url': target, 'snippet': link.get('snippet', '')[:1200], 'engine': provider})
+        if len(rows) >= max(1, min(10, int(limit))):
             break
-    return {'query': query, 'provider': provider, 'results': rows, **({'message': '搜索站点没有返回可用结果，请调整关键词或稍后重试。'} if not rows else {})}
+    return rows
 
 
 def execute(tool, args, workspace):

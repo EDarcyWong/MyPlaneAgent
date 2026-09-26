@@ -10,6 +10,7 @@ import type {
   CapabilityExecutionRequest
 } from '../../../shared/types/index.js'
 import type { CapabilityRegistry } from './capability-registry.js'
+import { validateExecutionPlan } from './execution-guards.js'
 
 export class AgentExecutor {
   constructor(
@@ -31,6 +32,7 @@ export class AgentExecutor {
     workspace: string,
     signal: AbortSignal
   ): Promise<ExecutionResult> {
+    validateExecutionPlan(plan)
     const startTime = Date.now()
     const outputs: unknown[] = new Array(plan.steps.length)
     const errors: string[] = new Array(plan.steps.length)

@@ -283,9 +283,22 @@ def execute_plan(root,plan):
         prepared.append((change,file,data,current,file.stat().st_mode & 0o777 if file.exists() else 0o644))
     def atomic_write(file,data,mode):
         file.parent.mkdir(parents=True,exist_ok=True);name=None
+        original=file.read_bytes() if file.exists() else None
         try:
             with tempfile.NamedTemporaryFile(dir=file.parent,delete=False) as tmp: tmp.write(data);name=tmp.name
-            os.chmod(name,mode);os.replace(name,file)
+            os.chmod(name,mode)
+            for attempt in range(3):
+                resolve(root,str(file.relative_to(root)),True)
+                current=file.read_bytes() if file.exists() else None
+                if current!=original: raise ValueError('重试前发现文件已变化，停止替换：'+str(file))
+                try:
+                    os.replace(name,file)
+                    break
+                except PermissionError as error:
+                    if getattr(error,'winerror',None) in (5,32,33) and attempt<2:
+                        time.sleep((0.05,0.15)[attempt])
+                        continue
+                    raise PermissionError('文件替换被拒绝：'+str(file)+'；请检查只读属性、目录替换权限及编辑器/安全软件占用。未改权限、未删除原文件；不要重复相同写入。系统原因：'+str(error)) from error
         finally:
             if name and os.path.exists(name): os.unlink(name)
     applied=[]
@@ -303,7 +316,7 @@ def execute_plan(root,plan):
                 if before is None: file.unlink()
                 else: atomic_write(file,before,mode)
             except Exception: pending.append(change['path'])
-        raise ValueError(str(error)+('；回退未完成，请核对：'+','.join(pending) if pending else '；已回退本次写入')) from error
+        raise ValueError(str(error)+('；回退未完成，请核对：'+','.join(pending) if pending else '；已回退本次写入' if applied else '；本次尚未替换任何文件')) from error
     invalidate(root,[file for _,file,_,_,_ in prepared])
     return compact({'status':'saved','paths':[c['path'] for c in changes]})
 

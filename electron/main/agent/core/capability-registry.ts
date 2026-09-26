@@ -12,6 +12,7 @@ import type {
 } from '../../../shared/types/index.js'
 import type { SkillPlatform } from './skill-platform.js'
 import type { MCPAdapter } from './mcp-adapter.js'
+import { validateToolArguments } from './execution-guards.js'
 
 export class CapabilityRegistry {
   private capabilities = new Map<string, Capability>()
@@ -214,6 +215,8 @@ export class CapabilityRegistry {
     const startTime = Date.now()
 
     try {
+      signal.throwIfAborted()
+      validateToolArguments(capability.parameters, request.args)
       let output: unknown
 
       // 根据运行时路由执行

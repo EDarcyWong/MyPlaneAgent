@@ -22,8 +22,10 @@ import type { AgentConnection } from './model.js'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
+import type { AbilityPolicyRuntime } from '../ability-modules/policy-runtime.js'
 
 export interface AgentCoreServiceConfig {
+  abilityPolicies?: AbilityPolicyRuntime
   dataDir: string
   skillsDir: string
   getConnection: () => AgentConnection
@@ -196,6 +198,7 @@ export class AgentCoreService extends EventEmitter {
    * 获取或创建 Agent Core 实例
    */
   private createAgentCore(options: AgentRunOptions): AgentCore {
+    const policies = this.config.abilityPolicies?.fork()
     const config: AgentConfig = {
       mode: options.mode || 'general',
       maxReplanAttempts: options.maxReplanAttempts ?? 2,
@@ -209,12 +212,14 @@ export class AgentCoreService extends EventEmitter {
         getConnection: this.config.getConnection,
         connection: options.connection,
         model: options.model,
-        diagnosticLog: this.config.diagnosticLog
+        diagnosticLog: this.config.diagnosticLog,
+        abilityPolicies: policies
       }),
       this.memory,
       config,
       options.approve,
-      options.maxSteps
+      options.maxSteps,
+      policies
     )
   }
 

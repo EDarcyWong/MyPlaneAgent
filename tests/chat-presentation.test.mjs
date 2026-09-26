@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {chatArtifacts,executionEntries,toolState,toolTarget} from '../dist-electron/shared/chat-presentation.js'
+import {chatArtifacts,executionEntries,toolState,toolTarget,formatElapsedTime} from '../dist-electron/shared/chat-presentation.js'
+test('elapsed time uses whole hours, minutes and seconds without boundary overflow',()=>{
+ for(const [input,expected] of [[0,'0秒'],[59999,'59秒'],[60000,'1分0秒'],[390000,'6分30秒'],[465500,'7分45秒'],[3600000,'1小时0分0秒'],[3661000,'1小时1分1秒'],[NaN,'0秒'],[-1,'0秒']])assert.equal(formatElapsedTime(input),expected)
+})
 const activity=(overrides={})=>({id:'a',capability:'agent.write_file',args:{path:'hello.txt',content:'hello'},status:'complete',...overrides})
 const message=(overrides={})=>({id:'m',role:'assistant',content:'已完成',createdAt:'now',toolActivity:[activity()],...overrides})
 test('only successful file actions produce artifacts, without inventing a previous file version',()=>{

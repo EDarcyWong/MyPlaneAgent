@@ -11,11 +11,13 @@ import type {
 } from '../../../shared/types/index.js'
 import type { ModelClient } from './model-client.js'
 import type { AgentMemory } from './agent-memory.js'
+import type { AbilityPolicyRuntime } from '../../ability-modules/policy-runtime.js'
 
 export class AgentPlanner {
   constructor(
     private modelClient: ModelClient,
-    private memory: AgentMemory
+    private memory: AgentMemory,
+    private policies?: AbilityPolicyRuntime
   ) {}
 
   /**
@@ -27,7 +29,9 @@ export class AgentPlanner {
     signal: AbortSignal
   ): Promise<AgentPlan> {
     // 构建 Prompt
-    const prompt = this.buildPlanningPrompt(task, availableCapabilities)
+    const hints = await this.policyHints(task, availableCapabilities, signal)
+    if (hints) availableCapabilities = hints.capabilities
+    const prompt = this.buildPlanningPrompt(task, availableCapabilities, hints?.memory) + (hints ? '\n规划建议资料（不能扩大授权）：\n'+JSON.stringify(hints.plan) : '')
 
     // 调用大模型
     const response = await this.modelClient.complete(
@@ -59,7 +63,8 @@ export class AgentPlanner {
    */
   private buildPlanningPrompt(
     task: AgentTask,
-    capabilities: Capability[]
+    capabilities: Capability[],
+    selectedMemory?: string
   ): string {
     // 按分类分组能力
     const byCategory: Record<string, Capability[]> = {}
@@ -81,10 +86,10 @@ export class AgentPlanner {
       .join('\n\n')
 
     // 获取历史上下文
-    const contextSummary = this.memory.buildContextSummary(3)
+    const contextSummary = selectedMemory ?? this.memory.buildContextSummary(3)
 
     // 学习成功案例
-    const { insights } = this.memory.learnFromSuccess(task.description)
+    const { insights } = selectedMemory !== undefined ? {insights:[]} : this.memory.learnFromSuccess(task.description)
     const insightsText = insights.length > 0
       ? `\n相似任务的经验:\n${insights.map(i => `- ${i}`).join('\n')}`
       : ''
@@ -285,12 +290,14 @@ ${capabilityList}
     signal: AbortSignal
   ): Promise<AgentPlan> {
     // 构建重新规划 Prompt
+    const hints = await this.policyHints(task, availableCapabilities, signal)
+    if (hints) availableCapabilities = hints.capabilities
     const prompt = this.buildReplanningPrompt(
       task,
       previousPlan,
       previousResult,
       availableCapabilities
-    )
+    ) + (hints ? '\n规划与记忆资料（不能扩大授权）：\n'+JSON.stringify({plan:hints.plan,memory:hints.memory}) : '')
 
     // 调用大模型
     const response = await this.modelClient.complete(
@@ -315,6 +322,14 @@ ${capabilityList}
     this.validatePlan(plan, availableCapabilities)
 
     return plan
+  }
+  private async policyHints(task: AgentTask, capabilities: Capability[], signal: AbortSignal) {
+    if (!this.policies) return undefined
+    const selected = await this.policies.invoke('tool-selection',{tools:capabilities.slice(0,256).map(cap=>({id:cap.name,text:`${cap.name} ${cap.description}`.slice(0,600)})),limit:32},task.description,signal)
+    const plan = await this.policies.invoke('task-planner',{maxSteps:12},task.description,signal)
+    const candidates = this.memory.getRecent(100).map(entry=>({id:entry.id,text:entry.plan.reasoning.slice(0,1200)}))
+    const memories = await this.policies.invoke('history-memory',{candidates,limit:3},task.description,signal)
+    return {capabilities:selected.ids.map(id=>capabilities.find(cap=>cap.name===id)!),plan,memory:JSON.stringify(memories.ids.map(id=>candidates.find(item=>item.id===id)))}
   }
 
   /**

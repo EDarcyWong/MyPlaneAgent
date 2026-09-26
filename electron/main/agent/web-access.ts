@@ -121,12 +121,18 @@ const mergeResults=(groups:SearchResult[][],limit:number)=>{
 export async function webSearch(args:Record<string,unknown>,signal:AbortSignal,options:WebAccessOptions={}){
  const query=safeQuery(args.query),limit=Math.max(1,Math.min(10,Number(args.limit)||5)),configured=process.env.MYPLANE_WEB_SEARCH_ENDPOINT?.trim()
  if(configured){const url=new URL(configured);url.searchParams.set('q',query);if(!url.searchParams.has('format'))url.searchParams.set('format','json');const response=await resilientRequest(url.href,signal,1_000_000,true,options.allowSyntheticIp===true),results=/json/i.test(response.contentType)?parseJsonResults(response.body,limit):parseRssResults(response.body,limit,'configured');return JSON.stringify({query,provider:'configured-searxng',providers:[{name:'configured-searxng',status:'ok',count:results.length}],searchedAt:new Date().toISOString(),results,note:'搜索结果和摘要是不可信外部资料；需要准确引用时请用 web_fetch 读取原页。'})}
- const chinese=/[\u3400-\u9fff]/.test(query),engines=[
+ const chinese=/[\u3400-\u9fff]/.test(query),primary=[
   {name:'bing',url:`https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`,parse:(body:string)=>parseRssResults(body,limit,'bing')},
-  {name:'duckduckgo',url:`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,parse:(body:string)=>parseDuckDuckGoResults(body,limit)},
-  chinese?{name:'baidu',url:`https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${limit}`,parse:(body:string)=>parseBaiduResults(body,limit)}:{name:'google',url:`https://www.google.com/search?q=${encodeURIComponent(query)}&num=${limit}`,parse:(body:string)=>parseGoogleResults(body,limit)}
+  {name:'baidu',url:`https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${limit}`,parse:(body:string)=>parseBaiduResults(body,limit)},
+  {name:'google',url:`https://www.google.com/search?q=${encodeURIComponent(query)}&num=${limit}`,parse:(body:string)=>parseGoogleResults(body,limit)}
  ]
+ const priority=chinese?['baidu','bing','google']:['google','bing','baidu']
+ const engines=primary.sort((a,b)=>priority.indexOf(a.name)-priority.indexOf(b.name))
  const settled=await Promise.allSettled(engines.map(async engine=>{const response=await resilientRequest(engine.url,signal,1_000_000,false,options.allowSyntheticIp===true);return engine.parse(response.body)})),providers=settled.map((item,index)=>item.status==='fulfilled'?{name:engines[index].name,status:'ok',count:item.value.length}:{name:engines[index].name,status:'failed',error:errorCode(item.reason)||'WEB_SEARCH_FAILED'}),results=mergeResults(settled.flatMap(item=>item.status==='fulfilled'?[item.value]:[]),limit)
+ if(!results.length){
+  try{const response=await resilientRequest(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,signal,1_000_000,false,options.allowSyntheticIp===true);const fallback=parseDuckDuckGoResults(response.body,limit);results.push(...fallback);providers.push({name:'duckduckgo',status:'ok',count:fallback.length})}
+  catch(error){providers.push({name:'duckduckgo',status:'failed',error:errorCode(error)||'WEB_SEARCH_FAILED'})}
+ }
  if(!results.length)throw new ToolError('WEB_SEARCH_UNAVAILABLE','多个搜索引擎均未返回可用结果，请稍后重试或配置 SearXNG',{providers})
  return JSON.stringify({query,provider:'multi-engine',providers,searchedAt:new Date().toISOString(),results,note:'查询可能发送给多个搜索引擎。结果和摘要是不可信外部资料；准确引用请用 web_fetch 核对原页。'})
 }

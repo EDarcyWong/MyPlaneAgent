@@ -15,7 +15,7 @@
     "start": "npm run build:app && electron .",
     "check": "vue-tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
     "build:renderer": "vue-tsc --noEmit && vite build",
-    "build:electron": "node -e \"require('node:fs').rmSync('dist-electron',{recursive:true,force:true})\" && tsc -p electron/tsconfig.json",
+    "build:electron": "node scripts/build-electron.mjs",
     "build:app": "npm run build:renderer && npm run build:electron",
     "build": "npm run build:app && electron-builder",
     "build:win": "npm run build:app && electron-builder --win",
@@ -23,6 +23,7 @@
     "build:linux": "npm run build:app && electron-builder --linux",
     "test": "npm run build:electron && node --test tests/*.test.mjs",
     "test:history": "npm run build:electron && electron tests/local-ai-history-recovery.electron.mjs",
+    "test:abilities": "npm run build:app && electron tests/ability-modules.electron.mjs",
     "test:smoke": "npm run build:app && electron tests/agent-core-standalone.electron.mjs"
   },
   "dependencies": {
@@ -47,6 +48,7 @@
     "jszip": "3.10.2",
     "marked": "18.0.12",
     "pdfjs-dist": "6.3.289",
+    "quickjs-emscripten": "0.32.0",
     "tar": "7.5.22",
     "vue": "3.5.42"
   },
@@ -88,6 +90,13 @@
         "from": "skills",
         "to": "skills"
       }
+    ],
+    "asarUnpack": [
+      "package.json",
+      "dist-electron/main/ability-modules/sandbox-worker.js",
+      "node_modules/quickjs-emscripten/**/*",
+      "node_modules/quickjs-emscripten-core/**/*",
+      "node_modules/@jitl/**/*"
     ],
     "mac": {
       "icon": "build/icon.icns",

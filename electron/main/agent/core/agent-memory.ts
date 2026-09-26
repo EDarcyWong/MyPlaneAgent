@@ -5,8 +5,9 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { readIntegrationJson, writeIntegrationJson } from '../../integration-store.js'
 import type {
-  AgentTask,
   AgentPlan,
   ExecutionResult,
   MemoryEntry,
@@ -46,22 +47,28 @@ export class AgentMemory {
       tags: entry.tags || []
     }
 
-    this.shortTermMemory.push(memoryEntry)
-
-    // 限制短期记忆大小（最多保留 100 条）
-    if (this.shortTermMemory.length > 100) {
-      this.shortTermMemory = this.shortTermMemory.slice(-100)
-    }
-
-    // 持久化到磁盘
-    await this.saveMemory()
+    this.archive(memoryEntry)
+    const previous = this.shortTermMemory
+    this.shortTermMemory = [...previous, memoryEntry].slice(-100)
+    try { await this.saveMemory() } catch (error) { this.shortTermMemory = previous; throw error }
   }
 
   /**
    * 查询记忆
    */
   query(options?: MemoryQueryOptions): MemoryEntry[] {
-    let results = [...this.shortTermMemory]
+    const directory = path.join(this.dataDir, 'memory-history')
+    const history = fs.existsSync(directory) ? fs.readdirSync(directory)
+      .filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+      .map(name => {
+        const entry = readIntegrationJson<MemoryEntry | null>(path.join(directory, name), null)
+        if (!entry || typeof entry.id !== 'string' || !entry.plan || !entry.result) {
+          throw new Error('任务历史格式无效，原文件已保留，请先备份后修复')
+        }
+        return entry
+      }) : []
+    let results = [...new Map([...history, ...this.shortTermMemory].map(entry => [entry.id, entry])).values()]
+      .sort((a, b) => a.timestamp - b.timestamp)
 
     // 按任务 ID 过滤
     if (options?.taskId) {
@@ -103,7 +110,7 @@ export class AgentMemory {
    * 获取特定任务的记忆
    */
   getByTask(taskId: string): MemoryEntry[] {
-    return this.shortTermMemory.filter(entry => entry.taskId === taskId)
+    return this.query({ taskId })
   }
 
   /**
@@ -181,29 +188,24 @@ export class AgentMemory {
       return
     }
 
-    try {
-      const data = fs.readFileSync(this.memoryFile, 'utf8')
-      const parsed = JSON.parse(data)
-
-      if (Array.isArray(parsed)) {
-        this.shortTermMemory = parsed
-        console.log(`[Memory] Loaded ${this.shortTermMemory.length} memory entries`)
-      }
-    } catch (error) {
-      console.error('[Memory] Failed to load memory:', error)
+    const parsed = readIntegrationJson<MemoryEntry[]>(this.memoryFile, [])
+    if (!Array.isArray(parsed) || parsed.some(entry => !entry || typeof entry.id !== 'string' || !entry.plan || !entry.result)) {
+      throw new Error('任务记忆格式无效，原文件已保留，请先备份后修复')
     }
+    for (const entry of parsed) this.archive(entry)
+    this.shortTermMemory = parsed.slice(-100)
   }
 
   /**
    * 持久化记忆到磁盘
    */
   private async saveMemory(): Promise<void> {
-    try {
-      const data = JSON.stringify(this.shortTermMemory, null, 2)
-      fs.writeFileSync(this.memoryFile, data, 'utf8')
-    } catch (error) {
-      console.error('[Memory] Failed to save memory:', error)
-    }
+    writeIntegrationJson(this.memoryFile, this.shortTermMemory)
+  }
+  private archive(entry: MemoryEntry): void {
+    const hash = createHash('sha256').update(JSON.stringify(entry)).digest('hex')
+    const file = path.join(this.dataDir, 'memory-history', `${hash}.json`)
+    if (!fs.existsSync(file)) writeIntegrationJson(file, entry)
   }
 
   /**

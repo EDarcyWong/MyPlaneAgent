@@ -16,6 +16,7 @@ import { AgentPlanner } from './agent-planner.js'
 import { AgentExecutor } from './agent-executor.js'
 import { AgentMemory } from './agent-memory.js'
 import type { ModelClient } from './model-client.js'
+import type { AbilityPolicyRuntime } from '../../ability-modules/policy-runtime.js'
 
 export class AgentCore {
   private status: AgentStatus = 'idle'
@@ -27,7 +28,8 @@ export class AgentCore {
     private memory: AgentMemory,
     private config: AgentConfig,
     private approve?: (capability: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<boolean>,
-    private maxSteps?: number
+    private maxSteps?: number,
+    private abilityPolicies?: AbilityPolicyRuntime
   ) {}
 
   /**
@@ -175,7 +177,7 @@ export class AgentCore {
     task: AgentTask,
     signal: AbortSignal
   ): Promise<AgentPlan> {
-    const planner = new AgentPlanner(this.modelClient, this.memory)
+    const planner = new AgentPlanner(this.modelClient, this.memory, this.abilityPolicies)
     const capabilities = this.capabilityRegistry.list()
 
     return await planner.plan(task, capabilities, signal)
@@ -190,7 +192,7 @@ export class AgentCore {
     previousResult: ExecutionResult,
     signal: AbortSignal
   ): Promise<AgentPlan> {
-    const planner = new AgentPlanner(this.modelClient, this.memory)
+    const planner = new AgentPlanner(this.modelClient, this.memory, this.abilityPolicies)
     const capabilities = this.capabilityRegistry.list()
 
     return await planner.replan(

@@ -42,8 +42,8 @@ test('distinct failures use the expanded cumulative failure limit',async t=>{
  assert.equal(h.requests(),10);assert.equal(result.events.filter(event=>event.status==='failed').length,10);assert.match(result.error,/达到 10 次失败上限/)
 })
 test('read-only blocks writes; scoped auto mode edits ordinary files but keeps scripts and commands gated',async t=>{
- const h=await harness(t,()=>reply([call('write_file',{path:'src/a.ts',content:'new'})]));fs.mkdirSync(path.join(h.workspace,'src'));let project=h.service.createProject(h.workspace,'web')
- h.service.updateProject({id:project.id,policy:'read-only',autoWritePaths:[]});let task=h.start({projectId:project.id});await until(()=>!h.service.active(task.id));assert.equal(fs.existsSync(path.join(h.workspace,'src/a.ts')),false);assert.equal(h.service.get(task.id).events.at(-1).status,'rejected')
+ const h=await harness(t,body=>reply(body.messages.some(message=>message.role==='tool')?undefined:[call('write_file',{path:'src/a.ts',content:'new'})]));fs.mkdirSync(path.join(h.workspace,'src'));let project=h.service.createProject(h.workspace,'web')
+ h.service.updateProject({id:project.id,policy:'read-only',autoWritePaths:[]});let task=h.start({projectId:project.id});await until(()=>!h.service.active(task.id));assert.equal(fs.existsSync(path.join(h.workspace,'src/a.ts')),false);assert.equal(h.service.get(task.id).events.find(event=>event.tool==='write_file').status,'rejected')
  h.service.updateProject({id:project.id,policy:'project-auto',autoWritePaths:['src']});task=h.start({projectId:project.id});await until(()=>!h.service.active(task.id));assert.equal(fs.readFileSync(path.join(h.workspace,'src/a.ts'),'utf8'),'new');assert.equal(h.service.get(task.id).events.find(event=>event.tool).audit.authorization,'automatic')
  const workspace=new AgentWorkspace(h.workspace);assert.equal(workspace.canAutoWrite('write_file',{path:'package.json'},['.']),false);assert.equal(workspace.canAutoWrite('write_file',{path:'src/test.sh'},['src']),false);assert.equal(workspace.canAutoWrite('run_command',{command:'npm test'},['.']),false)
 })

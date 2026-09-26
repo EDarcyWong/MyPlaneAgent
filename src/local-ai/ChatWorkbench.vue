@@ -18,7 +18,7 @@ import ChatPermissionSelect from './ChatPermissionSelect.vue'
 const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>}>()
 const emit = defineEmits<{settings: []; models: []}>()
 const ch = reactive(props.studio)
-const locked = computed(() => ch.sending || ch.sessionBusy)
+const locked = computed(() => ch.sending || ch.sessionBusy || ch.selectingChatModel)
 const hasConversation = computed(() => ch.messages.length > 0)
 const historyOpen = ref(false)
 const selectedArtifact = ref<ChatArtifact>()
@@ -87,6 +87,10 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
       </div>
       <ConversationOutline :messages="ch.messages" :scroller="scroller" :session-id="ch.session?.id"/>
       <div ref="composerElement" class="agent-composer-wrap">
+        <section v-if="ch.chatModelLoading" class="chat-model-loading" aria-label="模型切换进度" :aria-busy="true">
+          <div class="chat-model-loading-heading"><strong :title="ch.chatModelLoading.name">{{ch.chatModelLoading.name}}</strong><span role="status">{{ch.chatModelLoading.stage}}</span></div>
+          <div class="chat-model-loading-track" role="progressbar" aria-label="模型切换进度" :aria-valuetext="ch.chatModelLoading.stage"><span/></div>
+        </section>
         <section v-if="ch.chatApproval" class="chat-approval" aria-label="操作批准请求" role="region">
           <header><strong>请求批准 · {{ch.chatApproval.activity.capability}}</strong><span>本次操作的完整参数</span></header>
           <pre>{{JSON.stringify(ch.chatApproval.activity.args,null,2)}}</pre>
@@ -99,7 +103,7 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
           <footer><div class="agent-prompt-options">
             <ChatPermissionSelect v-model="ch.approvalMode" :disabled="locked"/>
             <button ref="settingsTrigger" type="button" class="agent-settings-trigger" title="会话设置" aria-label="会话设置" @click="openConversationSettings"><Setting/></button>
-            <ChatComposerSelect v-model="ch.model" class="conversation-model-select" :models="ch.serverModels" :disabled="locked" @manage="emit('models')"/>
+            <ChatComposerSelect :model-value="ch.chatModel" class="conversation-model-select" :models="ch.chatModels" :disabled="locked||!!ch.busy||ch.connecting" @update:model-value="ch.selectChatModel" @manage="emit('models')"/>
           </div><button v-if="ch.sending" type="button" class="agent-primary stop-button" title="停止" aria-label="停止生成" @click="ch.stop"><VideoPause/></button><button v-else class="agent-primary send-button" title="发送" aria-label="发送消息" :disabled="!ch.canSend"><ArrowUp/></button></footer>
         </form>
       </div>
@@ -121,6 +125,14 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
 <style scoped src="./studio-agent.css"></style>
 <style scoped src="./studio-workspace.css"></style>
 <style scoped>
+.chat-model-loading{margin-bottom:10px;padding:12px 14px;border:1px solid var(--s-border);border-radius:12px;background:var(--s-panel)}
+.chat-model-loading-heading{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:5px 12px;margin-bottom:9px;font-size:12px}
+.chat-model-loading-heading strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--s-text);font-weight:500}
+.chat-model-loading-heading>span{color:var(--s-dim);font-size:11px}
+.chat-model-loading-track{height:4px;border-radius:4px;overflow:hidden;background:var(--s-muted)}
+.chat-model-loading-track>span{display:block;width:35%;height:100%;border-radius:inherit;background:var(--s-accent);animation:chat-model-loading 1.4s ease-in-out infinite}
+@keyframes chat-model-loading{from{transform:translateX(-100%)}to{transform:translateX(386%)}}
+@media(prefers-reduced-motion:reduce){.chat-model-loading-track>span{animation:none;width:100%;opacity:.65}}
 .agent-prompt-options>.conversation-model-select{margin-left:auto;flex:0 1 220px;min-width:0}.conversation-model-select{max-width:220px}@container studio (max-width:650px){.conversation-model-select{max-width:150px}}
 .agent-history>.chat-sidebar-footer{padding:8px 0 0;border-top:1px solid var(--s-border);flex:none}
 .chat-settings-button{display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;border:0;border-radius:8px;background:transparent;color:var(--s-text);font-size:13px;text-align:left}

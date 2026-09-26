@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import {computed} from 'vue'
+import {computed,ref,watch,onBeforeUnmount} from 'vue'
 import ChatToolCard from './ChatToolCard.vue'
 import ChatArtifactList from './ChatArtifactList.vue'
-import {chatArtifacts,executionEntries,toolLabel,type ChatArtifact} from '../../electron/shared/chat-presentation'
+import {chatArtifacts,executionEntries,toolLabel,formatElapsedTime,type ChatArtifact} from '../../electron/shared/chat-presentation'
 import AiMarkdown from '../AiMarkdown.vue'
 import TokenUsageDisplay from './TokenUsageDisplay.vue'
 import {CopyDocument,Refresh} from '@element-plus/icons-vue'
@@ -11,6 +11,11 @@ import type {StudioMessage} from '../../electron/shared/local-ai-studio'
 const props=defineProps<{messages:StudioMessage[];sending:boolean}>()
 const rows=computed(()=>props.messages.map(message=>({message,entries:executionEntries(message),artifacts:chatArtifacts([message])})))
 const active=(index:number)=>props.sending&&index===props.messages.length-1
+const now=ref(Date.now())
+let timer:ReturnType<typeof setInterval>|undefined
+watch(()=>props.sending,sending=>{clearInterval(timer);now.value=Date.now();if(sending)timer=setInterval(()=>{now.value=Date.now()},1000)},{immediate:true})
+onBeforeUnmount(()=>clearInterval(timer))
+const liveElapsed=(message:StudioMessage)=>formatElapsedTime(now.value-Date.parse(message.createdAt))
 const outcomeLabel=(message:StudioMessage)=>message.outcome==='needs_input'?'需要补充信息':message.outcome==='blocked'?'执行受阻':message.outcome==='complete'?'最终回复':'回复'
 function liveLabel(message:StudioMessage){
  const waiting=message.toolActivity?.find(item=>item.status==='waiting');if(waiting)return '等待你批准操作'
@@ -27,7 +32,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
     <div v-if="message.images?.length" class="message-images"><img v-for="(image,imageIndex) in message.images" :key="imageIndex" :src="image.dataUrl" :alt="image.name" loading="lazy"/></div>
     <template v-if="message.role==='assistant'">
      <details v-if="entries.length" class="execution-flow" :open="active(index)">
-      <summary><span class="flow-indicator" :class="{running:active(index)}"></span><strong>{{active(index)?'正在处理':message.status==='error'?'执行遇到问题':message.status==='stopped'?'执行已停止':'执行过程'}}</strong><span v-if="message.toolActivity?.length">{{message.toolActivity.length}} 项操作</span><span v-if="message.elapsedMs">{{(message.elapsedMs/1000).toFixed(1)}}s</span><span class="flow-chevron">›</span></summary>
+      <summary><span class="flow-indicator" :class="{running:active(index)}"></span><strong>{{active(index)?'已处理 '+liveElapsed(message):message.status==='error'?'执行遇到问题':message.status==='stopped'?'执行已停止':'执行过程'}}</strong><span v-if="message.toolActivity?.length">{{message.toolActivity.length}} 项操作</span><span v-if="!active(index)&&message.elapsedMs!==undefined">{{formatElapsedTime(message.elapsedMs)}}</span><span class="flow-chevron">›</span></summary>
       <div class="flow-entries">
        <template v-for="entry in entries" :key="entry.id">
         <div v-if="entry.type==='progress'" class="progress-entry"><span class="progress-mark" aria-hidden="true"></span><AiMarkdown :text="entry.text"/></div>
@@ -35,12 +40,12 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
        </template>
       </div>
      </details>
-     <div v-if="active(index)" class="live-status" role="status"><span class="flow-indicator running"></span>{{liveLabel(message)}}</div>
+     <div v-if="active(index)" class="live-status" role="status"><span class="flow-indicator running"></span>{{liveLabel(message)}}<span v-if="!entries.length">已处理 {{liveElapsed(message)}}</span></div>
      <ChatArtifactList v-if="artifacts.length" :artifacts="artifacts" @open="$emit('open-artifact',$event)"/>
      <section v-if="message.content" class="final-answer"><h3 v-if="entries.length">{{outcomeLabel(message)}}</h3><AiMarkdown :text="message.content"/></section>
      <div v-if="message.status==='error'" class="execution-error" role="alert"><strong>本次执行未完成</strong><p>{{message.error||'生成未完成，可以重试。'}}</p></div>
      <p v-else-if="message.status==='stopped'" class="quiet">已停止生成，已执行的操作记录保留。</p>
-     <footer v-if="!active(index)" class="answer-meta"><span v-if="!entries.length&&message.elapsedMs">{{(message.elapsedMs/1000).toFixed(1)}}s</span><TokenUsageDisplay :usage="sumTokenUsage([messageUsage(message)])" label="本次 Tokens" compact/></footer>
+     <footer v-if="!active(index)" class="answer-meta"><span v-if="!entries.length&&message.elapsedMs!==undefined">{{formatElapsedTime(message.elapsedMs)}}</span><TokenUsageDisplay :usage="sumTokenUsage([messageUsage(message)])" label="本次 Tokens" compact/></footer>
     </template>
     <AiMarkdown v-else-if="message.content" :text="message.content"/>
     <div v-if="!active(index)" class="message-actions"><button v-if="message.content" class="text-button" @click="$emit('copy',message.content)"><CopyDocument/>复制</button><button v-if="!sending&&message.role==='assistant'&&index===messages.length-1" class="text-button" @click="$emit('regenerate')"><Refresh/>重新生成</button></div>

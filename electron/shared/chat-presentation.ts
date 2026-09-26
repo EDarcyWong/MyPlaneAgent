@@ -39,3 +39,8 @@ export function executionEntries(message:StudioMessage){
  const entries=message.execution|| (message.toolActivity||[]).map(activity=>({id:activity.id,type:'tool' as const,activityId:activity.id,createdAt:message.createdAt}))
  return entries.map(entry=>entry.type==='tool'?{...entry,activity:activities.get(entry.activityId)}:entry)
 }
+export function formatElapsedTime(milliseconds:number):string{
+ const seconds=Math.floor(Math.max(0,Number.isFinite(milliseconds)?milliseconds:0)/1000)
+ const hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60),rest=seconds%60
+ return `${hours?hours+'小时':''}${hours||minutes?minutes+'分':''}${rest}秒`
+}

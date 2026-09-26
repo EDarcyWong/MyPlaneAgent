@@ -22,6 +22,14 @@ async function main(){
   protectedHandle('browser:action',(event,action,value)=>browser.action(event.sender,action,value))
   await browser.open(url)
   const window=BrowserWindow.getAllWindows()[0],wc=window.contentView.children[0].webContents
+  assert.equal(await window.webContents.executeJavaScript("typeof window.myplane.onBrowserState"),'function')
+  const unprivileged=new BrowserWindow({show:false,webPreferences:{sandbox:true,contextIsolation:true,nodeIntegration:false}})
+  try{
+   await unprivileged.loadFile(path.resolve('dist/index.html'))
+   await wait(async()=>await unprivileged.webContents.executeJavaScript("!!document.querySelector('[role=alert]')"))
+   assert.match(await unprivileged.webContents.executeJavaScript('document.body.innerText'),/此页面需要 MyPlaneAgent 桌面接口/)
+   assert.equal(await unprivileged.webContents.executeJavaScript('typeof window.myplane'),'undefined')
+  }finally{unprivileged.destroy()}
   await wait(()=>browser.snapshot().title==='测试网页'&&!browser.snapshot().loading)
   assert.equal(await wc.executeJavaScript('typeof window.myplane'), 'undefined')
   assert.equal(await wc.executeJavaScript('typeof require'), 'undefined')
@@ -120,6 +128,6 @@ async function main(){
   await assert.rejects(browser.automate('read_page',{},signal),/未启用/)
   window.destroy();await wait(()=>wc.isDestroyed());assert.equal(wc.isDestroyed(),true)
   console.log('Internal browser navigation, isolation and cleanup passed')
- }catch(error){console.error(error);process.exitCode=1}finally{for(const window of BrowserWindow.getAllWindows())window.destroy();server?.close();rmSync(root,{recursive:true,force:true});app.exit(process.exitCode||0)}
+ }catch(error){console.error(error);process.exitCode=1}finally{for(const window of BrowserWindow.getAllWindows())window.destroy();server?.close();try{rmSync(root,{recursive:true,force:true})}catch(error){if(!['EPERM','EBUSY'].includes(error.code))throw error;console.log('Temporary Electron profile is locked until process exit')}app.exit(process.exitCode||0)}
 }
 void main()

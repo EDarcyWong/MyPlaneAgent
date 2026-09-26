@@ -6,6 +6,8 @@
 import type { AgentConnection, AgentMessage, AgentAnswer } from '../model.js'
 import { requestAgentModel } from '../model.js'
 import type { ToolDefinition } from '../registry.js'
+import type { AbilityPolicyRuntime } from '../../ability-modules/policy-runtime.js'
+import { modelCapacity } from '../model-budget.js'
 
 export type ModelMessage = {
   role: 'system' | 'user' | 'assistant'
@@ -18,6 +20,7 @@ export type ModelResponse = {
 }
 
 export type ModelConfig = {
+  abilityPolicies?: AbilityPolicyRuntime
   connection?: AgentConnection
   getConnection?: () => AgentConnection
   model?: string
@@ -57,18 +60,21 @@ export class ModelClient {
     }))
 
     let retries = 0
+    const connection = this.getConnection()
+    const adapted = this.config.abilityPolicies ? await this.config.abilityPolicies.invoke('model-adapter',{capacity:modelCapacity(connection,this.config.model||'default'),maxTokens:connection.maxTokens,temperature:options?.temperature??this.config.temperature??.2,toolCount:0},'',signal) : undefined
     const maxRetries = options?.maxRetries ?? 2
 
     while (retries <= maxRetries) {
       try {
         const response = await requestAgentModel(
-          this.getConnection(),
+          {...connection,...(adapted?{maxTokens:adapted.maxTokens}:{})},
           this.config.model || 'default',
           agentMessages,
           signal,
           {
             tools: false,  // 不使用工具
-            thinking: false
+            thinking: false,
+            temperature: adapted?.temperature ?? options?.temperature ?? this.config.temperature
           }
         )
 

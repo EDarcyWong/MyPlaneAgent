@@ -48,8 +48,8 @@ export type StudioFileChange = {path:string;before?:string;after:string}
 export type StudioToolActivity = {id:string;capability:string;args:Record<string,unknown>;status:'waiting'|'running'|'complete'|'error'|'denied';output?:string;fileChanges?:StudioFileChange[]}
 export type StudioProgress = {id:string;type:'progress';text:string;phase:'working'|'reviewing'|'context';createdAt:string}
 export type StudioExecutionEntry = StudioProgress | {id:string;type:'tool';activityId:string;createdAt:string}
-export type StudioMessage = {execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
-export type StudioSession = {pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
+export type StudioMessage = {abilityRoute?:import('./ability-modules.js').AbilityRoute;execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
+export type StudioSession = {abilityTask?:import('./ability-modules.js').AbilityTask;abilityState?:import('./ability-modules.js').ConversationState;pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
 export type StudioSessionSummary = Omit<StudioSession,'messages'> & {messageCount:number}
 export type StudioEvent = {type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
 export type StudioHardware = {platform:string;arch:string;cpu:string;threads:number;totalMemory:number;freeMemory:number}
@@ -92,7 +92,7 @@ export type StudioCommands = {
   compactSession:{input:{sessionId:string;requestId:string;model:string};output:{started:boolean}}
   chatApprove:{input:{requestId:string;approvalId:string;approved:boolean};output:void}
   stopChat:{input:{requestId:string};output:void}
-}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands
+}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands&import('./ability-modules.js').AbilityModuleCommands&import('./ability-catalog.js').AbilityCatalogCommands
 
 export type AgentCoreUiEvent = {taskId:string;event:CoreAgentEvent}|{taskId:string;result:CoreExecutionResult}|{taskId:string;error:string}|{taskId:string;cancelled:true}|{taskId:string;approval:{id:string;capability:string;args:Record<string,unknown>}}
 export type AgentCoreCommands = {

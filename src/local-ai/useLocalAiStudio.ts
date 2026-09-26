@@ -7,7 +7,7 @@ import {AppMessageBox as ElMessageBox} from './message-box'
 import type {StudioApprovalMode,StudioToolActivity,StudioBootstrap,StudioCommands,StudioConnection,StudioDownload,StudioImage,StudioLocalModel,StudioMessage,StudioModelFile,StudioSession,StudioSessionSummary,StudioSettings,StudioSettingsInput} from '../../electron/shared/local-ai-studio'
 import type {LocalAiRemoteProfile,RemoteApiFormat} from '../../electron/shared/local-ai'
 import {clipboardImageFiles,readChatImages} from './chat-images'
-import {currentModelSelection} from '../../electron/shared/local-ai-model-selection'
+import {currentModelSelection,chatModelOptions,prepareLocalChatModel} from '../../electron/shared/local-ai-model-selection'
 import {builtinCatalog,type StudioCatalog,type StudioDiscoveryModel} from '../../electron/shared/local-ai-catalog'
 import type {StudioModelDetails} from '../../electron/shared/local-ai-studio'
 import type {WorkflowModelRef} from '../../electron/shared/local-ai-workflow'
@@ -17,7 +17,7 @@ type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:Wor
 
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
- const tab=ref<'chat'|'workflow'|'automation'|'discover'|'models'|'server'|'skills'|'mcp'|'settings'>('chat'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
+ const tab=ref<'chat'|'workflow'|'automation'|'abilities'|'discover'|'models'|'server'|'skills'|'mcp'|'settings'>('chat'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
  const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system',appearanceStyle:'minimal'})
  const apiKey=ref(''),hfToken=ref(''),connection=ref<StudioConnection>(),connecting=ref(false),remoteProfiles=ref<LocalAiRemoteProfile[]>([]),sessions=ref<StudioSessionSummary[]>([]),session=ref<StudioSession>(),sessionFilter=ref('')
  const images=ref<StudioImage[]>([]),attaching=ref(false)
@@ -66,6 +66,42 @@ export function useLocalAiStudio(){
   if(!activeId||reported.some(item=>item.id===activeId||item.instanceId===activeId))return reported
   return [{id:activeId,name:activeId},...reported]
  })
+ const selectingChatModel=ref(false)
+ const chatModelLoading=ref<{name:string;stage:string}>()
+ const chatModels=computed(()=>chatModelOptions(data.value?.models||[],data.value?.remoteModelCache||[],remoteProfiles.value,settings,connection.value?.models))
+ const chatModel=computed(()=>chatModels.value.find(item=>settings.source==='managed'
+  ?item.source==='local'&&item.modelId===runtime.value?.modelId
+  :item.source==='remote'&&item.apiFormat===settings.apiFormat&&item.endpoint===settings.endpoint&&item.modelId===model.value)?.id||'')
+ async function selectChatModel(id:string){
+  if(selectingChatModel.value||busy.value||sending.value||sessionBusy.value||connecting.value)return
+  const selected=chatModels.value.find(item=>item.id===id);if(!selected)return
+  selectingChatModel.value=true;busy.value='chat-model';error.value=''
+  const loading=(stage:string)=>{chatModelLoading.value={name:selected.name,stage}}
+  loading('正在检查模型状态…')
+  const previousSource=settings.source
+  try{
+   if(selected.source==='local'){
+    const state=await prepareLocalChatModel(selected.modelId,{
+     snapshot:async()=>{const snapshot=await api('snapshot');if(data.value)Object.assign(data.value,snapshot);return snapshot.runtime},
+     confirm:async()=>{chatModelLoading.value=undefined;await ElMessageBox.confirm(`本地模型“${selected.name.replace(/^本地 · /,'')}”尚未启动，需要启动后才能使用。${runtime.value?.state==='running'?'启动时将卸载当前本地模型。':''}是否现在启动？`,'启动本地模型',{confirmButtonText:'启动并使用',cancelButtonText:'取消',type:'info'});loading('正在准备启动…')},
+     stop:async()=>{loading('正在卸载当前模型…');const state=await api('stopRuntime');if(data.value)data.value.runtime=state},
+     start:async()=>{loading('正在启动本地模型…');const state=await api('startRuntime',{id:selected.modelId});if(data.value)data.value.runtime=state;return state},
+     wait:()=>{loading('正在加载模型，等待服务就绪…');return new Promise(resolve=>setTimeout(resolve,500))},
+    })
+    Object.assign(settings,await api('settings',{source:'managed'}));model.value=state.modelName;connection.value=undefined
+   }else{
+    loading('正在切换远程服务…')
+    if(selected.profileId){const result=await api('remoteProfileUse',{id:selected.profileId});Object.assign(settings,result.settings);remoteProfiles.value=result.profiles}
+    Object.assign(settings,await api('settings',{source:'external',apiFormat:selected.apiFormat,endpoint:selected.endpoint,model:selected.modelId}));model.value=selected.modelId;connection.value=undefined
+   }
+   loading('正在连接模型服务…');await connect(true)
+  }catch(cause){
+   chatModelLoading.value=undefined
+   if(cause!=='cancel'&&cause!=='close'){
+    if(selected.source==='local'){Object.assign(settings,await api('settings',{source:previousSource}));await showServiceStartError(cause)}else report(cause)
+   }
+  }finally{chatModelLoading.value=undefined;selectingChatModel.value=false;busy.value=''}
+ }
  const cachedRemoteModels=computed(()=>{
   const cache=data.value?.remoteModelCache.find(item=>item.apiFormat===settings.apiFormat&&item.endpoint===settings.endpoint)
   return cache?.models||[]
@@ -87,9 +123,9 @@ export function useLocalAiStudio(){
   return rows
  })
  watch([model,()=>settings.source,()=>runtime.value?.state,()=>runtime.value?.modelName,sending,sessionBusy],()=>{
-  if(!sending.value&&!sessionBusy.value)model.value=currentModelSelection(model.value,settings.source,runtime.value)
+  if(!selectingChatModel.value&&!sending.value&&!sessionBusy.value)model.value=currentModelSelection(model.value,settings.source,runtime.value)
  })
- const canSend=computed(()=>ready.value&&!sending.value&&!attaching.value&&(!!input.value.trim()||images.value.length>0)&&!!model.value&&!sessionBusy.value)
+ const canSend=computed(()=>ready.value&&!selectingChatModel.value&&!sending.value&&!attaching.value&&(!!input.value.trim()||images.value.length>0)&&!!model.value&&!sessionBusy.value)
  const effectiveEndpoint=computed(()=>settings.source==='managed'?runtime.value?.endpoint||`http://127.0.0.1:${settings.runtimePort}/v1`:settings.endpoint)
  const statusText=computed(()=>settings.source==='managed'?({stopped:'未加载模型',starting:'模型加载中',running:'模型已就绪',stopping:'正在卸载',error:'加载失败'}[runtime.value?.state||'stopped']):connection.value?.ok?'服务已连接':'服务未连接')
  const online=computed(()=>settings.source==='managed'?runtime.value?.state==='running':connection.value?.ok)
@@ -254,7 +290,7 @@ export function useLocalAiStudio(){
  }
  function removeImage(index:number){if(!attaching.value)images.value.splice(index,1)}
  async function send(regenerate=false,submission?:{text:string;images:StudioImage[]}){
-  if(sending.value||attaching.value||sessionBusy.value||(!regenerate&&!submission&&!canSend.value))return false
+  if(selectingChatModel.value||sending.value||attaching.value||sessionBusy.value||(!regenerate&&!submission&&!canSend.value))return false
   if((webEnabled.value||chatWorkspace.value||approvalMode.value==='full')&&data.value?.chatToolsSupported!==true){report('联网与工具调用需要重启应用主进程后生效；消息草稿已保留。');return false}
   const text=(submission?.text??input.value).trim(),attachments=regenerate?[]:(submission?.images??images.value).map(image=>({name:image.name,dataUrl:image.dataUrl}))
   if(attachments.length&&data.value?.chatImagesSupported!==true){report('图片发送功能需要重启 MyPlane 后生效；图片草稿已保留，请重启后重新粘贴发送。');return}
@@ -270,7 +306,7 @@ export function useLocalAiStudio(){
   }catch(cause){requestId.value='';pending.value=undefined;report(cause);try{session.value=await api('session',{id:target.id})}catch{}if(!regenerate&&!submission&&!input.value&&!images.value.length){input.value=text;images.value=attachments}return false}
  }
  async function compactSession(){
-  if(sending.value||sessionBusy.value||!session.value)return
+  if(selectingChatModel.value||sending.value||sessionBusy.value||!session.value)return
   const target=session.value,id=crypto.randomUUID();requestId.value=id;error.value=''
   try{
    session.value=await api('updateSession',{id:target.id,model:model.value,systemPrompt:systemPrompt.value})
@@ -284,7 +320,7 @@ export function useLocalAiStudio(){
  async function reveal(item:StudioLocalModel){try{await api('revealModel',{id:item.id})}catch(cause){report(cause)}}
  async function openLink(url:string){try{await window.myplane.openAiLink(url)}catch(cause){report(cause)}}
  async function poll(){
-  try{if(data.value){const before=data.value.runtime.state,completed=data.value.downloads.filter(item=>item.status==='completed').length,snapshot=await api('snapshot');Object.assign(data.value,snapshot);if(completed!==snapshot.downloads.filter(item=>item.status==='completed').length)await refreshModels();if(before!=='running'&&snapshot.runtime.state==='running'){model.value=snapshot.runtime.modelName;void connect()}}}catch(cause){if(!disposed)report(cause)}finally{if(!disposed)pollTimer=setTimeout(()=>void poll(),1500)}
+  try{if(data.value){const before=data.value.runtime.state,completed=data.value.downloads.filter(item=>item.status==='completed').length,snapshot=await api('snapshot');Object.assign(data.value,snapshot);if(completed!==snapshot.downloads.filter(item=>item.status==='completed').length)await refreshModels();if(!selectingChatModel.value&&settings.source==='managed'&&before!=='running'&&snapshot.runtime.state==='running'){model.value=snapshot.runtime.modelName;void connect()}}}catch(cause){if(!disposed)report(cause)}finally{if(!disposed)pollTimer=setTimeout(()=>void poll(),1500)}
  }
  onMounted(async()=>{
   try{
@@ -300,5 +336,5 @@ export function useLocalAiStudio(){
   }catch(cause){report(cause)}
  })
  onBeforeUnmount(()=>{disposed=true;clearTimeout(pollTimer);unlisten?.();if(requestId.value)void api('stopChat',{requestId:requestId.value}).catch(()=>{})})
- return {chatProjects,chatWorkspacePath,refreshChatProjects,organizeSession,createChatProject,webEnabled,approvalMode,chatWorkspace,chooseChatWorkspace,chatApproval,approvingChat,approveChat,modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
+ return {chatModelLoading,chatModels,chatModel,selectChatModel,selectingChatModel,chatProjects,chatWorkspacePath,refreshChatProjects,organizeSession,createChatProject,webEnabled,approvalMode,chatWorkspace,chooseChatWorkspace,chatApproval,approvingChat,approveChat,modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
 }

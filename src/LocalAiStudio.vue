@@ -11,6 +11,7 @@ import AutomationTasks from './local-ai/AutomationTasks.vue'
 import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowLeft,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentSkillManager from './local-ai/AgentSkillManager.vue'
+import AbilityModuleManager from './local-ai/AbilityModuleManager.vue'
 import AgentCoreMcpManager from './local-ai/AgentCoreMcpManager.vue'
 import ModelReadme from './local-ai/ModelReadme.vue'
 import {useModelIcons} from './local-ai/useModelIcons'
@@ -32,7 +33,7 @@ const logOutputOpen=ref(false)
 let disposeLogToggle:(()=>void)|undefined,disposeLogRequest:(()=>void)|undefined
 onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true})})
 onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.()})
-const navigation=[{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
+const navigation=[{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'abilities',label:'能力模块',icon:Cpu},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
 const settingsMode=computed(()=>tab.value!=='chat')
 const settingsQuery=ref('')
 const lastSettingsTab=ref<typeof tab.value>('settings')
@@ -219,6 +220,7 @@ function fillRemotePreset(event:Event){
     </section>
    </main>
    <AgentSkillManager v-else-if="tab==='skills'" ref="agentSkillManager"/>
+   <AbilityModuleManager v-else-if="tab==='abilities'"/>
 
    <main v-else-if="tab==='settings'" class="scroll-page settings-page"><header class="page-intro with-actions"><div><span class="eyebrow">PREFERENCES</span><h1>应用设置</h1><p>管理模型存储、界面外观和新会话默认值。服务连接请前往“模型服务”。</p></div><button class="primary-button" :disabled="!!busy||sending" @click="saveSettings()"><Check/>{{busy==='save'?'保存中':'保存设置'}}</button></header><div class="settings-grid">
     <section class="content-card appearance-card"><header><div><h3>界面风格</h3><p>选择后立即预览，保存设置后下次打开仍会使用。</p></div><Operation/></header><div class="appearance-options" role="group" aria-label="界面风格"><button v-for="style in appearanceStyles" :key="style.id" type="button" class="appearance-option" :class="['preview-'+style.id,{selected:settings.appearanceStyle===style.id}]" :aria-pressed="settings.appearanceStyle===style.id" @click="settings.appearanceStyle=style.id"><span class="appearance-preview"><i/><i/><i/><b/></span><strong>{{style.name}}</strong><small>{{style.description}}</small><Check v-if="settings.appearanceStyle===style.id" class="appearance-selected-icon"/></button></div><label class="field appearance-mode">明暗模式<select v-model="settings.theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><AppearanceBackground :image="settings.backgroundImage" :opacity="settings.backgroundOpacity" @change="Object.assign(settings,$event)"/></section>

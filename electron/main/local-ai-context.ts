@@ -85,10 +85,11 @@ export function recoverContext(history:ContextMessage[],system:ContextMessage[],
 export type Summarize=(messages:ContextMessage[],maxTokens:number)=>Promise<string>
 // Return a new checkpoint only after every bounded summary request succeeds.
 // The caller persists it atomically; full message/event history is never removed.
-export async function compactContext(options:{history:ContextMessage[];system:ContextMessage[];checkpoint?:ContextCheckpoint;budget:ContextBudget;force?:boolean;aggressive?:boolean;signal:AbortSignal;summarize:Summarize;evidence?:string}):Promise<ContextCheckpoint|undefined>{
+export async function compactContext(options:{history:ContextMessage[];system:ContextMessage[];checkpoint?:ContextCheckpoint;budget:ContextBudget;force?:boolean;aggressive?:boolean;signal:AbortSignal;summarize:Summarize;evidence?:string;triggerRatio?:number;retainRecent?:number}):Promise<ContextCheckpoint|undefined>{
  const {history,system,budget,signal,summarize}=options,previous=checkpointFor(history,options.checkpoint)
  const before=contextStatus(history,system,previous,budget)
- if(!options.force&&!needsCompaction(before))return previous
+ const trigger=Math.max(.5,Math.min(.8,options.triggerRatio??.8))
+ if(!options.force&&!needsCompaction(before)&&(before.inputTokens+before.reservedOutput)<before.capacity*trigger)return previous
  const starts=history.flatMap((message,index)=>message.role==='tool'?[]:[index])
  // Generation may include reasoning even when thinking is disabled. Its allowance
  // must grow with capacity independently of the short summary we retain.
@@ -97,7 +98,7 @@ export async function compactContext(options:{history:ContextMessage[];system:Co
  // turn an output-limit recovery into a context-overflow request.
  const retryOutput=Math.max(output,Math.min(budget.maxTokens,8192,output*4,Math.floor(budget.contextLength*.4)))
  const summaryTarget=Math.min(output,512)
- const retain=options.aggressive?1:2,from=previous?.through||0
+ const retain=options.aggressive?1:Math.max(2,Math.min(8,Math.floor(options.retainRecent??2))),from=previous?.through||0
  let index=Math.max(0,starts.length-retain),through=starts[index]??0
  // Prefer recent complete groups; if a tool result itself fills the context,
  // summarize that completed group too rather than truncating a tool response.

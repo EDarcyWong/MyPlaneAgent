@@ -64,7 +64,11 @@ export class InternalBrowser{
     else await window.loadFile(path.join(this.directory,'../../dist/index.html'),{query:{surface:'browser'}})
    })()
   }
-  try{await this.ready}catch(error){this.window?.destroy();throw error}
+  try{
+   await this.ready
+   const connected=await this.window?.webContents.executeJavaScript("typeof window.myplane?.browser === 'function' && typeof window.myplane?.onBrowserState === 'function'")
+   if(!connected)throw new Error('内置浏览器控制界面的桌面接口未加载，请完全退出并重新启动应用；若仍失败，请检查预加载脚本是否完整安装。')
+  }catch(error){this.window?.destroy();throw error}
   if(this.window?.isMinimized())this.window.restore()
   this.window?.show();this.window?.focus()
   if(url)void this.navigate(url)
