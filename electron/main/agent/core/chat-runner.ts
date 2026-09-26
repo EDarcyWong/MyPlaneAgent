@@ -207,6 +207,8 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
   let lastToolError = ''
   const unresolvedFailures = new Set<string>()
   let outputRecovery = false
+  let responseSegments: string[] = []
+  let responseContinuationCount = 0
   const failedPageUrls=new Set<string>()
   const pageKey=(value:unknown)=>{try{const url=new URL(String(value));url.hash='';return url.href}catch{return ''}}
   const pause = (reason: string) => {
@@ -249,8 +251,23 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
      }); break } catch (error) {
       options.signal.throwIfAborted()
       if (!(error instanceof ModelOutputLimitError)) throw error
-      const breakdown=error.output?`本次返回正文 ${error.output.text} 字符、思考 ${error.output.reasoning} 字符、工具参数 ${error.output.arguments} 字符（${error.output.calls} 个调用）。`:''
-      if (retry === 2) { pause(`模型连续三次达到输出上限（本次 ${error.maxTokens} Tokens），已停止重试。${breakdown}被截断的工具调用均未执行。${error.output&&error.output.reasoning>error.output.text+error.output.arguments?'请求已关闭思考，但服务仍返回大量思考内容，请检查模型服务的思考开关或模板。':'已要求单个小范围步骤，模型仍未返回完整结果。请根据已有执行记录继续尚未完成部分。'}`); return }
+      const truncatedText=error.output?.text||''
+      const breakdown=error.output?`本次返回正文 ${truncatedText.length} 字符、思考 ${error.output.reasoning} 字符、工具参数 ${error.output.arguments} 字符（${error.output.calls} 个调用）。`:''
+      if(error.output&&!error.output.calls&&truncatedText.trim()){
+        const decision=policies?await policies.invoke('response-continuation',{hasToolCalls:false,textChars:truncatedText.length,segments:responseContinuationCount+1,maxSegments:4,capacity:connection.contextLength},query,options.signal):{action:responseContinuationCount<3?'continue' as const:'abort' as const,maxSegments:4,tailChars:4000,reason:'宿主默认长响应策略'}
+        responseSegments.push(truncatedText);responseContinuationCount++
+        if(decision.action==='continue'){
+          const tail=responseSegments.join('').slice(-decision.tailChars)
+          options.onProgress?.(`回答达到 ${error.maxTokens} Tokens，已保留第 ${responseContinuationCount} 段，正在从断点继续`,'working')
+          retryInput=[...input,{role:'assistant',content:tail},{role:'system',content:'上一段最终回答因输出长度达到上限而结束。已生成正文由宿主保存。现在只继续最终回答，不执行任何工具，不重复标题、前言或已完成内容；从断点后的未完成位置继续，保持 Markdown 结构。若剩余内容已完成，直接结束。'}]
+          turnTools=[]
+          continue
+        }
+        options.onOutcome?.('blocked')
+        options.onContent(responseSegments.join('')+'\n\n[回答达到分段上限，已保留以上完整生成内容；可继续对话要求从此处续写。]')
+        return
+      }
+      if (retry === 2) { pause(`模型连续三次达到输出上限（本次 ${error.maxTokens} Tokens），已停止重试。${breakdown}截断的工具调用均未执行。${error.output&&error.output.reasoning>truncatedText.length+error.output.arguments?'请求已关闭思考，但服务仍返回大量思考内容，请检查模型服务的思考开关或模板。':'已要求单个小范围步骤，模型仍未返回完整结果。请根据已有执行记录继续尚未完成部分。'}`); return }
       outputRecovery = true
       turnTools=allowedTools.map(tool=>({...tool,function:{...tool.function,parameters:recoveryToolSchema(tool.function.parameters)}}))
       options.onProgress?.(`正在启用小步骤恢复。${breakdown}`, 'working')
@@ -274,7 +291,9 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
     }
     if (!response) throw new Error('模型未返回有效响应')
     if (outputRecovery && (response.tool_calls?.length || 0) > 1) { pause('恢复模式要求单个小步骤，但模型仍返回多个工具调用。本轮均未执行，请核对已有记录后继续。'); return }
-    const candidate = streamedContent || response.content || ''
+    const candidatePart = streamedContent || response.content || ''
+    const candidate = responseSegments.length ? responseSegments.join('') + candidatePart : candidatePart
+    responseSegments=[];responseContinuationCount=0
     if (!streamedReasoning && response.reasoning) options.onReasoning(response.reasoning)
     history.push({ ...response, role: 'assistant', reasoning_content: response.reasoning })
     if (!response.tool_calls?.length) {
