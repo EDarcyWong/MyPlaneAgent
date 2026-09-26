@@ -204,7 +204,7 @@ async function requestAnthropic(connection:AgentConnection,model:string,messages
   if(added){activity();options.onProgress?.({phase,characters,toolNames:phase==='tools'?[...calls.values()].map(call=>call.name).filter(Boolean):undefined})}
  }
  if(!stopReason)throw new Error('Anthropic 响应流意外中断，本轮未执行工具。请检查模型服务后继续任务。')
- if(stopReason==='max_tokens')throw new ModelOutputLimitError(connection.maxTokens,{text:content.length,reasoning:reasoning.length,arguments:[...calls.values()].reduce((n,c)=>n+c.arguments.length,0),calls:calls.size})
+ if(stopReason==='max_tokens')throw new ModelOutputLimitError(connection.maxTokens,{text:content,reasoning:reasoning.length,arguments:[...calls.values()].reduce((n,c)=>n+c.arguments.length,0),calls:calls.size})
  const toolCalls=[...calls.entries()].sort((a,b)=>a[0]-b[0]).map(([,call])=>({id:call.id,type:'function' as const,function:{name:call.name,arguments:call.arguments||'{}'}}))
  if(options.tools===false&&toolCalls.length)throw new Error('摘要请求返回了工具调用，未执行，也未替换原摘要')
  if(!content.trim()&&!toolCalls.length)throw new Error('模型没有返回答复或工具调用，请选择支持工具调用的模型')
@@ -214,7 +214,7 @@ async function requestAnthropic(connection:AgentConnection,model:string,messages
 function validateAnthropicAnswer(data:Record<string,unknown>,maxTokens:number,options:RequestOptions):AgentAnswer{
  if(data.type==='error'||data.error)throw new Error(String(record(data.error).message||'Anthropic 服务返回错误'))
  const blocks=Array.isArray(data.content)?data.content.map(record):[],content=blocks.filter(block=>block.type==='text').map(block=>String(block.text||'')).join(''),reasoning=blocks.filter(block=>block.type==='thinking').map(block=>String(block.thinking||'')).join('')
- if(data.stop_reason==='max_tokens')throw new ModelOutputLimitError(maxTokens,{text:content.length,reasoning:reasoning.length,arguments:blocks.filter(b=>b.type==='tool_use').reduce((n,b)=>n+JSON.stringify(b.input??{}).length,0),calls:blocks.filter(b=>b.type==='tool_use').length})
+ if(data.stop_reason==='max_tokens')throw new ModelOutputLimitError(maxTokens,{text:content,reasoning:reasoning.length,arguments:blocks.filter(b=>b.type==='tool_use').reduce((n,b)=>n+JSON.stringify(b.input??{}).length,0),calls:blocks.filter(b=>b.type==='tool_use').length})
  const calls:ToolCall[]=blocks.filter(block=>block.type==='tool_use').map(block=>({id:String(block.id||''),type:'function',function:{name:String(block.name||''),arguments:JSON.stringify(block.input??{})}}))
  if(calls.some(call=>!call.id||!call.function.name)||calls.length>8)throw new ModelFormatError('Anthropic 返回了无效的工具调用')
  if(options.tools===false&&calls.length)throw new Error('摘要请求返回了工具调用，未执行，也未替换原摘要')
@@ -224,7 +224,7 @@ function validateAnthropicAnswer(data:Record<string,unknown>,maxTokens:number,op
 function validateAnswer(data:Record<string,unknown>,maxTokens:number):AgentAnswer{
  if(data.error)throw new Error(String(record(data.error).message||'模型服务返回错误'))
  const choice=record(Array.isArray(data.choices)?data.choices[0]:null),message=record(choice.message)
- if(choice.finish_reason==='length')throw new ModelOutputLimitError(maxTokens,{text:typeof message.content==='string'?message.content.length:0,reasoning:String(message.reasoning_content||message.reasoning||'').length,arguments:Array.isArray(message.tool_calls)?message.tool_calls.reduce((n,raw)=>n+String(record(record(raw).function).arguments||'').length,0):0,calls:Array.isArray(message.tool_calls)?message.tool_calls.length:0})
+ if(choice.finish_reason==='length')throw new ModelOutputLimitError(maxTokens,{text:typeof message.content==='string'?message.content:'',reasoning:String(message.reasoning_content||message.reasoning||'').length,arguments:Array.isArray(message.tool_calls)?message.tool_calls.reduce((n,raw)=>n+String(record(record(raw).function).arguments||'').length,0):0,calls:Array.isArray(message.tool_calls)?message.tool_calls.length:0})
  const calls:ToolCall[]=[]
  if(message.tool_calls!=null){
   if(!Array.isArray(message.tool_calls)||message.tool_calls.length>8)throw new ModelFormatError('模型工具调用格式错误或单轮超过 8 个')
