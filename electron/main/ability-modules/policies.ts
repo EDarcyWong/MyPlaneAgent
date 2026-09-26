@@ -10,6 +10,7 @@ export type PolicyResults = {
   'tool-selection': { ids: string[] }
   'completion-review': { status: 'complete'|'continue'|'needs_input'|'blocked'; reason: string; nextStep: string }
   'error-recovery': { action: 'continue'|'adjust'|'pause'; reason: string }
+  'response-continuation': { action: 'continue'|'abort'; maxSegments: number; tailChars: number; reason: string }
   'context-compaction': { triggerRatio: number; retainRecent: number }
   'model-adapter': { maxTokens: number; temperature: number; toolLimit: number }
   'history-memory': { ids: string[] }
@@ -74,6 +75,10 @@ export const policyContracts: ModuleContract[] = [
     `function process(input){const d=input.data;const stop=d.denied||d.stagnant>=6||d.continuations>4||d.invalidCalls>=3;return {result:{action:stop?'pause':d.stagnant>=3?'adjust':'continue',reason:stop?'已达到无进展、格式错误或权限边界':d.stagnant>=3?'核对已有结果并改用可行步骤':'仍在执行预算内'}};}`,
     [sample('正常执行',{stagnant:0,continuations:0,invalidCalls:0,denied:false},{action:'continue',reason:'仍在执行预算内'}),sample('无进展调整',{stagnant:3,continuations:0,invalidCalls:0,denied:false},{action:'adjust',reason:'核对已有结果并改用可行步骤'}),sample('达到上限暂停',{stagnant:6,continuations:0,invalidCalls:0,denied:false},{action:'pause',reason:'已达到无进展、格式错误或权限边界'}),sample('拒绝后停止',{stagnant:0,continuations:0,invalidCalls:0,denied:true},{action:'pause',reason:'已达到无进展、格式错误或权限边界'})],
     (r,i)=>{const d=i.data;if(!r.reason.trim()||(d.denied||Number(d.stagnant)>=6||Number(d.continuations)>4||Number(d.invalidCalls)>=3)&&r.action!=='pause')throw new Error('恢复策略不得绕过停止边界')}),
+  define('response-continuation', '长响应续写与聚合', '纯文本回答达到模型输出上限时决定是否安全续写；截断工具调用永不续接或执行。', object({hasToolCalls:{type:'boolean'},textChars:integer(0,8000000),segments:integer(0,32),maxSegments:integer(1,8),capacity:integer(256,10000000)}), object({action:choice('continue','abort'),maxSegments:integer(1,8),tailChars:integer(256,12000),reason:text(600)}),
+    `function process(input){const d=input.data;const limit=Math.min(d.maxSegments,d.capacity<8192?2:4);const abort=d.hasToolCalls||d.segments>=limit||!d.textChars;return {result:{action:abort?'abort':'continue',maxSegments:limit,tailChars:d.capacity<8192?1200:4000,reason:d.hasToolCalls?'截断内容包含工具调用，必须重新生成完整调用':d.segments>=limit?'已达到长响应分段上限':!d.textChars?'没有可安全保留的正文':'保留已生成正文并以无工具模式从断点续写'}};}`,
+    [sample('纯文本可续写',{hasToolCalls:false,textChars:6000,segments:1,maxSegments:4,capacity:32768},{action:'continue',maxSegments:4,tailChars:4000,reason:'保留已生成正文并以无工具模式从断点续写'}),sample('工具调用禁止续接',{hasToolCalls:true,textChars:1000,segments:1,maxSegments:4,capacity:32768},{action:'abort',maxSegments:4,tailChars:4000,reason:'截断内容包含工具调用，必须重新生成完整调用'}),sample('小上下文限制分段',{hasToolCalls:false,textChars:3000,segments:2,maxSegments:4,capacity:4096},{action:'abort',maxSegments:2,tailChars:1200,reason:'已达到长响应分段上限'})],
+    (r,i)=>{const d=i.data;if((d.hasToolCalls||Number(d.segments)>=r.maxSegments||!Number(d.textChars))&&r.action!=='abort'||r.maxSegments>Number(d.maxSegments))throw new Error('长响应策略不得续接工具调用、突破宿主分段上限或扩大预算')}),
   define('context-compaction', '上下文预算与压缩恢复', '选择更早的压缩时点和近期消息保留量，原始历史和最后用户要求由内核保留。', object({capacity:integer(256,10000000),usageRatio:number(0,10000000)}), object({triggerRatio:number(.5,.8),retainRecent:integer(2,8)}),
     `function process(input){return {result:{triggerRatio:input.data.capacity<8192?.7:.8,retainRecent:input.data.capacity<8192?2:4}};}`,
     [sample('小容量提前压缩',{capacity:4096,usageRatio:.75},{triggerRatio:.7,retainRecent:2}),sample('大容量保留更多近期记录',{capacity:32768,usageRatio:.4},{triggerRatio:.8,retainRecent:4})]),

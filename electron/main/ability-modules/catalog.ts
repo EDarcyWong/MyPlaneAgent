@@ -39,6 +39,8 @@ export const abilityDefinitions: AbilityDescriptor[] = [
     inputs: ['模型工具调用', '能力参数模式'], outputs: ['可执行参数', '校验错误'], dependencies: [], implementation: ['agent/core/chat-runner.js', 'agent/registry.js'], integrationNote: '执行前校验属于受保护内核，不允许候选模块自行降低验收条件。' },
   { id: 'completion-review', stageId: 'recovery', name: '任务完成检查', description: '结合候选回答和工具证据判断完成、继续、受阻或需要输入。', mode: 'builtin', protected: false,
     inputs: ['用户目标', '候选回答', '执行证据'], outputs: ['完成状态', '原因与下一步'], dependencies: ['step-executor'], implementation: ['agent/core/completion-review.js', 'agent/core/chat-runner.js'], integrationNote: '已接入模型完成检查和严格格式解析；尚未覆盖所有任务类型的确定性结果验证。' },
+  { id: 'response-continuation', stageId: 'recovery', name: '长响应续写与聚合', description: '纯文本最终回答达到输出上限时保留已生成正文并从断点继续；工具调用截断仍由内核整轮作废。', mode: 'builtin', protected: false,
+    inputs: ['截断正文', '工具调用数量', '模型容量', '已续写段数'], outputs: ['续写或停止决策', '分段上限', '断点尾部窗口'], dependencies: ['completion-review', 'model-adapter'], implementation: ['agent/core/chat-runner.js', 'agent/model.js', 'local-ai-model-error.js'], integrationNote: '续写决策可独立优化；工具调用完整性、实际容量和最大分段数由宿主硬限制。' },
   { id: 'error-recovery', stageId: 'recovery', name: '失败恢复与停滞检测', description: '反馈工具错误、限制无进展重试，保留未完成结果。', mode: 'builtin', protected: false,
     inputs: ['失败结果', '进展签名', '轮次预算'], outputs: ['纠正提示', '继续或暂停结论'], dependencies: ['call-validation', 'completion-review'], implementation: ['agent/core/chat-runner.js'], integrationNote: '已有重试和停滞保护；完整的错误类型路由仍需进一步模块化。' },
 
