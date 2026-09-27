@@ -11,6 +11,7 @@ import AutomationTasks from './local-ai/AutomationTasks.vue'
 import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowLeft,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentSkillManager from './local-ai/AgentSkillManager.vue'
+import ExperienceLibraryCard from './local-ai/ExperienceLibraryCard.vue'
 import AbilityModuleManager from './local-ai/AbilityModuleManager.vue'
 import AgentCoreMcpManager from './local-ai/AgentCoreMcpManager.vue'
 import ModelReadme from './local-ai/ModelReadme.vue'
@@ -33,11 +34,11 @@ const logOutputOpen=ref(false)
 let disposeLogToggle:(()=>void)|undefined,disposeLogRequest:(()=>void)|undefined
 onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true})})
 onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.()})
-const navigation=[{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'abilities',label:'能力模块',icon:Cpu},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
+const navigation=[{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'abilities',label:'能力模块',icon:Cpu},{id:'experience',label:'知识库',icon:Document},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
 const settingsMode=computed(()=>tab.value!=='chat')
 const settingsQuery=ref('')
 const lastSettingsTab=ref<typeof tab.value>('settings')
-const settingsKeywords:Record<string,string>={skills:'Skills Skill 技能插件编辑 编译 能力注册表 可用能力 工具',mcp:'工具 服务',discover:'搜索 下载 Hugging Face',models:'本地 导入 模型库',server:'本地 远程 API 启动 配置',workflow:'流程 自动化',automation:'计划 定时 自动化',settings:'外观 主题 存储 偏好'}
+const settingsKeywords:Record<string,string>={experience:'知识库 经验 记忆 流程 天气 验证 knowledge memory',skills:'Skills Skill 技能插件编辑 编译 能力注册表 可用能力 工具',mcp:'工具 服务',discover:'搜索 下载 Hugging Face',models:'本地 导入 模型库',server:'本地 远程 API 启动 配置',workflow:'流程 自动化',automation:'计划 定时 自动化',settings:'外观 主题 存储 偏好'}
 const filteredNavigation=computed(()=>{
  const words=settingsQuery.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
  return navigation.filter(item=>words.every(word=>`${item.label} ${item.id} ${settingsKeywords[item.id]||''}`.toLowerCase().includes(word)))
@@ -122,6 +123,7 @@ function fillRemotePreset(event:Event){
 
    <WorkflowDesigner ref="workflowDesigner" v-else-if="tab==='workflow'" :model="model" :models="workflowModels" :theme="settings.theme" :appearance-style="settings.appearanceStyle"/>
    <AutomationTasks ref="automationTasks" v-else-if="tab==='automation'" :model="model" :models="workflowModels"/>
+   <ExperienceLibraryCard v-else-if="tab==='experience'"/>
    <AgentCoreMcpManager v-else-if="tab==='mcp'"/>
 
    <main v-else-if="tab==='discover'" class="discover-workspace catalog-workspace" :class="{'has-details':!!selected,'details-open':detailsOpen}">

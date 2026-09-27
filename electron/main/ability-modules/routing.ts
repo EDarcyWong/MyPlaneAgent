@@ -1,9 +1,25 @@
 import { conversationIntents, routeActions, type AbilityInput, type RouterInput, type RouterOutput } from '../../shared/ability-modules.js'
 import type { StudioSession } from '../../shared/local-ai-studio.js'
 import type { ModuleContract } from './contract.js'
+import {parseWeatherRequest} from '../agent/core/weather-workflow.js'
+import {parseExperienceRequest} from '../agent/core/experience-request.js'
+import {isWebLookup} from '../../shared/task-scope.js'
 
 const clean = (text: string) => text.trim().replace(/[。！!？?\s]+$/g, '').toLowerCase()
 export const explicitNewTask = (text: string) => /^(新任务|换个任务|另外一个任务|new task)[:：\s]/i.test(text.trim())
+export function standaloneLookup(text:string){
+ if(/^(补充|另外|还要|请注意|要求|不要|不许|保持|注意|改成|换成|更正|纠正|不是|日期改为|also|do not|change to|actually)/i.test(text.trim()))return false
+ const weather=parseWeatherRequest(text)
+ if(weather?.city&&weather.day)return true
+ const request=parseExperienceRequest(text)
+ return request?.kind==='web-research'&&isWebLookup(text)===true
+}
+export function lookupBoundary(text:string,currentGoal:string):'new_task'|'replace'|undefined{
+ if(!standaloneLookup(text))return
+ const current=currentGoal.split('\n用户补充：').at(-1)||currentGoal
+ const before=parseWeatherRequest(current),after=parseWeatherRequest(text)
+ return before?.city&&before.day&&after?.city===before.city&&after.day===before.day?'replace':'new_task'
+}
 const cancelCommand = (text: string) => /^(取消|停止|暂停|不用做了|停止任务|取消任务|暂停任务|cancel|stop|pause)$/.test(clean(text))
 const progressCommand = (text: string) => /^(做到哪了|进度如何|现在进度|进度|查看进度|任务进度|status|progress)$/.test(clean(text))
 const continueCommand = (text: string) => /^(继续|继续吧|继续修改|继续执行|接着做|接着完成(?:剩余|未完)部分|continue|resume)$/.test(clean(text))
@@ -24,7 +40,7 @@ export function validateRouterOutput(value: unknown, input: AbilityInput): Route
   if (explicitNewTask(text) && action !== 'new_task') throw new Error('明确新任务必须隔离旧任务上下文')
   if (action === 'cancel' && (input.hasAttachments || !cancelCommand(text))) throw new Error('取消必须来自明确的当前用户命令')
   if (action === 'progress' && (input.hasAttachments || !(progressCommand(text) || input.intent === 'progress'))) throw new Error('进度路由必须来自当前查询')
-  if (action === 'new_task' && input.taskStatus !== 'none' && !explicitNewTask(text)) throw new Error('不能静默丢弃已有任务')
+  if (action === 'new_task' && input.taskStatus !== 'none' && !explicitNewTask(text)&&!standaloneLookup(text)) throw new Error('不能静默丢弃已有任务')
   if ((action === 'continue' || action === 'amend') && input.taskStatus === 'none') throw new Error('没有可继续或补充的任务')
   if (action === 'continue' && !continueCommand(text) && input.intent !== 'continue') throw new Error('继续必须有当前用户请求')
   return { action }

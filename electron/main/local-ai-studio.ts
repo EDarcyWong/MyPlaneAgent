@@ -1,9 +1,14 @@
+import {validateVisualDecision,visualDecisionText} from '../shared/visual-review.js'
+import {SearchHealth} from './agent/search-health.js'
+import {beginOperation,operationKey,journalRequired} from './agent/core/operation-journal.js';
+import {upgradeBundledEngine} from './agent/core/bundled-engine-upgrade.js';
 import {registerBrowserPlugin} from './browser-plugin.js';
+import {ChatApprovalGrants} from './agent/chat-approval-grants.js';
 import {AbilityModuleManager} from './ability-modules/manager.js';
 import {AbilityCatalogService} from './ability-modules/catalog.js';
 import {policyContracts} from './ability-modules/policies.js';
 import {AbilityPolicyRuntime} from './ability-modules/policy-runtime.js';
-import {routerContract,validateRouterOutput,explicitNewTask,taskMessages,taskProgress} from './ability-modules/routing.js';
+import {routerContract,validateRouterOutput,explicitNewTask,lookupBoundary,taskMessages,taskProgress} from './ability-modules/routing.js';
 import type {RouterInput} from '../shared/ability-modules.js';
 import {stateContext} from './ability-modules/conversation.js';
 import {selectionInput,selectionContract,validateSelectionOutput} from './ability-modules/selection.js';
@@ -224,7 +229,7 @@ export class LocalAiStudioService extends LocalAiService {
   private agentCoreReady: Promise<void> | null = null;
   private readonly coreTaskOwners = new Map<string, WebContents>();
   private readonly coreTaskWorkspaces = new Map<string, string>();
-  private readonly chatApprovals = new Map<string, {requestId:string;owner:number;resolve:(approved:boolean)=>void}>();
+  private readonly chatApprovals = new Map<string, {requestId:string;owner:number;resolve:(approved:boolean,scope?:'once'|'similar'|'full')=>void}>();
   private readonly coreApprovals = new Map<string, { taskId: string; resolve: (approved: boolean) => void }>();
   private readonly coreMcpFile: string;
   private deletingPlugin = false;
@@ -308,6 +313,7 @@ export class LocalAiStudioService extends LocalAiService {
       },
       message => log?.("error", "ai-conversation", message),
     );
+    this.agent.setSearchHealth(new SearchHealth(path.join(dataRoot, 'agent-data')));
     this.probeFile = path.join(dataRoot, "local-ai-model-profiles.json");
     this.mcp = new AgentMcpManager(
       path.join(dataRoot, "local-ai-mcp.json"),
@@ -491,6 +497,7 @@ export class LocalAiStudioService extends LocalAiService {
             const destination = path.join(skillsDir, entry.name)
             if (!existsSync(destination)) cpSync(path.join(bundledSkills, entry.name), destination, { recursive: true })
             else if (entry.name === 'agent-tools') {
+              upgradeBundledEngine(path.join(bundledSkills,entry.name,'engine.py'),path.join(destination,'engine.py'),path.join(dataDir,'bundled-plugin-history','agent-tools'));
               // Upgrade the known shipped runtime while preserving user-edited Skill code.
               const entryPath = path.join(destination, 'index.py');
               if (existsSync(entryPath) && new Set([
@@ -500,6 +507,9 @@ export class LocalAiStudioService extends LocalAiService {
                 '3e7c81771e6755b232c6639d3c2aaf57ece56a242352deba98206ddd69039029',
                 'e4d7591580822e8415b0242ef9d34e7c24021fb7f8fb04c516ea1162eb0e5326',
                 '8942f9e611f5c4a2a8e1e9c7506125c1b303acb850df7561b2f4d9bc953e0bd1',
+                '9670ade3a70339d9fcb31bdb92641b6279f86f08903eeeaa356223917e46f425',
+                '1607fbd67f8aa564ffd951c83a4c6bf2335006f915eedb14707ee25630e5e71a',
+                '7e727bf9a53dbb5292a430e7037372bb691abda34c7742839b1f8d349fbffd3a',
               ]).has(createHash('sha256').update(readFileSync(entryPath)).digest('hex')))
                 cpSync(path.join(bundledSkills, entry.name, 'index.py'), entryPath);
             }
@@ -1445,7 +1455,7 @@ export class LocalAiStudioService extends LocalAiService {
     return readdirSync(this.sessionsDirectory)
       .filter((file) => /^[a-f\d-]{36}\.json$/i.test(file))
       .map((file) => this.session(file.slice(0, -5)))
-      .map(({ messages, abilityState: _abilityState, ...rest }) => ({
+      .map(({ messages, abilityState: _abilityState, operationJournal: _operationJournal, ...rest }) => ({
         ...rest,
         messageCount: messages.length,
       }))
@@ -1545,13 +1555,16 @@ export class LocalAiStudioService extends LocalAiService {
     const images =
       compactOnly || value.regenerate === true ? [] : chatImages(value.images);
     const imageChars = [
-      ...session.messages.flatMap((message) => message.images || []),
+      ...session.messages.flatMap((message) => [...(message.images||[]),...(message.toolActivity||[]).flatMap(activity=>activity.images||[])]),
       ...images,
     ].reduce((sum, image) => sum + image.dataUrl.length, 0);
     if (imageChars > maxSessionImageChars)
       throw new Error("当前会话的图片已达到容量上限，请新建对话");
+    if(value.regenerate===true&&session.messages.filter(message=>message.role==='user').at(-1)?.visualDecision)throw new Error('验收选择已保存，请发送继续或重新截图，不要重新生成已提交的验收选择');
+    const visualDecision=value.visualDecision===undefined?undefined:validateVisualDecision(session.taskPlan,session.messages,value.visualDecision);
+    if(visualDecision&&(compactOnly||value.regenerate===true||session.taskPlan?.workspace!==workspace||!session.abilityTask||session.taskPlan.taskId!==session.abilityTask.id))throw new Error('验收任务或工作目录已变化，请刷新后继续');
     const model = required(value.model, "模型", 500),
-      content = textValue(value.text, 100000).trim(),
+      content = visualDecision?visualDecisionText(session.taskPlan!.items.find(item=>item.id===visualDecision.itemId)!,visualDecision):textValue(value.text, 100000).trim(),
       settings = this.inferenceSettings(model),
       service = this.service();
     if (
@@ -1590,8 +1603,10 @@ export class LocalAiStudioService extends LocalAiService {
           role: "user",
           content,
           ...(images.length ? { images } : {}),
+          ...(visualDecision?{visualDecision}:{}),
           createdAt: new Date().toISOString(),
         });
+        if(visualDecision){const item=session.taskPlan!.items.find(item=>item.id===visualDecision.itemId)!;item.visualResponses??=[];item.visualResponses.push({...visualDecision,createdAt:new Date().toISOString()})}
         if (session.title === "新对话")
           session.title = content.slice(0, 36) || "图片对话";
       }
@@ -1614,6 +1629,7 @@ export class LocalAiStudioService extends LocalAiService {
     const emit = (event: StudioEvent) => {
       if (!sender.isDestroyed()) sender.send("local-ai:studio-event", event);
     };
+    const approvalGrants = new ChatApprovalGrants();
     void this.generate(
       session,
       service,
@@ -1623,12 +1639,21 @@ export class LocalAiStudioService extends LocalAiService {
       requestId,
       compactOnly,
       {
-        workspace, initializeLocalGit: !!grant || !!project, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled,
+        workspace, initializeLocalGit: !!grant || !!project, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled, webAllowSyntheticIp:project?.webAllowSyntheticIp!==false,
         approvalMode: session.approvalMode || 'ask',
+        getApprovalMode: () => session.approvalMode || 'ask',
+        approvalGranted: activity => approvalGrants.allows(activity),
         approve: activity => new Promise<boolean>(resolve => {
           if (sender.isDestroyed() || controller.signal.aborted) { resolve(false); return }
+          if(approvalGrants.allows(activity)){resolve(true);return}
           const approvalId = randomUUID();
-          const finish = (approved:boolean) => { this.chatApprovals.delete(approvalId); controller.signal.removeEventListener('abort', abort); resolve(approved) };
+          const finish = (approved:boolean,scope:'once'|'similar'|'full'='once') => {
+            if(!controller.signal.aborted){
+              if(approved&&scope==='full'){session.approvalMode='full';session.webEnabled=true;this.saveSession(session)}
+              approvalGrants.approve(activity,approved,scope);
+            }
+            this.chatApprovals.delete(approvalId); controller.signal.removeEventListener('abort', abort); resolve(approved)
+          };
           const abort = () => finish(false);
           controller.signal.addEventListener('abort', abort, {once:true});
           this.chatApprovals.set(approvalId, {requestId, owner:sender.id, resolve:finish});
@@ -1645,7 +1670,7 @@ export class LocalAiStudioService extends LocalAiService {
   private chatHistory(session: StudioSession): ContextMessage[] {
     return taskMessages(session).map((item) => ({
       role: item.role,
-      content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(({fileChanges: _fileChanges,...activity}) => ({...activity, output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
+      content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(({fileChanges: _fileChanges,images:storedImages,...activity}) => ({...activity,...(storedImages?.length?{imageNote:'截图原件保存在该工具记录；当前文字摘要不能替代图片，核验当前画面时重新截图。'}:{}), output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
     }));
   }
   private chatSystem(session: StudioSession): ContextMessage[] {
@@ -1780,7 +1805,7 @@ export class LocalAiStudioService extends LocalAiService {
     emit: (event: StudioEvent) => void,
     requestId: string,
     compactOnly = false,
-    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'approvalMode'|'approve'>,
+    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'webAllowSyntheticIp'|'approvalMode'|'approve'|'getApprovalMode'|'approvalGranted'>,
   ) {
     const started = Date.now(),
       answer: StudioMessage = {
@@ -1829,7 +1854,8 @@ export class LocalAiStudioService extends LocalAiService {
             delete session.checkpoint;
           }
         }
-        const newBoundary = explicitNewTask(latest.content);
+        const lookupChange=!latest.visualDecision&&!latest.images?.length?lookupBoundary(latest.content,session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||''):undefined;
+        const newBoundary = !latest.visualDecision&&(explicitNewTask(latest.content)||!!lookupChange);
         let proposedState: typeof previousState;
         try {
           const candidates = selectionInput(newBoundary ? [latest] : taskMessages(session), newBoundary ? undefined : previousState);
@@ -1845,13 +1871,21 @@ export class LocalAiStudioService extends LocalAiService {
           this.applicationLog?.('warn', 'ability-modules', `状态模块未应用，保留原始对话继续：${String(cause)}`);
         }
         signal.throwIfAborted();
-        const routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
-        const routed = await this.routerModule.execute(routingInput, signal);
+        const routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
+        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:await this.routerModule.execute(routingInput, signal);
         const route = validateRouterOutput(routed.output, routingInput);
-        this.routerModule.recordSample(routingInput, routed.versionId);
+        if(lookupChange==='new_task'){
+          try{
+            const sample={...routingInput,messages:routingInput.messages.map(message=>({id:'current',text:message.text}))}
+            const predicted=await this.routerModule.execute(sample,signal)
+            if((predicted.output as {action:string}).action!==route.action)this.routerModule.reportAutomaticFeedback('独立查询的任务边界与宿主确定性判断不符',sample,{action:route.action})
+          }catch(cause){signal.throwIfAborted();this.applicationLog?.('warn','ability-modules','自动回归案例收集失败：'+String(cause))}
+        }
+        if(!latest.visualDecision&&!lookupChange)this.routerModule.recordSample(routingInput, routed.versionId);
         if (route.action === 'new_task') {
           session.abilityTask = { id: randomUUID(), startMessageId: latest.id, goalMessageId: latest.id, status: 'ready', updatedAt: new Date().toISOString() };
           delete session.checkpoint;
+          delete session.taskPlan;
           // Initial task after unrelated questions also starts from the current user message.
           if (!newBoundary && proposedState?.proposal.goalMessageId !== latest.id) {
             const selectionVersionId = proposedState?.selectionVersionId;
@@ -1860,7 +1894,11 @@ export class LocalAiStudioService extends LocalAiService {
           }
           session.abilityState = proposedState;
         } else if (['continue', 'amend'].includes(route.action)) {
-          session.abilityState = proposedState || previousState;
+          if(lookupChange==='replace'&&session.abilityTask){
+            session.abilityTask.goalMessageId=latest.id;session.abilityTask.startMessageId=latest.id;
+            delete session.taskPlan;delete session.checkpoint;
+          }else if(route.action==='amend'&&session.taskPlan)session.taskPlan.needsReplan=true;
+          session.abilityState = lookupChange ? proposedState : proposedState || previousState;
         } else if (!session.abilityTask && route.action === 'respond') session.abilityState = proposedState;
         answer.abilityRoute = { versionId: routed.versionId, action: route.action, taskId: session.abilityTask?.id, createdAt: new Date().toISOString() };
         if (route.action === 'cancel' && session.abilityTask) {
@@ -1905,9 +1943,26 @@ export class LocalAiStudioService extends LocalAiService {
         answer.execution.push(entry);
         emit({type:'progress',requestId,entry});
       };
+      const imageProfile=modelProfile(this.probeFile,service.endpoint,session.model)?.image;
+      const imageCapability=imageProfile==='failed'||settings.source==='managed'&&!this.runtime.snapshot().vision?'unsupported':imageProfile==='passed'||settings.source==='managed'&&this.runtime.snapshot().vision?'supported':'unknown';
+      const storedImageChars=session.messages.flatMap(message=>[...(message.images||[]),...(message.toolActivity||[]).flatMap(activity=>activity.images||[])]).reduce((sum,image)=>sum+image.dataUrl.length,0);
       await core.runConversation({
         ...toolOptions!, connection: {...service, contextLength:settings.contextLength, maxTokens:settings.maxTokens, localLlama:settings.source === 'managed'},
         model:session.model, messages:messages as AgentMessage[], signal, temperature:settings.temperature,
+        visualDecision:session.messages.filter(message=>message.role==='user').at(-1)?.visualDecision,
+        imageCapability,imageBudget:{remaining:Math.max(0,maxSessionImageChars-storedImageChars)},
+        beforeExecution: taskRunId ? (capability,args)=>{
+          if(!journalRequired(capability,args))return;
+          session.operationJournal??={};
+          return beginOperation(session.operationJournal,operationKey(taskRunId!,toolOptions!.workspace,capability.name,args),()=>this.saveSession(session));
+        } : undefined,
+        afterExecution: taskRunId ? (capability,args,success)=>{
+          if(!journalRequired(capability,args))return;
+          session.operationJournal??={};
+          session.operationJournal[operationKey(taskRunId!,toolOptions!.workspace,capability.name,args)]={status:success?'succeeded':'failed',updatedAt:new Date().toISOString()};
+          this.saveSession(session);
+        } : undefined,
+        planExecution: taskRunId ? {goal:[session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'',...(session.taskPlan?.needsReplan?[session.messages.filter(message=>message.role==='user').at(-1)?.content||'']:[])].filter(Boolean).join('\n用户补充：'),taskId:taskRunId,plan:session.taskPlan,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
         stateContext: moduleContext,
         abilityPolicies,
         onProgress: progress,
@@ -1947,6 +2002,15 @@ export class LocalAiStudioService extends LocalAiService {
         error = String(cause);
       }
     } finally {
+      if(!compactOnly&&!signal.aborted){
+        try{
+          if(session.taskPlan?.items.some(item=>item.excludedProjectChecks?.length))this.policyManagers.get('task-planner')?.observeFailure('host','计划曾包含与用户目标无关的项目检查，宿主已纠正；该规则不属于当前任务规划模块接口，不能通过修改模块测试冒充修复。')
+          if(answer.outcome==='blocked'||error){
+            const failed=(answer.toolActivity||[]).filter(activity=>activity.status==='error'||activity.status==='denied')
+            this.policyManagers.get('error-recovery')?.observeFailure(failed.length?'tool':'unknown',failed.length?'任务因工具错误或权限拒绝受阻；保留原工具记录，不自动生成模块代码修复案例。':'任务未完成但尚无独立预期结果；需要可复现输入与期望，不能把模型自述当作正确答案。')
+          }
+        }catch{/* Learning diagnostics must not affect the user's result. */}
+      }
       for (const activity of answer.toolActivity || []) if (activity.status === 'waiting' || activity.status === 'running') {
         activity.status = 'error'; activity.output = signal.aborted ? '操作已停止' : error || '操作未完成';
       }
@@ -2264,6 +2328,25 @@ export class LocalAiStudioService extends LocalAiService {
       case "workflowDefinitions":
         return this.workflow.definitions();
       case 'abilityCatalog': return this.abilityCatalog.list();
+      case 'previewPluginState': return (await this.ensureAgentCore()).previewState();
+      case 'experienceSearchHealth': return (await this.ensureAgentCore()).searchHealthState();
+      case 'experienceConvert': return (await this.ensureAgentCore()).convertExperience(String(value.id),value.revision as number);
+      case 'experienceState': return (await this.ensureAgentCore()).experienceState();
+      case 'experienceConfigure': return (await this.ensureAgentCore()).configureExperiences(value.enabled as boolean);
+      case 'experienceRemove': return (await this.ensureAgentCore()).removeExperience(String(value.id));
+      case 'experienceEdit': return (await this.ensureAgentCore()).editExperience(String(value.id),value.revision as number,value.recipe as import('../shared/experience.js').ExperienceRecipe);
+      case 'experienceEnable': return (await this.ensureAgentCore()).enableExperience(String(value.id),value.revision as number,value.enabled as boolean);
+      case 'experienceRollback': return (await this.ensureAgentCore()).rollbackExperience(String(value.id),value.revision as number,value.target as number);
+      case 'experienceTrial': {
+        const input=value as import('../shared/experience.js').ExperienceTrialInput
+        const project=input.projectId?this.agent.projects().find(p=>p.id===input.projectId):undefined
+        if(input.projectId&&!project)throw new Error('项目不存在')
+        const core=await this.ensureAgentCore()
+        const entry=core.experienceState().entries.find(e=>e.id===input.id)
+        if(entry?.recipe?.kind==='file-read'&&!project)throw new Error('文件流程试运行须选择原工作目录项目')
+        return core.trialExperience(input,project?.workspace||path.join(this.dataRoot,'agent-data'),project?.webAccess!=='disabled',project?.webAllowSyntheticIp!==false)
+      }
+      case 'previewPluginConfigure': return (await this.ensureAgentCore()).configurePreview(value.enabled as boolean);
       case 'abilityModelEvaluationHistory': return this.abilityModelEvaluation.history();
       case 'abilityModelEvaluationCancel': return this.abilityModelEvaluation.cancel();
       case 'abilityModelComparisonRun':
@@ -3462,7 +3545,9 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
         const approvalId = required(value.approvalId, '批准 ID');
         const pending = this.chatApprovals.get(approvalId);
         if (!pending || pending.owner !== event.sender.id || pending.requestId !== value.requestId || !this.chats.has(pending.requestId)) throw new Error('批准请求已失效或不属于当前窗口');
-        pending.resolve(value.approved === true);
+        const scope=value.scope??'once';
+        if(!['once','similar','full'].includes(String(scope)))throw new Error('批准范围无效');
+        pending.resolve(value.approved === true,scope as 'once'|'similar'|'full');
         return;
       }
       case "stopChat":

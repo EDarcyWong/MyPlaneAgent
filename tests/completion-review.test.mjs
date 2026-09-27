@@ -7,3 +7,12 @@ test('completion review rejects ambiguous, incomplete and unstructured decisions
 test('review keeps braces in strings and validates the next step',()=>{
  assert.deepEqual(parseCompletionReview('结果：{"status":"continue","reason":"检查 {} 配置","nextStep":"读取配置"}'),{status:'continue',reason:'检查 {} 配置',nextStep:'读取配置'})
 })
+
+test('structured checks are bounded, validated and never parsed from truncated JSON',()=>{
+ const action={title:'读取页面',capability:'browser.read_page',args:{},basis:'测试页面',required:true}
+ const value={status:'continue',reason:'仍需读取',actions:[action],optionalChecks:['性能测试']}
+ const parsed=parseCompletionReview(JSON.stringify(value))
+ assert.deepEqual(parsed.actions,[action]);assert.deepEqual(parsed.optionalChecks,['性能测试']);assert.ok(parsed.nextStep)
+ for(const actions of [[{...action,args:[]}],[{...action,required:'yes'}],Array(7).fill(action)])assert.equal(parseCompletionReview(JSON.stringify({...value,actions})),undefined)
+ assert.equal(parseCompletionReview(JSON.stringify(value).slice(0,-2)),undefined)
+})

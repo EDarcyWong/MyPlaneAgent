@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import BrowserPluginCard from './BrowserPluginCard.vue'
+import StaticPreviewPluginCard from './StaticPreviewPluginCard.vue'
 import { computed, defineAsyncComponent, onMounted, ref } from 'vue'
 import {ElMessage} from 'element-plus'
 const SkillCodeEditor = defineAsyncComponent(() => import('./SkillCodeEditor.vue'))
@@ -340,6 +341,7 @@ defineExpose({ create: createFromToolbar })
     </p>
 
     <BrowserPluginCard v-if="view==='manage'"/>
+    <StaticPreviewPluginCard v-if="view==='manage'"/>
     <div v-show="view==='manage'" class="skill-layout">
       <!-- 左侧：插件列表 -->
       <aside class="skill-browser">

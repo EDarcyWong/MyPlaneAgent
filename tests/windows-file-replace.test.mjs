@@ -1,6 +1,28 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {spawnSync} from 'node:child_process'
+
+test('both Python plugins skip identical writes without touching metadata, including mixed patches',()=>{
+ const result=spawnSync(process.env.MYPLANE_PYTHON||(process.platform==='win32'?'python':'python3'),['-c',String.raw`
+import importlib.util, pathlib, tempfile, json
+from unittest.mock import patch
+for source in ['python/agent_tools_worker.py','skills/agent-tools/engine.py']:
+ spec=importlib.util.spec_from_file_location('no_op_test',source);engine=importlib.util.module_from_spec(spec);spec.loader.exec_module(engine)
+ with tempfile.TemporaryDirectory() as directory:
+  root=pathlib.Path(directory);file=root/'a.txt';file.write_bytes(b'A');stamp=file.stat().st_mtime_ns
+  for tool,args in [('write_file',{'path':'a.txt','content':'A'}),('replace_text',{'path':'a.txt','oldText':'A','newText':'A'}),('apply_patch',{'changes':[{'path':'a.txt','before':'A','after':'A'}]})]:
+   prepared=engine.prepare_write(root,tool,args)
+   with patch.object(engine.os,'replace',side_effect=AssertionError('identical write must not replace')):
+    result=json.loads(engine.execute_plan(root,prepared['plan']))
+   assert result['status']=='unchanged' and result['changed'] is False and result['paths']==[] and result['unchangedPaths']==['a.txt']
+   assert file.stat().st_mtime_ns==stamp
+  prepared=engine.prepare_write(root,'apply_patch',{'changes':[{'path':'a.txt','before':'A','after':'A'},{'path':'b.txt','after':''}]})
+  result=json.loads(engine.execute_plan(root,prepared['plan']))
+  assert result['changed'] and result['paths']==['b.txt'] and result['unchangedPaths']==['a.txt']
+  assert file.stat().st_mtime_ns==stamp and (root/'b.txt').exists()
+`],{encoding:'utf8'})
+ assert.equal(result.status,0,result.stderr||result.error?.message)
+})
 test('both Python writers bound permission retries and preserve concurrent edits',()=>{
  const result=spawnSync(process.env.MYPLANE_PYTHON||(process.platform==='win32'?'python':'python3'),['-c',String.raw`
 import importlib.util, pathlib, tempfile, os

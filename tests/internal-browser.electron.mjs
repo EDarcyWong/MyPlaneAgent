@@ -1,4 +1,4 @@
-import {app,BrowserWindow} from 'electron'
+import {app,BrowserWindow,nativeImage} from 'electron'
 import {createServer} from 'node:http'
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
@@ -23,6 +23,7 @@ async function main(){
   await browser.open(url)
   const window=BrowserWindow.getAllWindows()[0],wc=window.contentView.children[0].webContents
   assert.equal(await window.webContents.executeJavaScript("typeof window.myplane.onBrowserState"),'function')
+  assert.equal(await window.webContents.executeJavaScript("Math.abs(document.querySelector('.internal-browser').getBoundingClientRect().width-innerWidth)<2"),true,'browser shell fills window')
   const unprivileged=new BrowserWindow({show:false,webPreferences:{sandbox:true,contextIsolation:true,nodeIntegration:false}})
   try{
    await unprivileged.loadFile(path.resolve('dist/index.html'))
@@ -45,6 +46,10 @@ async function main(){
   await browser.action(window.webContents,'navigate','http://127.0.0.1:1/')
   await wait(()=>!!browser.snapshot().error)
   assert.ok(browser.snapshot().url.includes('127.0.0.1:1'))
+  await window.webContents.executeJavaScript(`(()=>{const input=document.querySelector('input');input.focus();input.value=${JSON.stringify(url)};input.dispatchEvent(new Event('input',{bubbles:true}));input.blur()})()`)
+  await window.webContents.executeJavaScript("document.querySelector('.browser-empty button').click()")
+  await wait(()=>browser.snapshot().title==='测试网页'&&!browser.snapshot().loading&&!browser.snapshot().error)
+  assert.equal(browser.snapshot().url,url+'/','retry uses edited address')
   await browser.action(window.webContents,'navigate',url);await wait(()=>browser.snapshot().title==='测试网页'&&!browser.snapshot().loading&&!browser.snapshot().error)
   const signal=new AbortController().signal
   configureBrowserPlugin(browser)
@@ -118,6 +123,22 @@ async function main(){
   assert.equal(layout.count,1);assert.equal(layout.elements[0].bounds.width,180)
   assert.equal(layout.elements[0].styles['white-space'],'nowrap')
   assert.equal(layout.elements[0].text,'hard')
+  await wc.executeJavaScript("console.error('expected-browser-test-error')")
+  const runtime=await automate('read_page',{},signal)
+  assert.ok(runtime.pageErrors.some(error=>error.includes('expected-browser-test-error')))
+  await wc.executeJavaScript("(()=>{const canvas=document.querySelector('canvas');canvas.scrollIntoView({block:'center'});const ctx=canvas.getContext('2d');ctx.fillStyle='red';ctx.fillRect(0,0,600,400)})()")
+  const screenshot=await automate('screenshot',{url:runtime.url},signal)
+  const pixels=nativeImage.createFromDataURL(screenshot.image.dataUrl)
+  assert.equal(pixels.isEmpty(),false)
+  assert.deepEqual(pixels.getSize(),{width:screenshot.width,height:screenshot.height})
+  assert.ok(screenshot.width<=1280&&screenshot.height<=1280)
+  assert.ok(screenshot.image.dataUrl.length<1_400_000)
+  const bitmap=pixels.toBitmap();let redPixels=0
+  for(let i=0;i<bitmap.length;i+=4)if(bitmap[i]<80&&bitmap[i+1]<80&&bitmap[i+2]>180)redPixels++
+  assert.ok(redPixels>100,'screenshot includes actual canvas pixels, not only dimensions')
+  await assert.rejects(automate('screenshot',{url:runtime.url+'/other'},signal),/页面已变化/)
+  const cancelledShot=new AbortController();cancelledShot.abort()
+  await assert.rejects(automate('screenshot',{url:runtime.url},cancelledShot.signal))
   await assert.rejects(automate('inspect',{url:snapshot.url,selector:'['},signal),/selector/i)
   await assert.rejects(automate('inspect',{url:snapshot.url+'/other',selector:'.status'},signal),/页面已变化/)
   snapshot=await automate('read_page',{},signal)
@@ -126,6 +147,7 @@ async function main(){
   await browser.action(window.webContents,'enable-automation',false)
   assert.equal(await wc.executeJavaScript("!!document.querySelector('[data-myplane-pointer]')"),false)
   await assert.rejects(browser.automate('read_page',{},signal),/未启用/)
+  await assert.rejects(browser.automate('screenshot',{url:snapshot.url},signal),/未启用/)
   window.destroy();await wait(()=>wc.isDestroyed());assert.equal(wc.isDestroyed(),true)
   console.log('Internal browser navigation, isolation and cleanup passed')
  }catch(error){console.error(error);process.exitCode=1}finally{for(const window of BrowserWindow.getAllWindows())window.destroy();server?.close();try{rmSync(root,{recursive:true,force:true})}catch(error){if(!['EPERM','EBUSY'].includes(error.code))throw error;console.log('Temporary Electron profile is locked until process exit')}app.exit(process.exitCode||0)}

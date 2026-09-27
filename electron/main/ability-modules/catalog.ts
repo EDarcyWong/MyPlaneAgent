@@ -28,7 +28,7 @@ export const abilityDefinitions: AbilityDescriptor[] = [
   { id: 'clarification-policy', stageId: 'routing', name: '必要信息澄清策略', description: '在缺少无法推断的必要信息时提问，避免无依据地扩展任务。', mode: 'builtin', protected: false,
     inputs: ['用户目标与约束', '模型回答与执行结果'], outputs: ['澄清请求', '需要输入的状态'], dependencies: ['conversation-state'], implementation: ['agent/core/chat-runner.js'], integrationNote: '目前由聊天提示和完成检查共同约束，尚未抽出独立分类器。' },
 
-  { id: 'task-planner', stageId: 'execution', name: '任务规划与步骤拆解', description: '生成能力调用计划，验证步骤和依赖关系。', mode: 'builtin', protected: false,
+  { id: 'task-planner', stageId: 'execution', name: '任务规划与步骤拆解', description: '生成任务清单；子任务按当前目标选工具和验收，避免每项重新规划整个请求。', mode: 'builtin', protected: false,
     inputs: ['任务目标', '可用能力', '历史经验'], outputs: ['执行步骤', '依赖关系'], dependencies: ['history-memory', 'tool-selection'], implementation: ['agent/core/agent-planner.js'], integrationNote: '已用于 Agent 计划任务；普通聊天使用聊天执行循环，尚未统一为独立规划模块。' },
   { id: 'step-executor', stageId: 'execution', name: '步骤执行与进度控制', description: '执行计划或逐轮工具调用，保留结果、审批与执行进度。', mode: 'builtin', protected: true,
     inputs: ['任务计划或工具调用', '执行权限'], outputs: ['逐步结果', '工具事件与进度'], dependencies: ['tool-selection', 'call-validation'], implementation: ['agent/core/agent-executor.js', 'agent/core/chat-runner.js'], integrationNote: '执行和权限边界属于稳定内核；不能让自动生成代码绕过审批或重复执行写入。' },
@@ -38,9 +38,9 @@ export const abilityDefinitions: AbilityDescriptor[] = [
   { id: 'call-validation', stageId: 'recovery', name: '工具调用与参数校验', description: '检查工具名称、参数结构和执行权限，对无效调用返回修正信息。', mode: 'builtin', protected: true,
     inputs: ['模型工具调用', '能力参数模式'], outputs: ['可执行参数', '校验错误'], dependencies: [], implementation: ['agent/core/chat-runner.js', 'agent/registry.js'], integrationNote: '执行前校验属于受保护内核，不允许候选模块自行降低验收条件。' },
   { id: 'completion-review', stageId: 'recovery', name: '任务完成检查', description: '结合候选回答和工具证据判断完成、继续、受阻或需要输入。', mode: 'builtin', protected: false,
-    inputs: ['用户目标', '候选回答', '执行证据'], outputs: ['完成状态', '原因与下一步'], dependencies: ['step-executor'], implementation: ['agent/core/completion-review.js', 'agent/core/chat-runner.js'], integrationNote: '已接入模型完成检查和严格格式解析；尚未覆盖所有任务类型的确定性结果验证。' },
+    inputs: ['用户目标', '候选回答', '执行证据'], outputs: ['完成状态', '原因与下一步'], dependencies: ['step-executor'], implementation: ['agent/core/completion-review.js', 'agent/core/chat-runner.js'], integrationNote: '已接入模型评审、文件内容检查、已有测试脚本和类型诊断；非零退出码不能算完成。程序验收失败最多局部修复两次，相同失败停止；没有规则时等待确认。' },
   { id: 'error-recovery', stageId: 'recovery', name: '失败恢复与停滞检测', description: '反馈工具错误、限制无进展重试，保留未完成结果。', mode: 'builtin', protected: false,
-    inputs: ['失败结果', '进展签名', '轮次预算'], outputs: ['纠正提示', '继续或暂停结论'], dependencies: ['call-validation', 'completion-review'], implementation: ['agent/core/chat-runner.js'], integrationNote: '已有重试和停滞保护；完整的错误类型路由仍需进一步模块化。' },
+    inputs: ['失败结果', '进展签名', '轮次预算'], outputs: ['纠正提示', '继续或暂停结论'], dependencies: ['call-validation', 'completion-review'], implementation: ['agent/core/chat-runner.js'], integrationNote: '已接入文本编辑实际变化、连续无效编辑和内容循环检测；读取与验证不会清空无效编辑计数，达到边界由内核停止。' },
 
   { id: 'context-compaction', stageId: 'context', name: '上下文预算与压缩恢复', description: '估算上下文、压缩历史，并在摘要失败时保留原始要求和执行记录。', mode: 'builtin', protected: false,
     inputs: ['历史消息', '容量与输出预算'], outputs: ['摘要检查点', '恢复上下文', '容量状态'], dependencies: ['state-context-selection'], implementation: ['local-ai-context.js', 'agent/context-policy.js'], integrationNote: '已接入聊天和任务处理，当前随应用发布更新。' },

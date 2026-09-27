@@ -14,4 +14,5 @@ test('chat snapshots record complete content and distinguish a new file from an 
  fs.writeFileSync(path.join(root,'existing.txt'),'updated')
  assert.deepEqual(snapshot.finish(),[{path:'new.txt',before:undefined,after:'new'},{path:'existing.txt',before:'',after:'updated'}])
  assert.equal(prepareChatFileChanges(root,'agent.read_file',{path:'new.txt'}),undefined)
+ assert.deepEqual(prepareChatFileChanges(root,'agent.write_file',{path:'new.txt'}).finish(),[],'unchanged content must not appear as a diff')
 })

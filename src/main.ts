@@ -1,4 +1,5 @@
 import {createApp} from 'vue'
+import DesktopTitleBar from './DesktopTitleBar.vue'
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import './style.css'
@@ -13,6 +14,10 @@ if(import.meta.hot)import.meta.hot.dispose(disposeFloatingMenus)
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
+if(window.myplane?.desktopPlatform==='win32'){
+ const bar=document.createElement('div');document.body.prepend(bar);createApp(DesktopTitleBar).mount(bar)
+ document.documentElement.classList.add('desktop-titlebar-enabled')
+}
 if(!window.myplane){
  document.title='请从桌面应用打开 · MyPlaneAgent'
  const root=document.querySelector('#app')

@@ -13,11 +13,15 @@ import type {
 import type { SkillPlatform } from './skill-platform.js'
 import type { MCPAdapter } from './mcp-adapter.js'
 import { validateToolArguments } from './execution-guards.js'
+import {searchRegion} from '../search-engines.js'
+import type {SearchHealth} from '../search-health.js'
 
 export class CapabilityRegistry {
+  private searchHealth?:SearchHealth
+  setSearchHealth(health:SearchHealth){this.searchHealth=health}
   private capabilities = new Map<string, Capability>()
-  private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal)=>Promise<unknown>;available:()=>boolean}>()
-  registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal)=>Promise<unknown>,available:()=>boolean=()=>true){
+  private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string)=>Promise<unknown>;available:()=>boolean}>()
+  registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string)=>Promise<unknown>,available:()=>boolean=()=>true){
     this.register(capability);this.builtinHandlers.set(capability.name,{run,available})
   }
 
@@ -234,7 +238,7 @@ export class CapabilityRegistry {
           request.args,
           signal,
           request.workspace,
-          request.context
+          capability.source.skillId==='agent-tools'&&toolName==='web_search'?{...request.context,searchRouting:this.searchHealth?.routing(searchRegion())??searchRegion()}:request.context
         )
 
       } else if (capability.runtime === 'mcp') {
@@ -249,13 +253,14 @@ export class CapabilityRegistry {
         const handler=this.builtinHandlers.get(capability.name)
         if(!handler||!handler.available())throw new Error('插件未启用或能力不可用')
         signal.throwIfAborted()
-        output=await handler.run(request.args,signal)
+        output=await handler.run(request.args,signal,request.workspace)
         signal.throwIfAborted()
 
       } else {
         throw new Error(`Unknown runtime: ${capability.runtime}`)
       }
 
+      if(request.capability==='agent.web_search')this.searchHealth?.observe(output)
       return {
         success: true,
         output,

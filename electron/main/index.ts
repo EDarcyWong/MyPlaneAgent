@@ -1,5 +1,6 @@
 import {configureBrowserPlugin} from './browser-plugin.js'
 import {InternalBrowser} from './internal-browser.js'
+import {windowChrome,registerTitleMenu} from './window-chrome.js'
 import {app,BrowserWindow,dialog,Menu,nativeTheme,shell,Tray,type MenuItemConstructorOptions} from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -83,7 +84,7 @@ function showAbout(){
 }
 async function createWindow(){
  if(window&&!window.isDestroyed()){focus();return}
- const next=new BrowserWindow({title:'MyPlaneAgent',width:1380,height:900,minWidth:520,minHeight:540,show:false,backgroundColor:nativeTheme.shouldUseDarkColors?'#181b1a':'#f5f8f6',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ const next=new BrowserWindow({...windowChrome(),title:'MyPlaneAgent',width:1380,height:900,minWidth:520,minHeight:540,show:false,backgroundColor:nativeTheme.shouldUseDarkColors?'#181b1a':'#f5f8f6',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
  window=next
  logger.info('window','创建主窗体')
  next.on('closed',()=>{logger.info('window','主窗体已关闭');if(window===next)window=undefined})
@@ -107,7 +108,7 @@ async function openWorkflowEditor(workflowId=''){
   if(currentId===workflowId)return
   workflowEditorWindow.close()
  }
- const editor=new BrowserWindow({title:workflowId?'编辑工作流':'新建工作流',width:1320,height:850,minWidth:960,minHeight:640,show:false,backgroundColor:'#eef3f0',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ const editor=new BrowserWindow({...windowChrome(),title:workflowId?'编辑工作流':'新建工作流',width:1320,height:850,minWidth:960,minHeight:640,show:false,backgroundColor:'#eef3f0',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
  workflowEditorWindow=editor
  logger.info('window',workflowId?'打开工作流编辑窗体':'打开新建工作流窗体',{workflowId})
  editor.on('closed',()=>{if(workflowEditorWindow===editor)workflowEditorWindow=undefined;window?.webContents.send('workflow:saved')})
@@ -129,7 +130,7 @@ async function openHelpDocument(documentId='workflow'){
   if(helpWindow.isMinimized())helpWindow.restore()
   helpWindow.show();helpWindow.focus();return
  }
- const next=new BrowserWindow({title:'工作流使用指南 · MyPlaneAgent',width:1160,height:840,minWidth:760,minHeight:560,show:false,backgroundColor:'#f7faf8',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ const next=new BrowserWindow({...windowChrome(),title:'工作流使用指南 · MyPlaneAgent',width:1160,height:840,minWidth:760,minHeight:560,show:false,backgroundColor:'#f7faf8',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
  helpWindow=next
  next.on('closed',()=>{if(helpWindow===next)helpWindow=undefined})
  next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
@@ -160,6 +161,7 @@ else{
    tray=new Tray(appIcon);tray.setToolTip(app.name);tray.setContextMenu(Menu.buildFromTemplate([{label:'打开 MyPlaneAgent',click:()=>void createWindow()},{type:'separator'},{label:'退出',role:'quit'}]));tray.on('click',()=>void createWindow())
   }
   registerLocalAiStudio(()=>service!,()=>service?.dispose())
+  registerTitleMenu()
   protectedHandle('browser:action',(event,action,value)=>browser.action(event.sender,action,value))
   protectedHandle('ai:open-link',async(_event,value:unknown)=>{
    if(typeof value!=='string'||value.length>8000)throw new Error('链接无效')

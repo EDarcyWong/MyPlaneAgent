@@ -1,0 +1,16 @@
+import type {BrowserWindowConstructorOptions} from 'electron'
+import {BrowserWindow,Menu} from 'electron'
+import {protectedHandle} from './auth.js'
+export const titleBarHeight=36
+export function windowChrome():BrowserWindowConstructorOptions{
+ return process.platform==='win32'?{titleBarStyle:'hidden',titleBarOverlay:{color:'#f5f5f5',symbolColor:'#444444',height:titleBarHeight},autoHideMenuBar:true}:{}
+}
+export function registerTitleMenu(){
+ protectedHandle('app:title-menu',(event,label,x)=>{
+  const owner=BrowserWindow.fromWebContents(event.sender)
+  if(!owner||typeof label!=='string'||!['文件','编辑','视图','窗体','帮助'].includes(label)||typeof x!=='number'||!Number.isFinite(x))throw new Error('菜单请求无效')
+  const menu=Menu.getApplicationMenu()?.items.find(item=>item.label===label)?.submenu
+  if(!menu)throw new Error('菜单尚未初始化')
+  menu.popup({window:owner,x:Math.round(Math.max(0,Math.min(owner.getContentSize()[0]-20,x*event.sender.getZoomFactor()))),y:Math.round(titleBarHeight*event.sender.getZoomFactor())})
+ })
+}

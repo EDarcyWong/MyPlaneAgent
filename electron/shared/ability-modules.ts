@@ -40,17 +40,20 @@ export type ModuleVersion = {
 }
 export type ModuleProblem = {
   id: string; versionId: string; createdAt: string; kind: 'runtime' | 'feedback'
-  description: string; input: AbilityInput; expected?: Partial<AbilityOutput>
+  description: string; input: AbilityInput; expected?: Partial<AbilityOutput>; automatic?:boolean
 }
 export type ModuleJob = {
   id: string; createdAt: string; updatedAt: string; parentId: string; problemIds: string[]
   phase: 'queued' | 'analyzing' | 'testing' | 'complete' | 'failed' | 'cancelled'
   model?: string; diagnosis?: string; candidateId?: string; message: string
   shadow?: { samples: number; changed: number; failed: number }
+  resolution?:'improved'|'review'|'non-module'|'retryable'; retryAfter?:string
 }
 export type ModuleRating = { id: string; versionId: string; score: number; note: string; createdAt: string }
 export type ModuleSwitch = { id: string; from: string; to: string; reason: string; createdAt: string }
 export type ModuleSnapshot = {
+  optimization?:{reason:string;pending:number;exhausted:number;nextRetryAt?:string}
+  observations?:Array<{id:string;createdAt:string;cause:string;message:string}>
   feedbackExample?: { input: AbilityInput; expected: Partial<AbilityOutput> }
   moduleId: string; name: string; description: string; contract: string; activeId: string; policy: ModulePolicy
   versions: Array<Omit<ModuleVersion, 'code'> & { report?: ModuleReport; ratings: ModuleRating[]; quarantined: boolean }>

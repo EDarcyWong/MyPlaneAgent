@@ -273,13 +273,16 @@ def execute_plan(root,plan):
         if plan.get('testAction'): result['failureAnalysis']=test_failure_analysis(output,done.returncode,plan['testAction'])
         result['output']=output[:32000];result['truncated']=len(output)>32000
         return compact(result)
-    changes=plan['changes'];prepared=[];seen=set()
+    changes=plan['changes'];prepared=[];seen=set();unchanged=[]
     for change in changes:
         file=resolve(root,change['path'],True);identity=os.path.normcase(str(file))
         if identity in seen: raise ValueError('同一文件只能出现一次')
         seen.add(identity);current=file.read_bytes() if file.exists() else None
         if (sha(current) if current is not None else None)!=change.get('expected'): raise ValueError('文件在确认期间已被修改：'+change['path'])
         data=bytes.fromhex(change['afterHex']) if 'afterHex' in change else change['after'].encode()
+        if current==data:
+            unchanged.append(change['path'])
+            continue
         prepared.append((change,file,data,current,file.stat().st_mode & 0o777 if file.exists() else 0o644))
     def atomic_write(file,data,mode):
         file.parent.mkdir(parents=True,exist_ok=True);name=None
@@ -317,8 +320,8 @@ def execute_plan(root,plan):
                 else: atomic_write(file,before,mode)
             except Exception: pending.append(change['path'])
         raise ValueError(str(error)+('；回退未完成，请核对：'+','.join(pending) if pending else '；已回退本次写入' if applied else '；本次尚未替换任何文件')) from error
-    invalidate(root,[file for _,file,_,_,_ in prepared])
-    return compact({'status':'saved','paths':[c['path'] for c in changes]})
+    if prepared: invalidate(root,[file for _,file,_,_,_ in prepared])
+    return compact({'status':'saved' if prepared else 'unchanged','changed':bool(prepared),'paths':[c['path'] for c,_,_,_,_ in prepared],'unchangedPaths':unchanged,'note':'文件内容未变化，未执行替换；请核验目标是否已满足，不要重复写入。' if not prepared else ''})
 
 def code_files(root,relative='.',limit=1800):
     paths=[]

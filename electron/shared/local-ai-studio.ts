@@ -45,18 +45,29 @@ export type StudioConnection = {ok:boolean;endpoint:string;latencyMs:number;mode
 export type StudioImage = {name:string;dataUrl:string}
 export type StudioApprovalMode = 'ask'|'auto'|'full'
 export type StudioFileChange = {path:string;before?:string;after:string}
-export type StudioToolActivity = {id:string;capability:string;args:Record<string,unknown>;status:'waiting'|'running'|'complete'|'error'|'denied';output?:string;fileChanges?:StudioFileChange[]}
+export type StudioToolActivity = {id:string;capability:string;args:Record<string,unknown>;status:'waiting'|'running'|'complete'|'error'|'denied';output?:string;fileChanges?:StudioFileChange[];images?:StudioImage[]}
 export type StudioProgress = {id:string;type:'progress';text:string;phase:'working'|'reviewing'|'context';createdAt:string}
 export type StudioExecutionEntry = StudioProgress | {id:string;type:'tool';activityId:string;createdAt:string}
-export type StudioMessage = {abilityRoute?:import('./ability-modules.js').AbilityRoute;execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
-export type StudioSession = {abilityTask?:import('./ability-modules.js').AbilityTask;abilityState?:import('./ability-modules.js').ConversationState;pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
-export type StudioSessionSummary = Omit<StudioSession,'messages'> & {messageCount:number}
-export type StudioEvent = {type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
+export type StudioMessage = {visualDecision?:import('./visual-review.js').VisualDecision;abilityRoute?:import('./ability-modules.js').AbilityRoute;execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
+export type StudioSession = {operationJournal?:import('../main/agent/core/operation-journal.js').OperationJournal;taskPlan?:import('./task-plan.js').TaskPlan;abilityTask?:import('./ability-modules.js').AbilityTask;abilityState?:import('./ability-modules.js').ConversationState;pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
+export type StudioSessionSummary = Omit<StudioSession,'messages'|'operationJournal'> & {messageCount:number}
+export type StudioEvent = {type:'task-plan';requestId:string;plan:import('./task-plan.js').TaskPlan}|{type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
 export type StudioHardware = {platform:string;arch:string;cpu:string;threads:number;totalMemory:number;freeMemory:number}
 export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;hardware:StudioHardware;remoteModelCache:StudioRemoteModelCache[]}
 export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean;chatToolsSupported?:boolean}
 
 export type StudioCommands = {
+    experienceSearchHealth:{input:undefined;output:import('../main/agent/search-health.js').SearchHealthRow[]}
+    experienceConvert:{input:{id:string;revision:number};output:import('./experience.js').ExperienceState}
+    experienceState:{input:undefined;output:import('./experience.js').ExperienceState}
+    experienceConfigure:{input:{enabled:boolean};output:import('./experience.js').ExperienceState}
+    experienceRemove:{input:{id:string};output:import('./experience.js').ExperienceState}
+    experienceEdit:{input:{id:string;revision:number;recipe:import('./experience.js').ExperienceRecipe};output:import('./experience.js').ExperienceState}
+    experienceEnable:{input:{id:string;revision:number;enabled:boolean};output:import('./experience.js').ExperienceState}
+    experienceRollback:{input:{id:string;revision:number;target:number};output:import('./experience.js').ExperienceState}
+    experienceTrial:{input:import('./experience.js').ExperienceTrialInput;output:import('./experience.js').ExperienceState}
+    previewPluginState:{input:undefined;output:{enabled:boolean;running:number}}
+    previewPluginConfigure:{input:{enabled:boolean};output:{enabled:boolean;running:number}}
   bootstrap:{input:undefined;output:StudioBootstrap}
   settings:{input:StudioSettingsInput;output:StudioSettings}
   remoteProfiles:{input:undefined;output:LocalAiRemoteProfile[]}
@@ -88,9 +99,9 @@ export type StudioCommands = {
   updateSession:{input:{id:string;pinned?:boolean;projectId?:string;title?:string;model?:string;systemPrompt?:string};output:StudioSession}
   deleteSession:{input:{id:string};output:void}
   exportSession:{input:{id:string;format?:'md'|'pdf'|'json'};output:boolean}
-  chat:{input:{sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;workspaceToken?:string};output:{started:boolean}}
+  chat:{input:{visualDecision?:import('./visual-review.js').VisualDecision;sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;workspaceToken?:string};output:{started:boolean}}
   compactSession:{input:{sessionId:string;requestId:string;model:string};output:{started:boolean}}
-  chatApprove:{input:{requestId:string;approvalId:string;approved:boolean};output:void}
+  chatApprove:{input:{requestId:string;approvalId:string;approved:boolean;scope?:'once'|'similar'|'full'};output:void}
   stopChat:{input:{requestId:string};output:void}
 }&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands&import('./ability-modules.js').AbilityModuleCommands&import('./ability-catalog.js').AbilityCatalogCommands
 

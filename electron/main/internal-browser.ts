@@ -1,4 +1,5 @@
 import {browserPointerScript} from './browser-pointer.js'
+import {windowChrome,titleBarHeight} from './window-chrome.js'
 import {randomUUID} from 'node:crypto'
 import {readFileSync,writeFileSync} from 'node:fs'
 import {app} from 'electron'
@@ -19,6 +20,17 @@ export class InternalBrowser{
  private window?:BrowserWindow
  private view?:WebContentsView
  private requestedUrl=''
+ private navigationRevision=0
+ private pageRevision=0
+ private pageErrors:string[]=[]
+ private loadingError(description:string){
+  if(description.includes('ERR_CONNECTION_REFUSED')){
+   let local=false;try{local=['localhost','127.0.0.1','[::1]'].includes(new URL(this.requestedUrl).hostname)}catch{}
+   return local?'本地网页服务未响应。请确认项目预览服务已经启动，端口与地址栏一致，然后重新加载。':'网站拒绝连接，请检查服务是否运行及端口是否正确。'
+  }
+  if(description.includes('ERR_NAME_NOT_RESOLVED'))return '无法解析网站地址，请检查域名或网络连接。'
+  return '网页加载失败：'+description
+ }
  private automationEnabled=false
  private snapshotToken=''
  private snapshotUrl=''
@@ -35,8 +47,9 @@ export class InternalBrowser{
  async open(value?:unknown){
   const url=value===undefined||value===''?'':browserUrl(value)
   if(!this.window||this.window.isDestroyed()){
-   const window=new BrowserWindow({title:'内置浏览器 · MyPlaneAgent',width:1180,height:820,minWidth:520,minHeight:420,show:false,webPreferences:{preload:path.join(this.directory,'../preload/index.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false}})
+   const window=new BrowserWindow({...windowChrome(),title:'内置浏览器 · MyPlaneAgent',width:1180,height:820,minWidth:520,minHeight:420,show:false,webPreferences:{preload:path.join(this.directory,'../preload/index.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false}})
    this.window=window;this.error='';this.requestedUrl=''
+   window.setMenu(null)
    trackAuthWindow(window.webContents,true,this.developmentUrl)
    window.webContents.setWindowOpenHandler(()=>({action:'deny'}))
    window.webContents.on('will-navigate',event=>event.preventDefault())
@@ -46,17 +59,18 @@ export class InternalBrowser{
    isolated.setPermissionCheckHandler(()=>false)
    const view=new WebContentsView({webPreferences:{session:isolated,sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}})
    this.view=view;window.contentView.addChildView(view);view.setVisible(false)
-   const resize=()=>{if(window.isDestroyed())return;const [width,height]=window.getContentSize();view.setBounds({x:0,y:92,width,height:Math.max(0,height-92)})}
+   const resize=()=>{if(window.isDestroyed())return;const [width,height]=window.getContentSize();const top=92+(process.platform==='win32'?titleBarHeight:0);view.setBounds({x:0,y:top,width,height:Math.max(0,height-top)})}
    window.on('resize',resize);resize()
    const wc=view.webContents
    const guard=(event:Electron.Event,target:string)=>{try{browserUrl(target)}catch{event.preventDefault()}}
    wc.on('will-navigate',guard);wc.on('will-redirect',guard)
    wc.setWindowOpenHandler(({url})=>{try{void this.navigate(browserUrl(url))}catch{/* Block non-web popups. */}return {action:'deny'}})
    wc.on('will-attach-webview',event=>event.preventDefault())
-   wc.on('did-start-loading',()=>{this.snapshotToken='';this.error='';view.setVisible(true);this.publish()})
+   wc.on('did-start-loading',()=>{this.pageRevision++;this.snapshotToken='';this.error='';this.pageErrors=[];view.setVisible(true);this.publish()})
+   wc.on('console-message',event=>{if(event.level==='error')this.pageErrors=[...this.pageErrors,event.message.slice(0,1200)].slice(-20)})
    wc.on('did-stop-loading',()=>this.publish());wc.on('did-navigate',()=>{this.requestedUrl=wc.getURL();this.publish()});wc.on('did-navigate-in-page',()=>this.publish());wc.on('page-title-updated',()=>this.publish())
    wc.on('before-input-event',(event,input)=>{if((input.control||input.meta)&&input.key.toLowerCase()==='l'){event.preventDefault();window.webContents.focus();void window.webContents.executeJavaScript("document.querySelector('input')?.focus();document.querySelector('input')?.select()").catch(()=>{})}})
-   wc.on('did-fail-load',(_event,code,description,_url,mainFrame)=>{if(!mainFrame||code===-3)return;this.error='网页加载失败：'+description;view.setVisible(false);this.publish()})
+   wc.on('did-fail-load',(_event,code,description,url,mainFrame)=>{if(!mainFrame||code===-3||url!==this.requestedUrl)return;this.error=this.loadingError(description);view.setVisible(false);this.publish()})
    wc.on('render-process-gone',()=>{this.error='网页进程已停止，请刷新重试。';view.setVisible(false);this.publish()})
    window.on('closed',()=>{if(!wc.isDestroyed())wc.close();if(this.window===window){this.window=undefined;this.view=undefined;this.ready=undefined}})
    this.ready=(async()=>{
@@ -77,7 +91,9 @@ export class InternalBrowser{
  private async navigate(url:string){
   const wc=this.view?.webContents;if(!wc||wc.isDestroyed())return
   this.error='';this.requestedUrl=url
-  try{await wc.loadURL(url)}catch(error){if(!wc.isDestroyed()&&!String(error).includes('ERR_ABORTED')){this.error=String(error);this.view?.setVisible(false);this.publish()}}
+  const revision=++this.navigationRevision
+  this.publish()
+  try{await wc.loadURL(url)}catch(error){if(revision===this.navigationRevision&&!wc.isDestroyed()&&!String(error).includes('ERR_ABORTED')){this.error=this.loadingError(String(error));this.view?.setVisible(false);this.publish()}}
  }
  async automate(operation:string,args:Record<string,unknown>,signal:AbortSignal):Promise<unknown>{
   signal.throwIfAborted()
@@ -90,6 +106,20 @@ export class InternalBrowser{
   const wc=this.view?.webContents
   if(!wc||wc.isDestroyed()||!wc.getURL()||this.error)throw new Error('请先在内置浏览器打开网页')
   browserUrl(wc.getURL())
+  if(operation==='screenshot'){
+   if(args.url!==wc.getURL())throw new Error('页面已变化，请重新读取')
+   if(wc.isLoading())throw new Error('网页仍在加载，请稍后截图')
+   const url=wc.getURL(),revision=this.pageRevision
+   let captured=await browserOperation(signal,()=>wc.capturePage(undefined,{stayHidden:true,stayAwake:true}))
+   signal.throwIfAborted()
+   if(!this.automationEnabled||wc.isDestroyed()||wc.getURL()!==url||revision!==this.pageRevision||wc.isLoading())throw new Error('页面或插件状态已变化，请重新截图')
+   if(captured.isEmpty())throw new Error('未取得网页画面，请显示浏览器后重试')
+   const size=captured.getSize(),scale=Math.min(1,1280/Math.max(size.width,size.height))
+   if(scale<1)captured=captured.resize({width:Math.round(size.width*scale),height:Math.round(size.height*scale),quality:'good'})
+   const bytes=captured.toJPEG(75)
+   if(bytes.length>1024*1024)throw new Error('截图超过大小限制，请缩小浏览器窗口后重试')
+   return {url,title:wc.getTitle(),...captured.getSize(),capturedAt:new Date().toISOString(),pageErrors:[...this.pageErrors],image:{name:'网页截图.jpg',dataUrl:'data:image/jpeg;base64,'+bytes.toString('base64')}}
+  }
   if(operation==='inspect'){
    if(args.url!==wc.getURL())throw new Error('页面已变化，请重新读取')
    if(typeof args.selector!=='string'||!args.selector.trim()||args.selector.length>500)throw new Error('CSS 选择器无效')
@@ -120,7 +150,7 @@ export class InternalBrowser{
    })()`}]))
    signal.throwIfAborted()
    if(!this.automationEnabled||wc.getURL()!==url||this.snapshotToken!==token)throw new Error('页面已变化，请重新读取')
-   return {snapshot:token,...result}
+   return {snapshot:token,...result,pageErrors:[...this.pageErrors],note:'文字、元素和 canvas 尺寸不是画面内容。pageErrors 仅记录本次导航以来捕获的控制台错误；FPS 单次读数不代表性能验收通过。'}
   }
   if(!['click','fill','select_option'].includes(operation))throw new Error('不支持的浏览器操作')
   if(typeof args.snapshot!=='string'||args.snapshot!==this.snapshotToken||!this.snapshotToken||wc.getURL()!==this.snapshotUrl||args.url!==this.snapshotUrl)throw new Error('网页快照已失效，请重新读取网页')

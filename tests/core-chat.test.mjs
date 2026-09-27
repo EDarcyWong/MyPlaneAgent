@@ -8,6 +8,312 @@ import { runCoreChat, chatApprovalRequired, chatCapabilityAllowed } from '../dis
 import { estimateTokens } from '../dist-electron/main/local-ai-context.js'
 import { AgentCoreService } from '../dist-electron/main/agent/agent-core-service.js'
 import {execFileSync} from 'node:child_process'
+import {beginOperation,operationKey,journalRequired} from '../dist-electron/main/agent/core/operation-journal.js'
+import {StaticPreview} from '../dist-electron/main/agent/static-preview.js'
+import {CapabilityRegistry} from '../dist-electron/main/agent/core/capability-registry.js'
+import {enqueueReviewActions} from '../dist-electron/main/agent/core/review-dispatch.js'
+import {runTaskPlan,parseTaskItems} from '../dist-electron/main/agent/core/task-plan-runner.js'
+import {weatherDate} from '../dist-electron/main/agent/core/weather-workflow.js'
+import {createTaskScope} from '../dist-electron/shared/task-scope.js'
+
+test('read-only weather task does not expose unrelated project diagnostics',()=>{
+ const diagnostic=capability('agent.get_diagnostics','read')
+ assert.equal(chatCapabilityAllowed(diagnostic,{filesEnabled:true,webEnabled:true,taskScope:createTaskScope('成都市明天下雨吗')}),false)
+ assert.equal(chatCapabilityAllowed(diagnostic,{filesEnabled:true,webEnabled:true,taskScope:createTaskScope('修复天气代码并检查类型')}),true)
+})
+
+test('successful general weather lookup learns source method instead of tool sequence',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'weather-learning-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.weather.run=async()=>false
+ let reads=0,outcome
+ service.capabilityRegistry.registerBuiltin({...capability('agent.web_fetch','read'),runtime:'builtin',parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}},async args=>{reads++;return {url:args.url,text:`上海 ${weatherDate('明天','Asia/Shanghai',new Date())} 天气预报 20℃`}})
+ await withModel(input=>reads?{content:'已取得上海明天的天气预报。'}:toolCall(input,'agent.web_fetch',{url:'https://weather.example/shanghai?private=123'}),async connection=>{
+  await service.runConversation(options(connection,{workspace,approvalMode:'full',messages:[{role:'user',content:'上海明天天气'}],onOutcome:value=>outcome=value}))
+ })
+ assert.equal(outcome,'complete');assert.equal(reads,1)
+ const entries=service.experienceState().entries
+ assert.equal(entries.length,1);assert.equal(entries[0].recipe.kind,'weather-web');assert.equal(entries[0].recipe.sourceHost,'weather.example');assert.equal(entries[0].enabled,false)
+ assert.doesNotMatch(JSON.stringify(entries),/private|shanghai|20℃/)
+})
+
+test('weather conversation uses learned source with fresh city and date before builtin provider',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'weather-method-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.experiences.record('上海明天天气',workspace,['browser.open','browser.read_page','agent.web_fetch','agent.web_fetch'],true,undefined,'validation','weather.example')
+ const entry=service.experienceState().entries[0],calls=[]
+ service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
+ service.weather.run=async()=>{throw new Error('learned source must take precedence')}
+ service.capabilityRegistry.registerBuiltin({...capability('agent.web_search','read'),runtime:'builtin',parameters:{type:'object',properties:{query:{type:'string'},limit:{type:'number'}},required:['query']}},async args=>{calls.push(args.query);return {results:[{title:'北京天气预报',url:'https://weather.example/beijing'}]}})
+ service.capabilityRegistry.registerBuiltin({...capability('agent.web_fetch','read'),runtime:'builtin',parameters:{type:'object',properties:{url:{type:'string'},maxCharacters:{type:'number'}},required:['url']}},async args=>{calls.push(args.url);return {url:args.url,text:`北京 ${weatherDate('明天','Asia/Shanghai',new Date())} 天气预报 20℃`}})
+ let outcome
+ await withModel(()=>({content:'已查询北京最新天气预报。'}),async connection=>{
+  await service.runConversation(options(connection,{workspace,approvalMode:'full',messages:[{role:'user',content:'北京明天天气'}],onOutcome:value=>outcome=value}))
+ })
+ assert.equal(outcome,'complete');assert.equal(calls.length,2);assert.match(calls[0],/北京.*site:weather\.example/)
+ assert.equal(calls[1],'https://weather.example/beijing')
+ assert.equal(service.experienceState().entries.length,1);assert.equal(service.experiences.get(entry.id).successes,2)
+})
+
+const screenshotCapability={name:'browser.screenshot',description:'screenshot',category:'browser',source:{type:'builtin'},runtime:'builtin',permissions:['network'],tags:['requires-approval','risk:high'],parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}}
+const screenshotResult=()=>({success:true,output:{url:'http://localhost:8080/',width:100,height:100,capturedAt:new Date().toISOString(),image:{name:'screenshot.jpg',dataUrl:'data:image/jpeg;base64,/9j/2Q=='}}})
+const visualStep={title:'确认门头玻璃',acceptance:'正面视角下大门上方可见玻璃墙而非实墙'}
+
+test('unfinished edits regain control before pending browser checks and only then ask for visual confirmation',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-implement-first-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ writeFileSync(path.join(workspace,'door.js'),'const glass = "plain"')
+ const write={...screenshotCapability,name:'agent.write_file',source:{type:'skill',skillId:'agent-tools'},parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
+ const queue={revision:0,checks:[]},action={title:'截图确认花纹',capability:'browser.screenshot',args:{url:'http://localhost:8080/'},basis:'玻璃门添加花纹',required:true}
+ enqueueReviewActions(queue,[action]);const executed=[],snapshots=[];let turns=0,outcome
+ await withModel(input=>{
+  turns++
+  if(turns===1){assert.ok(!input.tools.some(tool=>tool.function.description.startsWith('browser.screenshot:')));return {content:'还未修改代码，请先截图'}}
+  if(!executed.includes('agent.write_file'))return toolCall(input,'agent.write_file',{path:'door.js',content:'const glass = "striped"'})
+  return {content:'实现已写入，待核验画面'}
+ },async connection=>{
+  await runCoreChat({list:()=>[write,screenshotCapability],execute:async request=>{
+   executed.push(request.capability)
+   if(request.capability==='agent.write_file'){writeFileSync(path.join(workspace,request.args.path),request.args.content);return {success:true,output:{changed:true}}}
+   return screenshotResult()
+  }},options(connection,{workspace,filesEnabled:true,approvalMode:'full',currentStep:{title:'为玻璃门添加花纹',acceptance:'玻璃门画面显示花纹且开合正常'},taskScope:{goal:'玻璃门添加花纹',kind:'general',required:['添加花纹'],optional:[]},reviewQueue:queue,onReviewQueue:()=>snapshots.push(structuredClone(queue)),imageCapability:'unsupported',onOutcome:value=>outcome=value}))
+ },()=>({content:JSON.stringify(!executed.includes('agent.write_file')?{status:'continue',reason:'源码中没有花纹',nextStep:'写入花纹实现',implementation:{status:'missing',evidenceIds:[]},missingEvidence:['花纹未实现'],actions:[action]}:!executed.includes('browser.screenshot')?{status:'continue',reason:'实现已写入，需要截图',nextStep:'截图',actions:[action]}:{status:'needs_input',reason:'画面需要人工确认',missingEvidence:['花纹视觉效果']})}))
+ assert.deepEqual(executed,['agent.write_file','browser.screenshot'])
+ assert.match(readFileSync(path.join(workspace,'door.js'),'utf8'),/striped/)
+ assert.equal(outcome,'needs_input');assert.equal(queue.phase,'verify')
+ assert.ok(snapshots.some(value=>value.phase==='implement'&&value.checks[0].status==='deferred'))
+})
+
+test('missing implementation cannot be replaced by screenshots or a false completion claim',async()=>{
+ let outcome,text='',calls=0
+ await withModel(()=>({content:'代码已落盘，可以确认'}),async connection=>{
+  await runCoreChat({list:()=>[screenshotCapability],execute:async()=>{calls++;return screenshotResult()}},options(connection,{filesEnabled:true,approvalMode:'full',currentStep:{title:'为玻璃门添加花纹',acceptance:'画面显示花纹'},imageCapability:'unsupported',onOutcome:value=>outcome=value,onContent:value=>text+=value}))
+ },()=>({content:JSON.stringify({status:'complete',reason:'没有代码修改证据',implementation:{status:'missing',evidenceIds:[]},missingEvidence:['花纹未实现'],actions:[{title:'截图',capability:'browser.screenshot',args:{url:'http://localhost:8080/'},basis:'添加花纹',required:true}]})}))
+ assert.equal(calls,0);assert.equal(outcome,'blocked');assert.match(text,/未落实代码修改/);assert.doesNotMatch(text,/请查看下方验收卡片/)
+})
+
+test('existing implementation can be verified using actual source evidence without unnecessary writes',async()=>{
+ const read={...screenshotCapability,name:'agent.read_file',source:{type:'skill',skillId:'agent-tools'},parameters:{type:'object',properties:{path:{type:'string'}}}}
+ let calls=0,outcome
+ await withModel(input=>calls?{content:'源码已存在所需功能，无需重复写入'}:toolCall(input,'agent.read_file',{path:'door.js'}),async connection=>{
+  await runCoreChat({list:()=>[read],execute:async()=>{calls++;return {success:true,output:{text:'const glass = "striped"'}}}},options(connection,{filesEnabled:true,approvalMode:'full',currentStep:{title:'添加门花纹代码',acceptance:'door.js 包含花纹实现',implementationPaths:['door.js']},onOutcome:value=>outcome=value}))
+ },input=>({content:JSON.stringify({status:'complete',reason:'源码已经实现',implementation:{status:'present',evidenceIds:input.messages.filter(message=>message.role==='tool').map(message=>JSON.parse(message.content).activityId)}})}))
+ assert.equal(calls,1);assert.equal(outcome,'complete')
+})
+
+test('structured completion checks are executed by the host through ordinary approval and saved',async()=>{
+ const read={...screenshotCapability,name:'agent.read_file',source:{type:'skill',skillId:'agent-tools'},parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
+ for(const approved of [true,false]){
+  const queue={revision:0,checks:[]},saved=[];let executions=0,outcome,approvals=0
+  const action={title:'核对入口',capability:'agent.read_file',args:{path:'index.html'},basis:'读取入口文件',required:true}
+  await withModel(()=>({content:'准备核验入口'}),async connection=>{
+   await runCoreChat({list:()=>[read],execute:async()=>{executions++;return {success:true,output:{text:'<html>入口</html>'}}}},options(connection,{filesEnabled:true,taskScope:{goal:'读取入口文件',kind:'general',required:['读取入口文件'],optional:[]},reviewQueue:queue,onReviewQueue:()=>saved.push(structuredClone(queue)),approve:async()=>{approvals++;return approved},onOutcome:value=>outcome=value}))
+  },()=>({content:JSON.stringify(executions?{status:'complete',reason:'已读取入口'}:{status:'continue',reason:'需要实际读取',nextStep:'读取入口',actions:[action]})}))
+  assert.equal(approvals,1);assert.equal(executions,approved?1:0);assert.equal(outcome,approved?'complete':'blocked')
+  assert.ok(saved.some(value=>value.checks[0]?.status==='running'))
+  assert.equal(queue.checks[0].status,approved?'complete':'failed')
+ }
+})
+
+test('failed scheduled checks stop after two actual attempts, not two prose reviews',async()=>{
+ const read={...screenshotCapability,name:'agent.read_file',source:{type:'skill',skillId:'agent-tools'},parameters:{type:'object',properties:{path:{type:'string'}}}}
+ const queue={revision:0,checks:[]};let executions=0,outcome
+ const action={title:'读取入口',capability:'agent.read_file',args:{path:'missing.html'},basis:'读取入口',required:true}
+ await withModel(()=>({content:'准备读取'}),async connection=>{
+  await runCoreChat({list:()=>[read],execute:async()=>{executions++;return {success:false,output:'文件不存在'}}},options(connection,{filesEnabled:true,approvalMode:'full',reviewQueue:queue,onOutcome:value=>outcome=value}))
+ },()=>({content:JSON.stringify({status:'continue',reason:'还需入口证据',nextStep:'读取入口',actions:[action]})}))
+ assert.equal(executions,2);assert.equal(queue.checks[0].attempts,2);assert.equal(outcome,'blocked')
+})
+
+test('truncated review actions are discarded even when their JSON looks complete',async()=>{
+ let executions=0,outcome
+ await withModel(()=>({content:'准备核验'}),async connection=>{
+  await runCoreChat({list:()=>[screenshotCapability],execute:async()=>{executions++;return screenshotResult()}},options(connection,{onOutcome:value=>outcome=value}))
+ },()=>({finish_reason:'length',content:JSON.stringify({status:'continue',reason:'截图',nextStep:'截图',actions:[{title:'截图',capability:'browser.screenshot',args:{url:'http://localhost/'},basis:'截图',required:true}]})}))
+ assert.equal(executions,0);assert.equal(outcome,'blocked')
+})
+
+test('open-project acceptance does not grow into variant or performance testing after main-page evidence',async()=>{
+ const caps=['preview.status','browser.read_page'].map(name=>({...screenshotCapability,name,parameters:{type:'object',properties:{}}}))
+ let index=0,outcome,review,content=''
+ await withModel(input=>index<caps.length?toolCall(input,caps[index++].name,{}):{content:'主入口已打开，但还想测试变体与性能'},async connection=>{
+  await runCoreChat({list:()=>caps,execute:async request=>({success:true,output:request.capability==='preview.status'?{status:'running',url:'http://127.0.0.1:5000/'}:{url:'http://127.0.0.1:5000/',title:'项目',text:'主页面内容',pageErrors:[]}})},options(connection,{filesEnabled:true,approvalMode:'full',taskScope:{goal:'打开项目',kind:'open-preview',required:['主入口加载'],optional:['性能']},currentStep:{title:'核对整体任务结果',acceptance:'执行必要的集成验证'},onOutcome:value=>outcome=value,onCompletionReview:value=>review=value,onContent:value=>content+=value}))
+ },()=>({content:JSON.stringify({status:'continue',reason:'还需覆盖更多页面',nextStep:'继续测试',missingEvidence:['index2.html 变体页','性能 FPS 采样']})}))
+ assert.equal(index,2);assert.equal(outcome,'complete');assert.equal(review.optionalChecks.length,2);assert.deepEqual(review.missingEvidence,[]);assert.match(content,/主入口已打开/)
+})
+
+test('browser screenshots are delivered as images after all tool replies, with compact stored metadata',async()=>{
+ const activities=[];let outcome,approvalCount=0
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ await withModel((input,n)=>{
+  if(n!==1)return {content:'已根据实际画面核验玻璃'}
+  const shot=toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}),page=toolCall(input,'browser.read_page',{})
+  page.tool_calls[0].id='page-call';shot.tool_calls.push(...page.tool_calls);return shot
+ },async(connection,requests)=>{
+  await runCoreChat({list:()=>[screenshotCapability,read],execute:async request=>request.capability==='browser.screenshot'?screenshotResult():{success:true,output:{canvas:{width:100,height:100}}}},options(connection,{currentStep:visualStep,imageCapability:'supported',onActivity:a=>activities.push(a),onOutcome:value=>outcome=value,approve:async()=>{approvalCount++;return true}}))
+  const execution=requests[1],lastTool=Math.max(...execution.messages.map((m,i)=>m.role==='tool'?i:-1))
+  const imageIndex=execution.messages.findIndex(m=>Array.isArray(m.content)&&m.content.some(part=>part.type==='image_url'))
+  assert.ok(imageIndex>lastTool)
+  assert.equal(execution.messages.filter(m=>m.role==='tool').length,2)
+  const review=requests.at(-1)
+  assert.ok(review.messages.some(m=>Array.isArray(m.content)&&m.content.some(part=>part.type==='image_url')))
+  assert.equal(outcome,'complete');assert.equal(approvalCount,2)
+  const shot=activities.find(a=>a.capability==='browser.screenshot'&&a.status==='complete')
+  assert.equal(shot.images.length,1);assert.equal(JSON.parse(shot.output).visualInput,true)
+  assert.ok(!shot.output.includes('base64'))
+ })
+})
+
+test('text-only model retains screenshot for the user and waits instead of certifying visual success',async()=>{
+ let outcome,text='',review;const activities=[]
+ await withModel((input,n)=>n===1?toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}):{content:'我已经看图，全部通过'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[screenshotCapability],execute:async()=>screenshotResult()},options(connection,{currentStep:visualStep,imageCapability:'unsupported',approvalMode:'full',onActivity:a=>activities.push(a),onOutcome:value=>outcome=value,onContent:value=>text+=value,onCompletionReview:value=>review=value}))
+  assert.equal(outcome,'needs_input');assert.match(text,/不支持图片识别/);assert.doesNotMatch(text,/全部通过/)
+  assert.equal(review.missingEvidence.length,1)
+  assert.ok(requests.every(request=>request.messages.every(m=>!Array.isArray(m.content)||m.content.every(part=>part.type!=='image_url'))))
+  assert.equal(activities.at(-1).images.length,1);assert.equal(JSON.parse(activities.at(-1).output).visualInput,false)
+  assert.equal(requests.length,3)
+ })
+})
+
+test('a file or canvas assertion cannot stand in for a screenshot even when reviewer says complete',async()=>{
+ let outcome,text=''
+ await withModel(()=>({content:'canvas 宽高正常，玻璃已通过'}),async(connection,requests)=>{
+  await runCoreChat({list:()=>[screenshotCapability],execute:async()=>assert.fail()},options(connection,{currentStep:visualStep,imageCapability:'supported',onOutcome:value=>outcome=value,onContent:value=>text+=value}))
+  assert.equal(outcome,'blocked');assert.match(text,/尚无.*画面/);assert.equal(requests.length,4)
+ })
+})
+
+test('explicit task-specific human visual confirmation permits the remaining completion review',async()=>{
+ let outcome
+ await withModel(()=>({content:'用户已确认本项视觉效果，其他条件已核验'}),async connection=>{
+  await runCoreChat({list:()=>[],execute:async()=>assert.fail()},options(connection,{currentStep:visualStep,imageCapability:'unsupported',messages:[{role:'user',content:'确认「确认门头玻璃」视觉验收通过'}],onOutcome:value=>outcome=value}))
+ })
+ assert.equal(outcome,'complete')
+})
+
+test('validated card acceptance confirms only the current visual evidence and expires after a page change',async()=>{
+ for(const change of [false,true]){
+  let outcome
+  const click={...screenshotCapability,name:'browser.click'}
+  await withModel((input,n)=>change&&n===1?toolCall(input,'browser.click',{url:'http://localhost:8080/'}):{content:'已核验'},async connection=>{
+   await runCoreChat({list:()=>[click],execute:async()=>({success:true,output:{performed:true}})},options(connection,{currentStep:{...visualStep,visualConfirmed:true},imageCapability:'unsupported',approvalMode:'full',messages:[{role:'user',content:'视觉效果符合要求，请核验其余条件'}],onOutcome:value=>outcome=value}))
+  })
+  assert.equal(outcome,change?'needs_input':'complete')
+ }
+})
+
+test('completion with declared missing evidence cannot certify success',async()=>{
+ let outcome,review
+ await withModel(()=>({content:'通过'}),async connection=>{
+  await runCoreChat({list:()=>[],execute:async()=>assert.fail()},options(connection,{onOutcome:value=>outcome=value,onCompletionReview:value=>review=value}))
+ },()=>({content:JSON.stringify({status:'complete',reason:'完成',missingEvidence:['尚未取得测试结果']})}))
+ assert.equal(outcome,'blocked');assert.deepEqual(review.missingEvidence,['尚未取得测试结果'])
+})
+
+test('changing the browser view invalidates earlier visual evidence',async()=>{
+ let outcome
+ const click={...screenshotCapability,name:'browser.click'}
+ await withModel((input,n)=>n===1?toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}):n===2?toolCall(input,'browser.click',{url:'http://localhost:8080/'}):{content:'通过'},async connection=>{
+  await runCoreChat({list:()=>[screenshotCapability,click],execute:async request=>request.capability==='browser.screenshot'?screenshotResult():{success:true,output:{performed:true}}},options(connection,{currentStep:visualStep,imageCapability:'supported',approvalMode:'full',onOutcome:value=>outcome=value}))
+ })
+ assert.equal(outcome,'blocked')
+})
+
+test('fresh screenshot timestamps do not manufacture new progress for identical pixels',async()=>{
+ let calls=0,outcome
+ await withModel(input=>toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}),async connection=>{
+  await runCoreChat({list:()=>[screenshotCapability],execute:async()=>{calls++;return screenshotResult()}},options({...connection,contextLength:32768},{approvalMode:'full',imageCapability:'supported',onOutcome:value=>outcome=value}))
+ })
+ assert.equal(calls,7);assert.equal(outcome,'blocked')
+})
+
+test('resumed chat can reuse an already recorded preview and complete with its actual URL',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-preview-')),service=new StaticPreview()
+ t.after(async()=>{await service.dispose();rmSync(workspace,{recursive:true,force:true})})
+ writeFileSync(path.join(workspace,'index.html'),'live preview')
+ await service.configure(true)
+ const registry=new CapabilityRegistry({getAllTools:()=>[]});service.register(registry)
+ const live=await service.start(workspace,undefined,new AbortController().signal)
+ const journal={[operationKey('task',workspace,'preview.start',{})]:{status:'succeeded',updatedAt:new Date().toISOString()}}
+ let outcome,approvals=0;const activities=[]
+ await withModel((input,n)=>n===1?toolCall(input,'preview.start',{}):{content:'预览服务 URL 已取得：'+live.url},async connection=>{
+  await runCoreChat(registry,options(connection,{workspace,filesEnabled:true,approvalMode:'ask',currentStep:{title:'启动静态预览服务并取得访问 URL',acceptance:'取得实际服务 URL'},
+   beforeExecution:(cap,args)=>journalRequired(cap,args)?beginOperation(journal,operationKey('task',workspace,cap.name,args),()=>{}):undefined,
+   approve:async()=>{approvals++;return true},onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value
+  }))
+ })
+ assert.equal(outcome,'complete');assert.equal(approvals,1,'normal approval still applies')
+ const result=JSON.parse(activities.find(activity=>activity.status==='complete').output)
+ assert.equal(result.reused,true);assert.equal(result.url,live.url)
+ assert.equal(await(await fetch(result.url)).text(),'live preview')
+})
+
+test('pre-change hook runs after authorization and blocks mutation before journaling',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-preflight-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ for(const approved of [false,true]){
+  const order=[]
+  await withModel(input=>input.tools?toolCall(input,'agent.run_command',{query:'change'}):{content:'操作未执行'},async connection=>{
+   await runCoreChat({list:()=>[capability('agent.run_command')],execute:async()=>assert.fail('blocked preflight must not execute')},options(connection,{workspace,filesEnabled:true,
+    approve:async()=>{order.push('approval');return approved},beforeMutation:async()=>{order.push('baseline');return '基线权限受阻'},beforeExecution:()=>assert.fail('no started marker before preflight succeeds')
+   }))
+  })
+  assert.deepEqual(order,approved?['approval','baseline']:['approval'])
+ }
+})
+
+test('nonzero verification exit code yields to the bounded scheduler immediately',async()=>{
+ let executions=0,failures=0,outcome
+ await withModel(input=>toolCall(input,'agent.run_test',{query:'test'}),async connection=>{
+  await runCoreChat({list:()=>[capability('agent.run_test')],execute:async()=>{executions++;return {success:true,output:{exitCode:1,output:'assertion failed'}}}},options(connection,{
+   filesEnabled:true,approvalMode:'full',currentStep:{title:'修复',acceptance:'测试通过'},
+   onVerificationFailure:activity=>{failures++;assert.equal(activity.status,'error')},onOutcome:value=>outcome=value
+  }))
+ })
+ assert.equal(executions,1);assert.equal(failures,1);assert.equal(outcome,'blocked')
+})
+
+test('three unchanged edits stop despite varied arguments and successful reads between them',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-unchanged-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ let edits=0,reads=0,outcome,content=''
+ const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
+ await withModel((input,n)=>n%2?toolCall(input,'agent.write_file',{path:'./'.repeat(n)+'same.txt',content:'same'}):toolCall(input,'agent.read_file',{query:'read-'+n}),async connection=>{
+  await runCoreChat({list:()=>[write,capability('agent.read_file','read')],execute:async request=>request.capability==='agent.write_file'?(edits++,{success:true,output:{status:'unchanged',changed:false,paths:[],unchangedPaths:[request.args.path]}}):(reads++,{success:true,output:'read evidence '+reads})},options(connection,{workspace,approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value,onContent:value=>content+=value}))
+ })
+ assert.equal(edits,3);assert.equal(reads,2);assert.equal(outcome,'blocked');assert.match(content,/没有内容变化/)
+})
+
+test('command timing and timeout variations are not fresh evidence',async()=>{
+ let executions=0,outcome
+ await withModel((input,n)=>toolCall(input,'agent.run_command',{query:'same command '+n}),async connection=>{
+  await runCoreChat({list:()=>[capability('agent.run_command')],execute:async()=>({success:true,output:{exitCode:0,output:'unchanged',durationMs:++executions}})},options(connection,{approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value}))
+ })
+ assert.equal(executions,7);assert.equal(outcome,'blocked')
+})
+
+test('completion review is scoped to the scheduled item, not the entire original request',async()=>{
+ let reviewSeen=false
+ await withModel(()=>({content:'读取完成，文件内容已核对'}),async connection=>{
+  await runCoreChat({list:()=>[],execute:()=>assert.fail()},options(connection,{currentStep:{title:'读取文件',acceptance:'确认当前内容'}}))
+ },input=>{
+  reviewSeen=true;const systems=input.messages.filter(m=>m.role==='system').map(m=>m.content).join('\n')
+  assert.match(systems,/当前项已满足条件即可 complete/);assert.match(systems,/确认当前内容/)
+  return {content:JSON.stringify({status:'complete',reason:'当前项完成',nextStep:''})}
+ })
+ assert.equal(reviewSeen,true)
+})
+
+test('execution journal stops repeated successful commands before executing them again',async()=>{
+ const journal={};let executions=0,outcome
+ await withModel(input=>toolCall(input,'agent.run_command',{query:'command'}),async connection=>{
+  await runCoreChat({list:()=>[capability('agent.run_command')],execute:async()=>{executions++;return {success:true,output:'done'}}},options(connection,{
+   approvalMode:'full',filesEnabled:true,webEnabled:true,
+   beforeExecution:(cap,args)=>beginOperation(journal,operationKey('task','workspace',cap.name,args),()=>{}),
+   afterExecution:(cap,args,success)=>{journal[operationKey('task','workspace',cap.name,args)].status=success?'succeeded':'failed'},
+   onOutcome:value=>outcome=value
+  }))
+ })
+ assert.equal(executions,1);assert.equal(outcome,'blocked')
+})
 
 const capability = (name, risk = 'high') => ({name,category:'agent',description:name,parameters:{type:'object',properties:{query:{type:'string'}},required:['query']},source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',permissions:['network'],tags:risk==='read'?[]:['requires-approval',`risk:${risk}`]})
 async function withModel(call, work, reviewCall) {
@@ -72,6 +378,31 @@ test('small-step recovery constrains schemas and rejects oversized complete argu
  })
 })
 
+test('recovery processes complete multiple calls sequentially without replay and keeps per-call argument guards',async()=>{
+ const executed=[],progress=[];let running=0,outcome
+ await withModel((input,n)=>{
+  if(n===1)return {content:'partial',finish_reason:'length'}
+  if(n===2){
+   const calls=['first','second','x'.repeat(2049)].map((query,i)=>({...toolCall(input,'agent.web_search',{query}).tool_calls[0],id:'batch-'+i}))
+   return {content:null,tool_calls:calls}
+  }
+  if(n===3)return toolCall(input,'agent.web_search',{query:'corrected'})
+  return {content:'所有结果已核对'}
+ },async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{
+   assert.equal(running,0,'execution is sequential');running++
+   await new Promise(resolve=>setTimeout(resolve,5))
+   executed.push(request.args.query);running--;return {success:true,output:{query:request.args.query}}
+  }},options(connection,{approvalMode:'full',onProgress:text=>progress.push(text),onOutcome:value=>outcome=value}))
+  assert.deepEqual(executed,['first','second','corrected'])
+  assert.equal(outcome,'complete')
+  assert.ok(progress.some(text=>text.includes('逐个校验并顺序处理')))
+  const replies=requests[2].messages.filter(m=>m.role==='tool')
+  for(const id of ['batch-0','batch-1','batch-2'])assert.equal(replies.filter(m=>m.tool_call_id===id).length,1)
+  assert.ok(replies.find(m=>m.tool_call_id==='batch-2').content.includes('2048'))
+ })
+})
+
 test('truncation diagnostics distinguish reasoning from tool arguments',async()=>{
  let content=''
  await withModel(()=>({content:'',reasoning_content:'r'.repeat(100),finish_reason:'length'}),async(connection)=>{
@@ -113,6 +444,17 @@ test('research handoff is corrected into a page read; failed text fetch can use 
   assert.ok(requests[1].messages.some(m=>m.role==='system'&&m.content.includes('把已授权的查询交回用户')))
   assert.ok(requests[0].messages.some(m=>m.role==='system'&&m.content.includes('不得从“晴”推断精确降雨概率')))
  })
+})
+
+test('guessed encyclopedia entry is redirected to search while explicit encyclopedia requests remain allowed',async()=>{
+ for(const explicit of [false,true]){
+  const calls=[]
+  const fetchCapability={...capability('agent.web_fetch'),parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}}
+  await withModel((input,n)=>n===1?toolCall(input,'agent.web_fetch',{url:'https://baike.baidu.com/item/example'}):!explicit&&n===2?toolCall(input,'agent.web_search',{query:'上海明天天气'}):{content:'已核对来源'},async connection=>{
+   await runCoreChat({list:()=>[capability('agent.web_search'),fetchCapability],execute:async request=>{calls.push(request.capability);return {success:true,output:'来源资料'}}},options(connection,{messages:[{role:'user',content:explicit?'请查百度百科中的上海词条':'搜索上海明天天气'}],approvalMode:'full'}))
+  })
+  assert.deepEqual(calls,[explicit?'agent.web_fetch':'agent.web_search'])
+ }
 })
 
 test('stale network denial in continued history is corrected with actual tool names before review',async()=>{
@@ -317,8 +659,8 @@ test('repeated incomplete responses stop at a bounded continuation limit',async(
   await withModel(()=>({content:'稍后处理'}),async(connection,requests)=>{
     let text='',outcome
     await runCoreChat({list:()=>[],execute:async()=>{}},options(connection,{onContent:value=>text+=value,onOutcome:value=>outcome=value}))
-    assert.equal(outcome,'blocked');assert.match(text,/仍未取得新执行结果/)
-    assert.equal(requests.length,10)
+    assert.equal(outcome,'blocked');assert.match(text,/连续两次完成检查没有获得新的执行证据/)
+    assert.equal(requests.length,4)
   },()=>({content:JSON.stringify({status:'continue',reason:'未完成',nextStep:'执行搜索'})}))
 })
 
@@ -459,4 +801,151 @@ test('stalled execution reports the concrete tool failure',async()=>{
   await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>({success:false,error:'连接失败'})},options({...connection,contextLength:131072},{onContent:value=>text+=value}))
   assert.match(text,/最近一次工具失败：agent.web_search/);assert.match(text,/连接失败/)
  })
+})
+
+test('full approval takes effect before later waiting events and model requests',async()=>{
+ let mode='ask',approvals=0;const activities=[],executed=[]
+ await withModel((input,n)=>n<=3?toolCall(input,'agent.web_search',{query:'query-'+n}):{content:'已完成'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{executed.push(request.args.query);return {success:true,output:'结果 '+request.args.query}}},options(connection,{
+   getApprovalMode:()=>mode,onActivity:activity=>activities.push({...activity}),
+   approve:async()=>{approvals++;mode='full';return true}
+  }))
+  assert.equal(approvals,1)
+  assert.equal(activities.filter(a=>a.status==='waiting').length,1)
+  assert.equal(executed.length,3)
+  assert.ok(requests[1].messages.some(m=>m.role==='system'&&String(m.content).includes('权限模式：full。')))
+ })
+})
+
+test('saved task items continue past the former sixteen-round cap and complete with evidence',async()=>{
+ let executed=0,outcome;const saved=[]
+ const plan={taskId:'round-regression',workspace:tmpdir(),items:parseTaskItems(JSON.stringify({steps:[{title:'核验交互',acceptance:'取得全部检查证据'}]})),updatedAt:''}
+ await withModel((input,n)=>n<=25?toolCall(input,'agent.web_search',{query:'step '+n}):{content:'全部检查完成'},async connection=>{
+  const registry={list:()=>[capability('agent.web_search')],execute:async()=>({success:true,output:'evidence '+ ++executed})}
+  await runTaskPlan(options({...connection,contextLength:131072},{onOutcome:value=>outcome=value}),{taskId:plan.taskId,plan,save:value=>saved.push(structuredClone(value))},step=>runCoreChat(registry,step))
+ })
+ assert.equal(executed,25);assert.equal(outcome,'complete')
+ assert.equal(saved.at(-1).items[0].status,'complete')
+ assert.equal(saved.at(-1).items[0].evidenceIds.length,25)
+})
+
+test('remembered operations bypass waiting while changed arguments still prompt',async()=>{
+ const activities=[];let approvals=0
+ await withModel((input,n)=>n<=2?toolCall(input,'agent.web_search',{query:n===1?'remembered':'changed'}):{content:'完成'},async connection=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>({success:true,output:'结果'})},options(connection,{
+   approvalGranted:activity=>activity.args.query==='remembered',onActivity:a=>activities.push({...a}),approve:async()=>{approvals++;return true}
+  }))
+  assert.equal(approvals,1)
+  assert.deepEqual(activities.filter(a=>a.status==='waiting').map(a=>a.args.query),['changed'])
+ })
+})
+
+test('experience flow executes through normal chat permissions and reports actual checks',async t=>{
+ const {ExperienceFlow}=await import('../dist-electron/main/agent/core/experience-flow.js')
+ const {ExperienceStore}=await import('../dist-electron/main/agent/core/experience-store.js')
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-chat-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const store=new ExperienceStore(workspace);store.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
+ const entry=store.state().entries[0],query='搜索 Vue 文档'
+ const search=capability('agent.web_search','read')
+ const fetch={...capability('agent.web_fetch','read'),parameters:{type:'object',properties:{url:{type:'string'},maxCharacters:{type:'number'}},required:['url']}}
+ for(const allowed of [false,true]){
+  const flow=new ExperienceFlow(entry,{query:'Vue 文档'},workspace),executions=[],progress=[];let approvals=0
+  await withModel(()=>({content:allowed?'Vue 文档已读取。':'操作被拒绝。'}),async connection=>{
+   await runCoreChat({list:()=>[search,fetch],execute:async request=>{
+    executions.push(request.capability)
+    return {success:true,output:request.capability==='agent.web_search'?{results:[{title:'Vue 文档',url:'https://vuejs.org/guide'}]}:{url:'https://vuejs.org/guide',text:'Vue 文档 Composition API'}}
+   }},options(connection,{workspace,messages:[{role:'user',content:query}],experienceFlow:flow,approve:async()=>{approvals++;return allowed},onProgress:message=>progress.push(message)}))
+  })
+  assert.equal(approvals,allowed?2:1)
+  assert.deepEqual(executions,allowed?['agent.web_search','agent.web_fetch']:[])
+  assert.equal(flow.passed,allowed)
+  assert.ok(progress.some(message=>message.includes(allowed?'本次检查通过':'本次检查未通过')))
+ }
+})
+test('conversation adopts verified file recipe before asking the model and preserves use evidence',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-service-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ writeFileSync(path.join(workspace,'README.md'),'Current file evidence.')
+ const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.experiences.record('读取 README.md',workspace,['agent.read_file'],true)
+ const entry=service.experienceState().entries[0]
+ service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
+ service.capabilityRegistry.registerBuiltin({...capability('agent.read_file','read'),runtime:'builtin',parameters:{type:'object',properties:{path:{type:'string'},startLine:{type:'number'},endLine:{type:'number'}},required:['path']}},async args=>({path:args.path,text:readFileSync(path.join(workspace,args.path),'utf8')}))
+ let saved;const progress=[]
+ await withModel(input=>{assert.ok(input.messages.some(m=>m.role==='tool'&&String(m.content).includes('Current file evidence')));return {content:'Current file evidence.'}},async connection=>{
+  const query='读取 README.md'
+  await service.runConversation(options(connection,{workspace,filesEnabled:true,webEnabled:false,messages:[{role:'user',content:query}],planExecution:{taskId:'recipe',goal:query,save:value=>saved=value},onProgress:message=>progress.push(message)}))
+ })
+ assert.equal(saved.items[0].status,'complete');assert.ok(saved.items[0].evidenceIds.length)
+ assert.equal(service.experienceState().entries[0].uses,1)
+ assert.ok(progress.some(message=>message.includes('采用经验流程')))
+ assert.equal(service.experienceState().entries[0].enabled,true)
+})
+
+test('conversation recovers failed recipe pages without learning duplicate or failed tool traces',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-fallback-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
+ const entry=service.experienceState().entries[0]
+ service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
+ const calls=[],progress=[]
+ service.capabilityRegistry.registerBuiltin({...capability('agent.web_search','read'),runtime:'builtin'},async()=>({results:[{title:'Vue 文档',url:'https://example.org/broken'},{title:'Vue 文档',url:'https://example.org/guide'}]}))
+ service.capabilityRegistry.registerBuiltin({...capability('agent.web_fetch','read'),runtime:'builtin',parameters:{type:'object',properties:{url:{type:'string'},maxCharacters:{type:'number'}},required:['url']}},async args=>{calls.push(args.url);if(args.url.endsWith('broken'))throw new Error('offline');return {url:args.url,text:'Vue 文档的完整说明'}})
+ let outcome
+ await withModel(input=>{return {content:'已取得 Vue 文档说明。'}},async connection=>{
+  await service.runConversation(options(connection,{workspace,approvalMode:'full',messages:[{role:'user',content:'搜索 Vue 文档'}],onOutcome:value=>outcome=value,onProgress:message=>progress.push(message)}))
+ })
+ assert.equal(outcome,'complete',JSON.stringify({calls,progress}));assert.equal(calls.length,2,JSON.stringify({calls,progress}))
+ assert.ok(progress.some(message=>message.includes('下一条')))
+ assert.equal(service.experienceState().entries.length,1)
+ const current=service.experienceState().entries[0];assert.equal(current.successes,2);assert.equal(current.failures,0);assert.equal(current.enabled,true)
+})
+
+
+test('recipe denial and cancellation preserve enabled status and use interruption counts',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-interruption-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ for(const kind of ['denied','cancelled']){
+  const service=new AgentCoreService({dataDir:path.join(workspace,kind),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+  service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
+  const entry=service.experienceState().entries[0];service.experiences.verify(entry.id,1,true,[],'ok');service.enableExperience(entry.id,1,true)
+  const controller=new AbortController()
+  service.capabilityRegistry.registerBuiltin({...capability('agent.web_search','read'),runtime:'builtin'},async()=>{controller.abort();controller.signal.throwIfAborted()})
+  service.capabilityRegistry.registerBuiltin({...capability('agent.web_fetch','read'),runtime:'builtin'},async()=>assert.fail('fetch must not run'))
+  await withModel(()=>({content:'本次未执行。'}),async connection=>{
+   const run=service.runConversation(options(connection,{workspace,signal:controller.signal,messages:[{role:'user',content:'搜索 Vue 文档'}],approve:async()=>kind!=='denied'}))
+   if(kind==='cancelled')await assert.rejects(run);else await run
+  })
+  const current=service.experienceState().entries[0]
+  assert.equal(current.enabled,true);assert.equal(current.status,'verified');assert.equal(current.failures,0);assert.equal(current.interruptions,1);assert.equal(current.lastIssue.kind,kind)
+ }
+})
+test('chat reports recipe mismatch and retains a safe diagnostic for the library',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-mismatch-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const service=new AgentCoreService({dataDir:workspace,skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
+ const entry=service.experienceState().entries[0],progress=[]
+ await withModel(()=>({content:'需要可用的搜索工具。'}),async connection=>{
+  await service.runConversation(options(connection,{workspace,messages:[{role:'user',content:'搜索 Vue 文档'}],onProgress:message=>progress.push(message)}))
+ })
+ assert.ok(progress.some(line=>line.includes('经验未采用')&&line.includes('未通过验证')))
+ assert.ok(service.experienceState().entries[0].lastMatch.reasons.includes('tools'))
+})
+
+test('equivalent file requests reuse one certified recipe with unchanged permission gates',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-phrases-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ writeFileSync(path.join(workspace,'README.md'),'Current phrase evidence')
+ const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ service.experiences.record('读取 README.md',workspace,['agent.read_file'],true)
+ const entry=service.experienceState().entries[0]
+ service.experiences.verify(entry.id,1,true,[],'ok');service.enableExperience(entry.id,1,true)
+ const calls=[],progress=[]
+ service.capabilityRegistry.registerBuiltin({...capability('agent.read_file','read'),runtime:'builtin',parameters:{type:'object',properties:{path:{type:'string'},startLine:{type:'number'},endLine:{type:'number'}},required:['path']}},async args=>{calls.push(args.path);return {path:args.path,text:readFileSync(path.join(workspace,args.path),'utf8')}})
+ await withModel(()=>({content:'Current phrase evidence'}),async connection=>{
+  for(const query of ['读取 README.md','请帮我看一下 README.md']){
+   await service.runConversation(options(connection,{workspace,filesEnabled:true,webEnabled:false,messages:[{role:'user',content:query}],onProgress:message=>progress.push(message)}))
+  }
+ })
+ assert.deepEqual(calls,['README.md','README.md']);assert.equal(service.experienceState().entries.length,1)
+ assert.equal(service.experienceState().entries[0].uses,2)
+ assert.equal(progress.filter(line=>line.includes('采用经验流程')).length,2)
+ assert.equal(service.experiences.match('请帮我看一下 README.md',{workspace,region:'CN',webEnabled:false,filesEnabled:false,tools:['agent.read_file']}),undefined)
 })

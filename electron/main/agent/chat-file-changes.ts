@@ -16,6 +16,6 @@ export function prepareChatFileChanges(root:string,capability:string,args:Record
   try{if(typeof name!=='string')return [];return [{path:name,before:read(name)}]}catch{return []}
  })
  return {paths:before.map(change=>change.path),finish:():StudioFileChange[]=>before.flatMap(change=>{
-  try{const after=read(change.path);return after===undefined?[]:[{...change,after}]}catch{return []}
+  try{const after=read(change.path);return after===undefined||after===change.before?[]:[{...change,after}]}catch{return []}
  })}
 }

@@ -14,6 +14,19 @@ import { kernelIds } from '../dist-electron/main/ability-modules/kernel-checks.j
 import { runCoreChat } from '../dist-electron/main/agent/core/chat-runner.js'
 import { AgentPlanner } from '../dist-electron/main/agent/core/agent-planner.js'
 
+test('updated recovery baseline is archived separately and unsafe old recovery falls back to the correct version',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-recovery-upgrade-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
+ const contract=policyContracts.find(c=>c.id==='error-recovery')
+ const old={...contract,baseline:'function process(){return {result:{action:"continue",reason:"old recovery"}}}'}
+ const first=new AbilityModuleManager(root,undefined,old);first.dispose()
+ const original=fs.readFileSync(path.join(root,'versions','bundled-v1.json'),'utf8')
+ const current=new AbilityModuleManager(root,undefined,contract);t.after(()=>current.dispose())
+ const result=await current.execute({messages:[],data:{stagnant:0,continuations:0,invalidCalls:0,denied:false,ineffectiveEdits:3}})
+ assert.equal(result.output.result.action,'pause');assert.notEqual(result.versionId,'bundled-v1')
+ assert.equal(current.version(result.versionId).code,contract.baseline)
+ assert.equal(fs.readFileSync(path.join(root,'versions','bundled-v1.json'),'utf8'),original)
+})
+
 function fixture(t, generate) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-policies-'))
   const managers=new Map(policyContracts.map(contract=>[contract.id,new AbilityModuleManager(path.join(root,contract.id),generate,contract)]))
@@ -69,6 +82,7 @@ test('permission, budget, provenance and completion invariants reject structural
   reject('model-adapter',{capacity:4096,maxTokens:1024,temperature:.2,toolCount:1},{maxTokens:2048,temperature:.2,toolLimit:8})
   reject('context-compaction',{capacity:4096,usageRatio:.9},{triggerRatio:.99,retainRecent:1})
   reject('error-recovery',{stagnant:6,continuations:0,invalidCalls:0,denied:false},{action:'continue',reason:'无限重试'})
+  reject('error-recovery',{stagnant:0,continuations:0,invalidCalls:0,denied:false,ineffectiveEdits:1},{action:'continue',reason:'把无效写入当作进展'})
   reject('completion-review',{status:'blocked',reason:'失败',nextStep:'',candidate:'完成',unresolvedFailures:1,denied:false},{status:'complete',reason:'假成功',nextStep:''})
   reject('clarification-policy',{missing:['文件路径']},{ask:false,question:''})
   reject('task-planner',{maxSteps:2},{steps:[{title:'写入',dependsOn:[0]}]})
@@ -127,6 +141,27 @@ async function modelServer(t, responder) {
   return {requests,connection:{endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',contextLength:8192,maxTokens:1024}}
 }
 const options=(connection,runtime,query='读取数据；生成图表')=>({connection,model:'test',messages:[{role:'user',content:query}],workspace:os.tmpdir(),filesEnabled:false,webEnabled:false,approvalMode:'ask',signal:new AbortController().signal,abilityPolicies:runtime,approve:async()=>false,onContent(){},onReasoning(){},onRequest(){},onUsage(){},onActivity(){}})
+
+test('project inspection recovers failed read alternatives only with matching source evidence',async t=>{
+ const {runtime}=fixture(t)
+ const caps=['agent.run_command','agent.code_outline','agent.search_files','agent.read_file'].map(name=>({name,description:name,category:'agent',parameters:{type:'object',properties:{command:{type:'string'},path:{type:'string'},query:{type:'string'}}},source:{type:'skill',skillId:'agent-tools'},tags:[],runtime:'python-native'}))
+ for(const target of ['index.html','other.html']){
+  let step=0,outcome,content='',mutations=0
+  const actions=[['agent.run_command',{command:'head -40 index.html'}],['agent.code_outline',{path:'index.html'}],['agent.search_files',{query:'script',path:'.'}]]
+  const {connection,requests}=await modelServer(t,input=>{
+   if(input.messages.some(m=>m.content?.includes('你是任务完成检查器')))return {content:JSON.stringify({status:'complete',reason:'项目结构与入口已确认',nextStep:''})}
+   if(step>=actions.length)return {content:'静态 HTML 项目，入口为 index.html'}
+   const [name,args]=actions[step++],tool=input.tools.find(t=>t.function.description.startsWith(name+':'))
+   if(!tool)return {content:'缺少测试所需工具：'+name}
+   return {content:null,tool_calls:[{id:'read-'+step,type:'function',function:{name:tool.function.name,arguments:JSON.stringify(args)}}]}
+  })
+  await runCoreChat({list:()=>caps,execute:async request=>request.capability==='agent.run_command'?{success:false,output:{exitCode:1,output:'head unavailable'}}:request.capability==='agent.code_outline'?{success:false,output:'请选择支持的代码文件'}:{success:true,output:{truncated:false,matches:[{path:target,text:'<script src="./main.js">'}]}}},{...options(connection,runtime.fork(),'查看项目根目录结构'),currentStep:{title:'查看项目根目录结构',acceptance:'列出文件并确认入口'},filesEnabled:true,webEnabled:true,approvalMode:'full',beforeMutation:async()=>{mutations++},onOutcome:value=>outcome=value,onContent:value=>content+=value})
+  assert.equal(mutations,0,'failed read command must not mark the task as modified')
+  assert.equal(outcome,target==='index.html'?'complete':'blocked')
+  if(target!=='index.html'){assert.match(content,/agent.run_command/);assert.match(content,/head unavailable/);assert.match(content,/agent.code_outline/)}
+  assert.ok(requests[0].tools.some(tool=>tool.function.description.startsWith('agent.read_file:')))
+ }
+})
 
 test('small-context chat keeps search and page reading through ranking while respecting the network toggle',async t=>{
   const {runtime}=fixture(t)
@@ -197,9 +232,9 @@ test('completion policy prevents repeated promises from being labelled complete 
   let outcome, content=''
   await runCoreChat({list:()=>[],execute:()=>assert.fail('no tools')},{...options(connection,runtime),onOutcome:value=>outcome=value,onContent:value=>content+=value})
   assert.equal(outcome,'blocked')
-  assert.match(content,/连续 5 次完成检查/)
+  assert.match(content,/连续两次完成检查/)
   assert.match(content,/当前只有执行承诺/)
-  assert.match(content,/待处理步骤/)
+  assert.match(content,/下一步：依据原始任务执行并验证尚未完成的步骤/)
   assert.ok(!content.includes('已达到无进展、格式错误或权限边界'))
   assert.ok(fs.readdirSync(path.join(root,'error-recovery','replays')).length)
 })

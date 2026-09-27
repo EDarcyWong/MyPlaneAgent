@@ -9,6 +9,19 @@ import { runSandbox, validateOutput } from '../dist-electron/main/ability-module
 import { stateInput, stateContext } from '../dist-electron/main/ability-modules/conversation.js'
 
 const input = (...texts) => ({ messages: texts.map((text, index) => ({ id: `m${index+1}`, text })) })
+test('optimization exposes cooldown and non-module observations without creating false regression cases',async t=>{
+ const {manager}=fixture(t,async()=>{throw new Error('temporary generator failure')})
+ manager.observeFailure('tool','工具暂不可用');manager.observeFailure('tool','工具暂不可用')
+ assert.equal(manager.snapshot().observations.length,1);assert.equal(manager.snapshot().problems.length,0)
+ manager.reportProblem('继续识别',['继续'],'continue');manager.optimize()
+ const job=await waitForJob(manager)
+ assert.equal(job.resolution,'retryable')
+ manager.setPolicy({...manager.snapshot().policy,autoOptimize:true})
+ assert.match(manager.snapshot().optimization.reason,/冷却/)
+ assert.ok(manager.snapshot().optimization.nextRetryAt)
+ manager.cancel();manager.setPolicy({...manager.snapshot().policy,autoOptimize:false})
+ assert.match(manager.snapshot().optimization.reason,/已关闭/)
+})
 const fixedCode = baselineCode.replace('function process(input)', 'function original(input)') + `
 function process(input) {
  const result = original(input);

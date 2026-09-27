@@ -6,6 +6,8 @@ import type {ApplicationLogAction,ApplicationLogResult} from '../electron/shared
 declare global {
  interface Window {
   myplane:{
+   desktopPlatform?:string
+   showTitleMenu(label:string,x:number):Promise<void>
    localAiStudio<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input']):Promise<StudioCommands[K]['output']>
    onLocalAiAgentEvent(callback:(task:AgentTask)=>void):()=>void
    onAgentCoreEvent(callback:(event:AgentCoreUiEvent)=>void):()=>void

@@ -17,7 +17,7 @@ type WorkflowModelOption={id:string;name:string;instanceId?:string;modelRef?:Wor
 
 export function useLocalAiStudio(){
  const api=<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input'])=>window.myplane.localAiStudio(action,payload)
- const tab=ref<'chat'|'workflow'|'automation'|'abilities'|'discover'|'models'|'server'|'skills'|'mcp'|'settings'>('chat'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
+ const tab=ref<'chat'|'workflow'|'automation'|'abilities'|'experience'|'discover'|'models'|'server'|'skills'|'mcp'|'settings'>('chat'),ready=ref(false),error=ref(''),busy=ref(''),drawer=ref(false),parameters=ref(window.innerWidth>1180)
  const data=ref<StudioBootstrap>(),settings=reactive<StudioSettings>({apiFormat:'openai',endpoint:'http://127.0.0.1:1234/v1',model:'',maxTokens:2048,hasApiKey:false,hasHfToken:false,downloadDirectory:'',source:'external',runtimePath:'',runtimePort:8089,contextLength:4096,gpuLayers:0,threads:4,temperature:0.7,topP:0.95,repeatPenalty:1.1,systemPrompt:'',theme:'system',appearanceStyle:'minimal'})
  const apiKey=ref(''),hfToken=ref(''),connection=ref<StudioConnection>(),connecting=ref(false),remoteProfiles=ref<LocalAiRemoteProfile[]>([]),sessions=ref<StudioSessionSummary[]>([]),session=ref<StudioSession>(),sessionFilter=ref('')
  const images=ref<StudioImage[]>([]),attaching=ref(false)
@@ -27,10 +27,10 @@ export function useLocalAiStudio(){
  const chatApproval=ref<{approvalId:string;activity:StudioToolActivity}>(),approvingChat=ref(false)
  watch(approvalMode,value=>{if(value==='full')webEnabled.value=true})
  async function chooseChatWorkspace(){if(sending.value)return;try{const picked=await api('agentCoreChooseWorkspace');if(picked)chatWorkspace.value=picked}catch(cause){report(cause)}}
- async function approveChat(approved:boolean){
+ async function approveChat(approved:boolean,scope:'once'|'similar'|'full'='once'){
   const pending=chatApproval.value;if(!pending||approvingChat.value)return
   approvingChat.value=true
-  try{await api('chatApprove',{requestId:requestId.value,approvalId:pending.approvalId,approved});chatApproval.value=undefined}catch(cause){report(cause)}finally{approvingChat.value=false}
+  try{await api('chatApprove',{requestId:requestId.value,approvalId:pending.approvalId,approved,scope:approved?scope:'once'});if(approved&&scope==='full'){approvalMode.value='full';if(session.value)session.value.approvalMode='full'}if(chatApproval.value?.approvalId===pending.approvalId)chatApproval.value=undefined}catch(cause){report(cause)}finally{approvingChat.value=false}
  }
 
  let composerRevision=0
@@ -289,7 +289,7 @@ export function useLocalAiStudio(){
   finally{attaching.value=false}
  }
  function removeImage(index:number){if(!attaching.value)images.value.splice(index,1)}
- async function send(regenerate=false,submission?:{text:string;images:StudioImage[]}){
+ async function send(regenerate=false,submission?:{text:string;images:StudioImage[];visualDecision?:import('../../electron/shared/visual-review').VisualDecision}){
   if(selectingChatModel.value||sending.value||attaching.value||sessionBusy.value||(!regenerate&&!submission&&!canSend.value))return false
   if((webEnabled.value||chatWorkspace.value||approvalMode.value==='full')&&data.value?.chatToolsSupported!==true){report('联网与工具调用需要重启应用主进程后生效；消息草稿已保留。');return false}
   const text=(submission?.text??input.value).trim(),attachments=regenerate?[]:(submission?.images??images.value).map(image=>({name:image.name,dataUrl:image.dataUrl}))
@@ -302,7 +302,7 @@ export function useLocalAiStudio(){
    requestId.value=id
    if(regenerate){if(session.value.messages.at(-1)?.role==='assistant')session.value.messages.pop()}else{session.value.messages.push({id:crypto.randomUUID(),role:'user',content:text,...(attachments.length?{images:attachments}:{}),createdAt:new Date().toISOString()});if(!submission){input.value='';images.value=[]}}
    pending.value={id,role:'assistant',content:'',reasoning:'',model:model.value,createdAt:new Date().toISOString()};followBottom.value=true;void scroll(true)
-   await api('chat',{sessionId:target.id,requestId:id,text,images:attachments,model:model.value,regenerate,webEnabled:webEnabled.value,approvalMode:approvalMode.value,workspaceToken:chatWorkspace.value?.token});return true
+   await api('chat',{sessionId:target.id,requestId:id,text,images:attachments,visualDecision:submission?.visualDecision,model:model.value,regenerate,webEnabled:webEnabled.value,approvalMode:approvalMode.value,workspaceToken:chatWorkspace.value?.token});return true
   }catch(cause){requestId.value='';pending.value=undefined;report(cause);try{session.value=await api('session',{id:target.id})}catch{}if(!regenerate&&!submission&&!input.value&&!images.value.length){input.value=text;images.value=attachments}return false}
  }
  async function compactSession(){
@@ -324,7 +324,7 @@ export function useLocalAiStudio(){
  }
  onMounted(async()=>{
   try{
-   unlisten=window.myplane.onLocalAiStudioEvent(event=>{if(event.requestId!==requestId.value)return;if(event.type==='progress'){if(pending.value){pending.value.execution??=[];pending.value.execution.push(event.entry)}void scroll()}else if(event.type==='outcome'){if(pending.value)pending.value.outcome=event.outcome}else if(event.type==='approval'){chatApproval.value={approvalId:event.approvalId,activity:event.activity}}else if(event.type==='tool'){
+   unlisten=window.myplane.onLocalAiStudioEvent(event=>{if(event.requestId!==requestId.value)return;if(event.type==='task-plan'){if(session.value)session.value.taskPlan=event.plan}else if(event.type==='progress'){if(pending.value){pending.value.execution??=[];pending.value.execution.push(event.entry)}void scroll()}else if(event.type==='outcome'){if(pending.value)pending.value.outcome=event.outcome}else if(event.type==='approval'){chatApproval.value={approvalId:event.approvalId,activity:event.activity}}else if(event.type==='tool'){
     if(pending.value){pending.value.toolActivity??=[];const index=pending.value.toolActivity.findIndex(item=>item.id===event.activity.id);if(index>=0)pending.value.toolActivity[index]=event.activity;else {pending.value.toolActivity.push(event.activity);pending.value.execution??=[];pending.value.execution.push({id:event.activity.id,type:'tool',activityId:event.activity.id,createdAt:new Date().toISOString()})}}
     if(chatApproval.value?.activity.id===event.activity.id&&event.activity.status!=='waiting')chatApproval.value=undefined
     void scroll()

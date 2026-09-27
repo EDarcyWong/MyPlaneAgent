@@ -4,9 +4,18 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AbilityModuleManager } from '../dist-electron/main/ability-modules/manager.js'
-import { routerContract, routerBaseline, validateRouterOutput, validateRouterInput, taskMessages, taskProgress } from '../dist-electron/main/ability-modules/routing.js'
+import { routerContract, routerBaseline, validateRouterOutput, validateRouterInput, taskMessages, taskProgress,lookupBoundary } from '../dist-electron/main/ability-modules/routing.js'
 
 const input = (text, intent = 'new_task', taskStatus = 'ready', hasAttachments = false) => ({ messages: [{ id: 'current', text }], intent, taskStatus, hasAttachments })
+test('standalone weather questions isolate destinations; aliases replace only the current target',()=>{
+ assert.equal(lookupBoundary('明天成都下雨吗','北京市明天下雨吗'),'new_task')
+ assert.equal(lookupBoundary('成都市明天下雨吗','明天成都下雨吗'),'replace')
+ assert.equal(lookupBoundary('成都市明天下雨吗','北京市明天下雨吗\n用户补充：明天成都下雨吗'),'replace')
+ assert.equal(lookupBoundary('成都后天下雨吗','成都明天下雨吗'),'new_task')
+ for(const text of ['继续','明天呢','改成成都','补充：成都市明天下雨吗','还要查成都','读取天气查询代码'])assert.equal(lookupBoundary(text,'北京市明天下雨吗'),undefined,text)
+ assert.deepEqual(validateRouterOutput({action:'new_task'},input('明天成都下雨吗','supplement','blocked')),{action:'new_task'})
+ assert.equal(lookupBoundary('搜索最新科技新闻','北京市明天下雨吗'),'new_task')
+})
 function fixture(t, generate) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myplane-routing-'))
   const manager = new AbilityModuleManager(root, generate, routerContract)

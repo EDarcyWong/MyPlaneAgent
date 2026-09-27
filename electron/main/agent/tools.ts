@@ -11,7 +11,7 @@ export const agentContextTools=[
  tool('build_project','执行 inspect_build 返回的构建或测试动作；优先使用本地容器沙盒并默认断网，沙盒不可用时需确认降级；返回结构化失败分析，不自动安装依赖。',{action:{type:'string',pattern:'^(test|check|lint|build)(:[a-zA-Z0-9_-]+)?$'},timeoutSeconds:num('超时秒数，默认 120')},['action']),
  tool('reconcile_execution','核对本任务中断步骤的文件哈希；只核对，不重放操作。返回结果未知时需要用户核对。',{},[]),
  tool('read_tool_result','按 resultId 和 nextOffset 读取本任务保存的完整工具结果。',{resultId:{type:'string',pattern:'^[a-fA-F0-9-]{36}$'},offset:num('字符偏移，默认 0')},['resultId']),
- tool('web_search','通过多个搜索引擎检索公开资料，聚合并去重标题、摘要、URL、来源引擎和检索时间。会向外部搜索服务发送查询，遵守项目联网策略。',{query:{type:'string',minLength:1,maxLength:300},limit:{type:'integer',minimum:1,maximum:10}},['query']),
+ tool('web_search','按系统地区线索优先使用 Google、Bing、百度等主流搜索引擎；不可用或无结果时切换后备引擎。返回标题、摘要、URL、实际引擎和地区判断依据。百科等站点仅作为结果来源。会向外部搜索服务发送查询，遵守项目联网策略。',{query:{type:'string',minLength:1,maxLength:300},limit:{type:'integer',minimum:1,maximum:10}},['query']),
  tool('web_fetch','读取一个公网 HTTP/HTTPS 页面的正文和来源元数据；遇到反爬拒绝、TLS 中断或动态页面时可降级到安全文本读取服务。阻止本机、局域网、私有地址和非文本响应。',{url:{type:'string',minLength:1,maxLength:4000},maxCharacters:{type:'integer',minimum:1000,maximum:30000}},['url']),
 ]
 export const agentTools=[

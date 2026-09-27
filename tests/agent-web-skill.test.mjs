@@ -7,10 +7,11 @@ test('web Skill supports configured fake-IP proxies while denying private target
     .find(command => spawnSync(command,['-c','import sys;sys.exit(0 if sys.version_info.major == 3 else 1)'],{timeout:5000}).status === 0)
   assert.ok(python,'A working Python 3 interpreter is required')
   const result=spawnSync(python,['-c',String.raw`
-import sys, socket
+import sys, socket, os
 from unittest.mock import patch, MagicMock
 sys.path.insert(0, 'skills/agent-tools')
 import index as skill
+os.environ['MYPLANE_SEARCH_REGION'] = 'GLOBAL'
 
 url = 'https://www.baidu.com/s?wd=北京市+明天+天气预报'
 encoded = skill.encoded_public_url(url)
@@ -49,6 +50,9 @@ with patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')), 
     assert calls[0].args[1] == encoded.removeprefix('https://www.baidu.com')
     assert calls[1].args[1] == '/%E5%A4%A9%E6%B0%94?q=%E6%98%8E%E5%A4%A9'
     assert '天气资料' in result['text']
+    assert result['requestedUrl'] == url
+    assert result['finalUrl'] == result['url']
+    assert result['finalUrl'] != encoded
     assert result['links']==[{'url':'https://www.baidu.com/%E5%8C%97%E4%BA%AC/%E9%A2%84%E6%8A%A5','title':'北京预报'}]
 with patch.object(skill.socket, 'getaddrinfo', return_value=lookup('198.18.0.20')):
     assert skill.safe_public_url('https://example.com', True)[2] == 'example.com'
@@ -71,7 +75,7 @@ with patch.object(skill, 'web_fetch', side_effect=responses), patch.object(skill
 google = '<a href="/url?q=https%3A%2F%2Fexample.com%2Fweather"><h3>Weather</h3></a>'
 baidu = '<h3 class="t"><a href="https://example.com/weather">天气</a></h3>'
 with patch.object(skill, 'web_fetch', return_value={'text':baidu}) as fetch, patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')):
-    result=skill.web_search({'query':'上海天气'})
+    result=skill.web_search({'query':'上海天气'}, {'region':'CN','basis':'timezone'})
     assert result['provider']=='Baidu'
     assert fetch.call_args.args[0]['url'].startswith('https://www.baidu.com/')
 with patch.object(skill, 'web_fetch', return_value={'text':google + google}), patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')):
@@ -80,10 +84,34 @@ with patch.object(skill, 'web_fetch', return_value={'text':google + google}), pa
     assert len(result['results'])==1
     assert result['results'][0]['url']=='https://example.com/weather'
 fallback='<a class="result__a" href="https://example.com/weather">Weather</a>'
-with patch.object(skill, 'web_fetch', side_effect=[OSError('unavailable'),{'text':'bad rss'},{'text':'no results'},{'text':fallback}]), patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')):
+with patch.object(skill, 'web_fetch', side_effect=[OSError('unavailable'),{'text':'bad rss'},{'text':fallback}]), patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')):
     result=skill.web_search({'query':'weather'})
     assert result['provider']=='DuckDuckGo'
-    assert [p['name'] for p in result['providers']]==['Google','Bing','Baidu','DuckDuckGo']
+    assert [p['name'] for p in result['providers']]==['Google','Bing','DuckDuckGo']
+
+for region, first in [('CN','Baidu'),('KR','Naver'),('RU','Yandex'),('GLOBAL','Google')]:
+    with patch.object(skill, 'web_fetch', return_value={'text':'<h3><a href="https://example.com/source">Source</a></h3>'}), patch.object(skill.socket, 'getaddrinfo', return_value=lookup('1.1.1.1')):
+        result=skill.web_search({'query':'Source'}, {'region':region,'basis':'timezone'})
+        assert result['provider']==first
+        assert result['region']==region
+with patch.object(skill, 'web_fetch', return_value={'text':'no results'}) as fetch:
+    order = [name.lower() for name in skill.SEARCH_ORDERS['CN']]
+    order = order[1:5] + order[:1] + order[5:]
+    result=skill.web_search({'query':'Vue'}, {'region':'CN','basis':'timezone','order':order})
+    assert [p['name'].lower() for p in result['providers']] == order
+with patch.object(skill, 'web_fetch', return_value={'text':'no results'}) as fetch:
+    result=skill.web_search({'query':'上海天气'}, {'region':'GLOBAL','basis':'timezone'})
+    assert [p['name'] for p in result['providers']]==skill.SEARCH_ORDERS['GLOBAL']
+    assert len(result['providers'])==10
+    assert sum('m.sm.cn' in call.args[0]['url'] for call in fetch.call_args_list)==1
+    assert all('baike' not in call.args[0]['url'] and 'wikipedia' not in call.args[0]['url'] for call in fetch.call_args_list)
+with patch.object(skill, 'web_fetch') as fetch:
+    try: skill.web_search({'query':'token=private-secret'})
+    except ValueError: pass
+    else: raise AssertionError('Sensitive query accepted')
+    fetch.assert_not_called()
+assert not skill.relevant_search_result('Vue 官方文档', 'Apple', 'Apple official website')
+assert skill.relevant_search_result('Vue 官方文档', 'Vue.js', 'The official guide')
 `],{encoding:'utf8'})
   assert.equal(result.status,0,result.error?.message || result.stderr)
 })

@@ -4,6 +4,8 @@ import type {StudioCommands,StudioEvent,AgentCoreUiEvent} from '../shared/local-
 import type {AgentTask} from '../shared/local-ai-agent.js'
 import type {ApplicationLogAction,ApplicationLogResult} from '../shared/application-log.js'
 contextBridge.exposeInMainWorld('myplane',{
+ desktopPlatform:process.platform,
+ showTitleMenu:(label:string,x:number):Promise<void>=>ipcRenderer.invoke('app:title-menu',label,x),
  localAiStudio:<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input']):Promise<StudioCommands[K]['output']>=>ipcRenderer.invoke('local-ai:studio',action,payload),
  onLocalAiAgentEvent:(callback:(task:AgentTask)=>void)=>{const listener=(_event:unknown,task:AgentTask)=>callback(task);ipcRenderer.on('local-ai:agent-event',listener);return()=>ipcRenderer.removeListener('local-ai:agent-event',listener)},
  onAgentCoreEvent:(callback:(event:AgentCoreUiEvent)=>void)=>{const listener=(_event:unknown,data:AgentCoreUiEvent)=>callback(data);ipcRenderer.on('local-ai:agent-core-event',listener);return()=>ipcRenderer.removeListener('local-ai:agent-core-event',listener)},
