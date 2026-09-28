@@ -14,12 +14,13 @@ import socket
 import ipaddress
 import http.client
 import ssl
+import subprocess
 from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 import engine
 
-WRITE_TOOLS = {'write_file', 'replace_text', 'apply_patch', 'create_document', 'create_spreadsheet', 'run_command', 'run_test'}
+WRITE_TOOLS = {'write_file', 'replace_text', 'apply_patch', 'create_document', 'replace_document_text', 'create_spreadsheet', 'update_spreadsheet_cells', 'run_command', 'run_test'}
 
 
 def encoded_public_url(url):
@@ -334,10 +335,23 @@ def execute(tool, args, workspace, context=None):
     if tool == 'inspect_build':
         package = root / 'package.json'
         scripts = json.loads(package.read_text('utf-8')).get('scripts', {}) if package.is_file() else {}
-        return {'scripts': {key: value for key, value in scripts.items() if key.split(':')[0] in ('test', 'check', 'lint', 'build')}, 'python': (root / 'pyproject.toml').is_file()}
+        actions = {key: {'runtime': 'npm', 'command': 'npm run ' + key} for key in scripts if key.split(':')[0] in ('test', 'check', 'lint', 'build')}
+        python_project = (root / 'pyproject.toml').is_file() or (root / 'setup.py').is_file()
+        if python_project:
+            actions.setdefault('check', {'runtime': 'python', 'command': 'python -m compileall -q .'})
+            actions.setdefault('test', {'runtime': 'python', 'command': 'python -m pytest'})
+        return {'scripts': {key: value for key, value in scripts.items() if key in actions}, 'python': python_project, 'actions': actions}
     if tool == 'build_project':
         action = args['action']
-        return execute('run_test', {'script': action, 'timeoutSeconds': args.get('timeoutSeconds', 120)}, workspace)
+        available = execute('inspect_build', {}, workspace)['actions']
+        if action not in available:
+            raise ValueError('项目没有此构建动作，请先查看 inspect_build 返回的 actions')
+        if available[action]['runtime'] == 'npm':
+            return execute('run_test', {'script': action, 'timeoutSeconds': args.get('timeoutSeconds', 120)}, workspace)
+        command = [sys.executable, '-m', 'compileall', '-q', '.'] if action == 'check' else [sys.executable, '-m', 'pytest']
+        done = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=max(1, min(300, int(args.get('timeoutSeconds', 120)))))
+        output = done.stdout + done.stderr
+        return {'command': command, 'exitCode': done.returncode, 'failureAnalysis': engine.test_failure_analysis(output, done.returncode, action), 'output': output[:32000], 'truncated': len(output) > 32000}
     context = {'workspace': str(root)}
     if tool in WRITE_TOOLS:
         prepared = engine.prepare_write(root, tool, args)

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import BrowserPluginCard from './BrowserPluginCard.vue'
 import StaticPreviewPluginCard from './StaticPreviewPluginCard.vue'
-import { computed, defineAsyncComponent, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import {ElMessage} from 'element-plus'
 const SkillCodeEditor = defineAsyncComponent(() => import('./SkillCodeEditor.vue'))
 import AgentCapabilityRegistry from './AgentCapabilityRegistry.vue'
@@ -38,6 +38,11 @@ interface SkillInfo {
   skillPath: string
   loaded: boolean
   metadata?: any
+}
+interface SkillEntry extends SkillInfo {
+  sourceName?: string
+  sourceDisplayName?: string
+  focusedToolName?: string
 }
 
 type Section = 'edit' | 'test' | 'info'
@@ -78,16 +83,34 @@ const testOutput = ref('')
 const testWorkspace = ref('')
 
 // 计算属性
-const selected = computed(() => skills.value.find(s => s.name === selectedSkill.value))
+const bundledToolSkills = new Set(['agent-tools', 'file-operations', 'git-operations'])
+const categoryOrder = ['file', 'git', 'code', 'document', 'test', 'runtime', 'workflow', 'other']
+const toolCategories: Record<string, string> = {
+  inspect_project:'code', code_outline:'code', find_symbol:'code', find_references:'code', find_todos:'code', dependency_report:'code',
+  read_document:'document', image_ocr:'document', pdf_ocr:'document', create_document:'document', create_spreadsheet:'document', replace_document_text:'document', update_spreadsheet_cells:'document',
+  get_diagnostics:'test', run_test_case:'test', run_test:'test', inspect_build:'test', build_project:'test',
+  process_status:'runtime', http_request:'runtime', run_command:'runtime', web_search:'runtime', web_fetch:'runtime',
+  set_plan:'workflow'
+}
+function toolCategory(source: string, name: string) {
+  if (source === 'git-operations' || name.startsWith('git_')) return 'git'
+  if (source === 'file-operations') return 'file'
+  return toolCategories[name] || 'file'
+}
+const entries = computed<SkillEntry[]>(() => skills.value.flatMap(skill => bundledToolSkills.has(skill.name)
+  ? skill.tools.map(tool => ({...skill,name:`${skill.name}/${tool.name}`,displayName:tool.name,description:tool.description,category:toolCategory(skill.name,tool.name),tools:[tool],sourceName:skill.name,sourceDisplayName:skill.displayName,focusedToolName:tool.name}))
+  : [{...skill,category:categoryOrder.includes(skill.category)?skill.category:'other'}]))
+const selected = computed(() => entries.value.find(s => s.name === selectedSkill.value))
 
-const categories = computed(() => [...new Set(skills.value.map(skill => skill.category))])
-const enabledCount = computed(() => skills.value.filter(skill => skill.loaded).length)
+const categories = computed(() => categoryOrder.filter(category => entries.value.some(skill => skill.category === category)))
+watch(categories, available => { if (filter.value !== 'all' && !available.includes(filter.value)) filter.value = 'all' })
+const enabledCount = computed(() => entries.value.filter(skill => skill.loaded).length)
 const currentTool = computed(() => selected.value?.tools.find(tool => tool.name === testTool.value))
 const snapshot = () => JSON.stringify({skillJson: skillJsonContent.value, indexPy: indexPyContent.value, enginePy: enginePyContent.value, readme: readmeContent.value})
 
 const filtered = computed(() => {
   const word = query.value.trim().toLowerCase()
-  return skills.value.filter(skill => {
+  return entries.value.filter(skill => {
     // 过滤分类
     if (filter.value !== 'all' && skill.category !== filter.value) {
       return false
@@ -98,8 +121,9 @@ const filtered = computed(() => {
         .some(v => v.toLowerCase().includes(word))
     }
     return true
-  })
+  }).sort((left,right) => categoryOrder.indexOf(left.category)-categoryOrder.indexOf(right.category) || left.displayName.localeCompare(right.displayName,'zh-CN'))
 })
+const grouped = computed(() => categories.value.map(category => ({category,items:filtered.value.filter(skill => skill.category === category)})).filter(group => group.items.length))
 
 const categoryLabel = (category: string) => {
   const labels: Record<string, string> = {
@@ -109,7 +133,10 @@ const categoryLabel = (category: string) => {
     system: '系统',
     document: '文档',
     test: '测试',
-    general: '通用'
+    code: '代码与项目',
+    runtime: '运行与网络',
+    workflow: '任务',
+    other: '其他插件'
   }
   return labels[category] || category
 }
@@ -132,7 +159,7 @@ async function refresh() {
 async function loadSkillContent(skill: SkillInfo) {
   try {
     const content = await window.myplane.localAiStudio('skillGetContent', {
-      skillName: skill.name
+      skillName: (skill as SkillEntry).sourceName || skill.name
     })
 
     selectedSkill.value = skill.name
@@ -145,7 +172,7 @@ async function loadSkillContent(skill: SkillInfo) {
     baseline.value = snapshot()
 
     section.value = 'info'
-    testTool.value = skill.tools[0]?.name || ''
+    testTool.value = (skill as SkillEntry).focusedToolName || skill.tools[0]?.name || ''
     testArgs.value = '{}'
     testOutput.value = ''
   } catch (e) {
@@ -172,7 +199,7 @@ async function selectSkill(skillName: string) {
     }
   }
 
-  const skill = skills.value.find(s => s.name === skillName)
+  const skill = entries.value.find(s => s.name === skillName)
   if (skill) {
     await run(() => loadSkillContent(skill))
   }
@@ -181,7 +208,7 @@ async function selectSkill(skillName: string) {
 async function compileSkill() {
   if (!selected.value) return
   await run(async () => {
-    await window.myplane.localAiStudio('skillCompile', {skillName: selected.value!.name, indexPy: indexPyContent.value, enginePy: enginePyContent.value})
+    await window.myplane.localAiStudio('skillCompile', {skillName: selected.value!.sourceName || selected.value!.name, indexPy: indexPyContent.value, enginePy: enginePyContent.value})
     ElMessage.success('Python 编译通过')
   })
 }
@@ -197,7 +224,7 @@ async function saveSkill() {
       const skillJson = JSON.parse(skillJsonContent.value)
 
       await window.myplane.localAiStudio('skillSave', {
-        skillName: selected.value!.name,
+        skillName: selected.value!.sourceName || selected.value!.name,
         skillJson,
         indexPy: indexPyContent.value,
         enginePy: enginePyContent.value,
@@ -207,7 +234,7 @@ async function saveSkill() {
       await load()
 
       // 重新加载内容以更新 baseline
-      const skill = skills.value.find(s => s.name === skillName)
+      const skill = entries.value.find(s => s.name === skillName)
       if (skill) {
         await loadSkillContent(skill)
       }
@@ -229,7 +256,7 @@ async function testSkillTool() {
       const args = JSON.parse(testArgs.value)
 
       const result = await window.myplane.localAiStudio('skillTestTool', {
-        skillName: selected.value!.name,
+        skillName: selected.value!.sourceName || selected.value!.name,
         toolName: testTool.value,
         args,
         workspace: testWorkspace.value
@@ -322,7 +349,7 @@ async function run(work: () => Promise<void>) {
 
 onMounted(() => run(async () => {
   await load()
-  if (skills.value[0]) await loadSkillContent(skills.value[0])
+  if (entries.value[0]) await loadSkillContent(entries.value[0])
 }))
 async function createFromToolbar(){view.value='manage';await createNewSkill()}
 defineExpose({ create: createFromToolbar })
@@ -348,7 +375,7 @@ defineExpose({ create: createFromToolbar })
         <header class="browser-head">
           <div>
             <h2>插件管理</h2>
-            <span>{{ skills.length }} 个插件 · {{ enabledCount }} 个已启用</span>
+            <span>{{ entries.length }} 项 · {{ enabledCount }} 项已启用</span>
           </div>
           <button
             class="icon-action"
@@ -378,8 +405,10 @@ defineExpose({ create: createFromToolbar })
         <label class="skill-filters"><span>分类</span><select v-model="filter" aria-label="筛选插件分类"><option value="all">全部分类</option><option v-for="cat in categories" :key="cat" :value="cat">{{ categoryLabel(cat) }}</option></select><small>{{ filtered.length }} 项</small></label>
 
         <div class="skill-list">
+          <template v-for="group in grouped" :key="group.category">
+          <div class="skill-group-heading">{{ categoryLabel(group.category) }}<span>{{ group.items.length }}</span></div>
           <button
-            v-for="skill in filtered"
+            v-for="skill in group.items"
             :key="skill.name"
             :class="{
               active: selectedSkill === skill.name,
@@ -394,15 +423,16 @@ defineExpose({ create: createFromToolbar })
                 <i :class="{ loaded: skill.loaded }" :title="skill.loaded ? '已启用' : '未启用'" />
               </span>
               <small>
-                <code>{{ skill.name }}</code>
-                <span>{{ skill.tools.length }} 个工具</span>
+                <code>{{ skill.focusedToolName || skill.name }}</code>
+                <span>{{ skill.focusedToolName ? skill.description : `${skill.tools.length} 个工具` }}</span>
               </small>
             </span>
           </button>
+          </template>
 
           <div v-if="!filtered.length" class="empty-skills">
             <Search />
-            <p>{{ busy ? '正在加载插件…' : skills.length ? '没有匹配的插件' : '还没有插件' }}</p>
+            <p>{{ busy ? '正在加载插件…' : entries.length ? '没有匹配的插件' : '还没有插件' }}</p>
             <button v-if="query || filter !== 'all'" class="text-button" @click="query = ''; filter = 'all'">
               清除筛选
             </button>
@@ -428,10 +458,10 @@ defineExpose({ create: createFromToolbar })
                 <span v-if="dirty" class="unsaved">未保存</span>
                 <span v-else class="saved">{{ selected.version }}</span>
               </div>
-              <p>{{ selected.name }} · {{ categoryLabel(selected.category) }}</p>
+              <p>{{ selected.focusedToolName || selected.name }} · {{ categoryLabel(selected.category) }}</p>
             </div>
             <div class="editor-actions">
-              <button class="secondary-button plugin-delete" :disabled="busy" @click="deleteSelectedSkill">删除插件</button>
+              <button v-if="!selected.focusedToolName" class="secondary-button plugin-delete" :disabled="busy" @click="deleteSelectedSkill">删除插件</button>
               <button class="secondary-button" :disabled="busy" @click="compileSkill">编译校验</button>
               <button
                 class="primary-button"
@@ -472,7 +502,7 @@ defineExpose({ create: createFromToolbar })
               <h3>基本信息</h3>
               <dl>
                 <dt>插件标识</dt>
-                <dd><code>{{ selected.name }}</code></dd>
+                <dd><code>{{ selected.focusedToolName || selected.name }}</code></dd>
 
                 <dt>显示名称</dt>
                 <dd>{{ selected.displayName }}</dd>
@@ -482,6 +512,9 @@ defineExpose({ create: createFromToolbar })
 
                 <dt>分类</dt>
                 <dd>{{ categoryLabel(selected.category) }}</dd>
+
+                <dt v-if="selected.sourceName">来源插件</dt>
+                <dd v-if="selected.sourceName">{{ selected.sourceDisplayName }}</dd>
 
                 <dt>运行时</dt>
                 <dd>{{ selected.runtime }}</dd>
@@ -505,6 +538,7 @@ defineExpose({ create: createFromToolbar })
 
           <!-- 编辑面板 -->
           <div v-show="section === 'edit'" class="editor-pane edit-pane">
+            <p v-if="selected.focusedToolName" class="test-hint">这些文件由 Agent 内置工具共用，修改代码会影响列表中的其他内置工具。</p>
             <div class="file-tabs">
               <button
                 :class="{ active: editingFile === 'skill.json' }"

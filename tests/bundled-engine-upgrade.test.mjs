@@ -18,3 +18,13 @@ test('engine upgrades archive original bytes, preserve custom engines and avoid 
  assert.equal(upgradeBundledEngine(source,destination,history,known),false)
  assert.equal(fs.readFileSync(destination,'utf8'),'custom engine')
 })
+
+test('bundled manifest without a trailing newline upgrades and keeps an archive',t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-manifest-upgrade-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
+ const source=path.join(root,'next.json'),destination=path.join(root,'skill.json'),history=path.join(root,'archive')
+ const old='{"tools":35}',next='{"tools":39}\n',known=new Set([createHash('sha256').update(old+'\n').digest('hex')])
+ fs.writeFileSync(source,next);fs.writeFileSync(destination,old)
+ assert.equal(upgradeBundledEngine(source,destination,history,known),true)
+ assert.equal(fs.readFileSync(destination,'utf8'),next)
+ assert.ok(fs.readdirSync(history)[0].endsWith('.json'))
+})

@@ -126,6 +126,17 @@ test('persist running state before execution, verification before completion, th
  assert.ok(f.saved.at(-1).items.every(i=>i.status==='complete'&&i.evidenceIds.length===1))
  assert.ok(f.events.includes('complete'))
 })
+test('each task item receives a fresh edit failure budget while file history remains available',async()=>{
+ const f=fixture(),history=['a','b','a']
+ f.plan.editProgress={files:{'known-path':history},ineffective:3}
+ const observed=[]
+ await runTaskPlan(f.options,f.execution,async step=>{
+  observed.push({ineffective:step.editProgress.ineffective,history:[...step.editProgress.files['known-path']]})
+  step.editProgress.ineffective=2
+  step.onOutcome('complete')
+ })
+ assert.deepEqual(observed,[{ineffective:0,history},{ineffective:0,history}])
+})
 test('resume skips completed steps and rechecks interrupted step without automatic tool replay',async()=>{
  const f=fixture();f.plan.items[0].status='complete';f.plan.items[0].summary='已有结果';f.plan.items[1].status='running'
  let calls=0
@@ -177,9 +188,34 @@ test('fresh task generates a plan through model API, persists it and runs final 
   f.execution.plan.editProgress={files:{'known-path':['a','b','a']},ineffective:2}
   await runTaskPlan(f.options,f.execution,async step=>{
    assert.deepEqual(step.editProgress.files,{'known-path':['a','b','a']})
-   assert.equal(step.editProgress.ineffective,2)
+   assert.equal(step.editProgress.ineffective,0)
    step.onOutcome('blocked')
   })
   assert.equal(f.saved.at(-1).needsReplan,undefined)
+ }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}
+})
+test('implementing earlier advice replans the read-only checklist and permits edits',async()=>{
+ const goal='项目还可以怎么优化\n用户补充：按建议优化'
+ const server=createServer(async(req,res)=>{
+  let body='';for await(const chunk of req)body+=chunk
+  const request=JSON.parse(body)
+  assert.match(JSON.stringify(request.messages),/须规划并执行具体修改/)
+  res.setHeader('content-type','application/json')
+  res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{role:'assistant',content:JSON.stringify({steps:[{title:'优化 AI 搜索',acceptance:'修改 useAI.js 并核对搜索结果'}]})}}]}))
+ })
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
+ try{
+  const workspace='workspace',plan={taskId:'advice-task',workspace,scope:{goal:'项目还可以怎么优化',kind:'general',required:['项目还可以怎么优化'],optional:[]},needsReplan:true,items:[{id:'list',title:'梳理项目可优化项',acceptance:'仅列建议，不修改文件',status:'complete',attempts:1,summary:'改进 AI 搜索',evidenceIds:[]}],updatedAt:''}
+  const f=fixture();let saved,ran=0
+  Object.assign(f.options,{workspace,connection:{endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:2048,contextLength:8192},model:'test',onRequest:()=>{},onUsage:()=>{}})
+  await runTaskPlan(f.options,{taskId:plan.taskId,goal,plan,save:value=>{saved=value}},async step=>{
+   ran++
+   assert.equal(step.currentStep.title,'优化 AI 搜索')
+   assert.equal(await step.beforeMutation({name:'agent.write_file'},{path:'useAI.js'}),undefined)
+   step.onOutcome('blocked')
+  })
+  assert.equal(ran,1)
+  assert.equal(saved.scope.goal,goal)
+  assert.equal(saved.items[0].title,'优化 AI 搜索')
  }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}
 })

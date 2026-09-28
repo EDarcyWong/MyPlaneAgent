@@ -96,7 +96,7 @@ test('existing implementation can be verified using actual source evidence witho
  let calls=0,outcome
  await withModel(input=>calls?{content:'源码已存在所需功能，无需重复写入'}:toolCall(input,'agent.read_file',{path:'door.js'}),async connection=>{
   await runCoreChat({list:()=>[read],execute:async()=>{calls++;return {success:true,output:{text:'const glass = "striped"'}}}},options(connection,{filesEnabled:true,approvalMode:'full',currentStep:{title:'添加门花纹代码',acceptance:'door.js 包含花纹实现',implementationPaths:['door.js']},onOutcome:value=>outcome=value}))
- },input=>({content:JSON.stringify({status:'complete',reason:'源码已经实现',implementation:{status:'present',evidenceIds:input.messages.filter(message=>message.role==='tool').map(message=>JSON.parse(message.content).activityId)}})}))
+ },input=>({content:JSON.stringify({status:'complete',reason:'源码已经实现',implementation:{status:'present',evidenceIds:input.messages.filter(message=>typeof message.content==='string'&&message.content.startsWith('以下是此前已执行的工具')).map(message=>JSON.parse(message.content.slice(message.content.indexOf('{'))).activityId)}})}))
  assert.equal(calls,1);assert.equal(outcome,'complete')
 })
 
@@ -221,9 +221,9 @@ test('changing the browser view invalidates earlier visual evidence',async()=>{
 
 test('fresh screenshot timestamps do not manufacture new progress for identical pixels',async()=>{
  let calls=0,outcome
- await withModel(input=>toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}),async connection=>{
+ await withModel(input=>input.tools?.length?toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}):{content:'现有截图不足以确认'},async connection=>{
   await runCoreChat({list:()=>[screenshotCapability],execute:async()=>{calls++;return screenshotResult()}},options({...connection,contextLength:32768},{approvalMode:'full',imageCapability:'supported',onOutcome:value=>outcome=value}))
- })
+ },()=>({content:JSON.stringify({status:'continue',reason:'截图仍未证明目标',nextStep:'核对其他画面证据'})}))
  assert.equal(calls,7);assert.equal(outcome,'blocked')
 })
 
@@ -272,21 +272,75 @@ test('nonzero verification exit code yields to the bounded scheduler immediately
  assert.equal(executions,1);assert.equal(failures,1);assert.equal(outcome,'blocked')
 })
 
-test('three unchanged edits stop despite varied arguments and successful reads between them',async t=>{
+test('unchanged edits receive one bounded automatic recovery before stopping',async t=>{
  const workspace=mkdtempSync(path.join(tmpdir(),'myplane-unchanged-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
  let edits=0,reads=0,outcome,content=''
  const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
  await withModel((input,n)=>n%2?toolCall(input,'agent.write_file',{path:'./'.repeat(n)+'same.txt',content:'same'}):toolCall(input,'agent.read_file',{query:'read-'+n}),async connection=>{
   await runCoreChat({list:()=>[write,capability('agent.read_file','read')],execute:async request=>request.capability==='agent.write_file'?(edits++,{success:true,output:{status:'unchanged',changed:false,paths:[],unchangedPaths:[request.args.path]}}):(reads++,{success:true,output:'read evidence '+reads})},options(connection,{workspace,approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value,onContent:value=>content+=value}))
  })
- assert.equal(edits,3);assert.equal(reads,2);assert.equal(outcome,'blocked');assert.match(content,/没有内容变化/)
+ assert.equal(edits,6);assert.equal(reads,5);assert.equal(outcome,'blocked');assert.match(content,/仍未产生有效修改/)
+})
+
+test('automatic edit recovery can read current content and complete a corrected edit',async t=>{
+ const workspace=mkdtempSync(path.join(tmpdir(),'myplane-edit-recovery-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const file=path.join(workspace,'tests.txt');writeFileSync(file,'before')
+ const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
+ let edits=0,reads=0,outcome='',answer=''
+ await withModel(input=>{
+  if(!input.tools?.length)return {content:'此前写入无变化；下一步读取 tests.txt 并核对内容。'}
+  if(edits<3)return toolCall(input,'agent.write_file',{path:'tests.txt',content:'before'})
+  if(!reads)return toolCall(input,'agent.read_file',{query:'tests.txt'})
+  if(edits===3)return toolCall(input,'agent.write_file',{path:'tests.txt',content:'after'})
+  return {content:'已核对修改后的测试内容'}
+ },async connection=>{
+  await runCoreChat({list:()=>[write,capability('agent.read_file','read')],execute:async request=>{
+   if(request.capability==='agent.read_file'){reads++;return {success:true,output:readFileSync(file,'utf8')}}
+   edits++
+   if(edits<=3)return {success:true,output:{status:'unchanged',changed:false}}
+   writeFileSync(file,String(request.args.content));return {success:true,output:{changed:true}}
+  }},options({...connection,contextLength:131072},{workspace,approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value,onContent:value=>answer+=value}))
+ })
+ assert.equal(edits,4)
+ assert.equal(reads,1)
+ assert.equal(outcome,'complete')
+ assert.equal(readFileSync(file,'utf8'),'after')
+ assert.match(answer,/核对修改/)
+})
+
+test('resuming with three old edit failures permits read-only diagnosis before recovery policy runs',async()=>{
+ const progress={files:{},ineffective:3},recoveryCounts=[]
+ let reads=0,outcome
+ const policies={invoke:async(id,data)=>{
+  if(id==='clarification-policy')return {ask:false,question:''}
+  if(id==='model-adapter')return {maxTokens:1024,temperature:0.2,toolLimit:32}
+  if(id==='tool-selection')return {ids:[]}
+  if(id==='history-memory')return {ids:[]}
+  if(id==='context-compaction')return {triggerRatio:0.8,retainRecent:4}
+  if(id==='error-recovery'){
+   recoveryCounts.push(data.ineffectiveEdits)
+   return data.ineffectiveEdits>=3?{action:'pause',reason:'旧失败次数不应停止读取'}:{action:'continue',reason:'继续诊断'}
+  }
+  if(id==='completion-review')return {status:data.status,reason:data.reason,nextStep:data.nextStep}
+  throw new Error(`Unexpected policy ${id}`)
+ }}
+ await withModel(input=>reads?{content:'已读取当前文件并核对内容'}:toolCall(input,'agent.read_file',{query:'tests/gomoku.test.js'}),async connection=>{
+  await runCoreChat({list:()=>[capability('agent.read_file','read')],execute:async()=>{reads++;return {success:true,output:{text:'当前测试内容'}}}},options(connection,{
+   filesEnabled:true,approvalMode:'full',editProgress:progress,abilityPolicies:policies,
+   currentStep:{title:'读取测试文件',acceptance:'确认当前测试内容'},onOutcome:value=>outcome=value
+  }))
+ })
+ assert.equal(reads,1)
+ assert.equal(outcome,'complete')
+ assert.deepEqual(recoveryCounts,[0])
+ assert.equal(progress.ineffective,0)
 })
 
 test('command timing and timeout variations are not fresh evidence',async()=>{
  let executions=0,outcome
- await withModel((input,n)=>toolCall(input,'agent.run_command',{query:'same command '+n}),async connection=>{
+ await withModel((input,n)=>input.tools?.length?toolCall(input,'agent.run_command',{query:'same command '+n}):{content:'现有命令结果不足以确认'},async connection=>{
   await runCoreChat({list:()=>[capability('agent.run_command')],execute:async()=>({success:true,output:{exitCode:0,output:'unchanged',durationMs:++executions}})},options(connection,{approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value}))
- })
+ },()=>({content:JSON.stringify({status:'continue',reason:'命令结果没有变化',nextStep:'检查实际验收证据'})}))
  assert.equal(executions,7);assert.equal(outcome,'blocked')
 })
 
@@ -340,6 +394,30 @@ test('chat discards truncated tool calls and recovers with bounded output withou
   assert.equal(requests[1].messages.some(m=>m.role==='assistant'&&m.tool_calls),false)
   assert.ok(requests.every(r=>r.max_tokens<=connection.contextLength/2));assert.ok(requests[1].max_tokens>requests[0].max_tokens);assert.ok(count>=3);assert.ok(usage>=3)
  })
+})
+
+test('oversized model stream retries a smaller step without publishing partial output',async()=>{
+ const requests=[];let reviews=0
+ const server=createServer(async(request,response)=>{
+  let body='';for await(const part of request)body+=part
+  const input=JSON.parse(body);requests.push(input)
+  const review=input.messages.some(message=>message.role==='system'&&String(message.content).includes('你是任务完成检查器'))
+  const content=review?(++reviews===1?'r'.repeat(1_100_000):JSON.stringify({status:'complete',reason:'已核对当前结果'})):requests.length===1?'x'.repeat(1_100_000):'当前步骤已完成'
+  response.setHeader('content-type','text/event-stream')
+  response.end(`data: ${JSON.stringify({choices:[{delta:{content},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`)
+ })
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
+ try{
+  const connection={endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:65536,contextLength:131072}
+  let answer='',outcome=''
+  await runCoreChat({list:()=>[],execute:async()=>assert.fail('partial tool calls must not run')},options(connection,{onContent:value=>answer+=value,onOutcome:value=>outcome=value}))
+  assert.equal(outcome,'complete')
+  assert.equal(answer,'当前步骤已完成')
+  assert.equal(requests.length,4)
+  assert.ok(requests[1].max_tokens<=4096)
+  assert.ok(requests[1].messages.some(message=>String(message.content).includes('只处理下一个最小步骤')))
+  assert.ok(requests[3].max_tokens<=2048)
+ }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}
 })
 
 test('chat repeated truncation stops after three requests and preserves a blocked outcome',async()=>{
@@ -647,6 +725,27 @@ test('invalid completion checks preserve candidate as unverified and never decla
   },()=>({content:'invalid'}))
 })
 
+test('long executions review a bounded evidence ledger with actual failures',async()=>{
+ let calls=0,outcome='',reviewAttempts=0
+ await withModel((input,n)=>n<=25?toolCall(input,'agent.web_search',{query:'source '+n}):{content:'已根据已读取资料列出可优化项。'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>++calls===1?{success:false,error:'first source unavailable'}:{success:true,output:'source evidence '+calls}},options({...connection,contextLength:131072},{messages:[{role:'user',content:'梳理项目可优化项'}],approvalMode:'full',onOutcome:value=>outcome=value}))
+  const reviews=requests.filter(request=>request.messages.some(message=>message.role==='system'&&String(message.content).includes('你是任务完成检查器'))),review=reviews[0]
+  assert.ok(review,'completion review was requested')
+  assert.equal(reviews.length,2)
+  assert.equal(calls,25)
+  assert.equal(outcome,'blocked')
+  assert.equal(review.messages.filter(message=>message.role==='tool').length,0,'the full tool transcript is omitted')
+  assert.ok(review.messages.length<=4,'the review context is bounded independently of operation count')
+  assert.ok(JSON.stringify(reviews[1].messages).length<JSON.stringify(review.messages).length,'the retry uses a smaller ledger')
+  const context=JSON.stringify(review.messages)
+  assert.match(context,/first source unavailable/)
+  assert.match(JSON.stringify(reviews[1].messages),/first source unavailable/)
+  assert.match(context,/source evidence 25/)
+  assert.deepEqual(JSON.parse(String(review.messages[1].content).split('\n').slice(1).join('\n')).unresolvedFailures,['agent.web_search'])
+  assert.match(context,/已根据已读取资料列出可优化项/)
+ },()=>++reviewAttempts===1?{content:'invalid'}:{content:JSON.stringify({status:'blocked',reason:'首个来源读取失败，仍需核对',nextStep:'核对失败来源'})})
+})
+
 test('completion review accepts a single JSON object wrapped in explanation and completed thinking',async()=>{
  let outcome=''
  await withModel(()=>({content:'回答内容'}),async(connection,requests)=>{
@@ -735,10 +834,22 @@ test('productive tasks automatically continue past twenty rounds and still requi
 
 test('unchanged successful tool results trigger a strategy correction and bounded pause',async()=>{
  let executed=0,outcome='',text=''
- await withModel(input=>toolCall(input,'agent.web_search',{query:'same query'}),async(connection,requests)=>{
+ await withModel(input=>input.tools?.length?toolCall(input,'agent.web_search',{query:'same query'}):{content:'现有搜索结果不足以回答'},async(connection,requests)=>{
   await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>{executed++;return {success:true,output:'unchanged'}}},options({...connection,contextLength:131072},{onOutcome:value=>outcome=value,onContent:value=>text+=value}))
   assert.equal(executed,7);assert.equal(outcome,'blocked');assert.match(text,/连续 6 轮/)
   assert.ok(requests.some(request=>request.messages.some(message=>String(message.content).includes('避免重复相同操作'))))
+ },()=>({content:JSON.stringify({status:'continue',reason:'尚缺少可靠来源',nextStep:'读取实际来源网页'})}))
+})
+
+test('stalled read-only analysis can finish from collected evidence without another tool call',async()=>{
+ let executed=0,outcome='',text=''
+ await withModel(input=>input.tools?.length?toolCall(input,'agent.read_file',{query:'same file'}):input.messages.some(message=>message.role==='tool'||message.tool_calls?.length)?{content:'<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name="cap_2_agent_read_file">'}:{content:'已根据读取结果列出性能、代码质量、可维护性、用户体验和测试覆盖的候选优化点。'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[capability('agent.read_file','read')],execute:async()=>{executed++;return {success:true,output:'项目源码与测试记录'}}},options({...connection,contextLength:131072},{filesEnabled:true,currentStep:{title:'梳理项目现状与可优化维度',acceptance:'依据已读取的源码和测试记录列出候选优化点，不修改文件'},reviewQueue:{phase:'implement',implementationRecovery:true,revision:0,checks:[]},onOutcome:value=>outcome=value,onContent:value=>text+=value}))
+  assert.equal(executed,7)
+  assert.equal(outcome,'complete',text)
+  assert.match(text,/候选优化点/)
+  assert.ok(requests.some(request=>!request.tools?.length&&request.messages.some(message=>String(message.content).includes('根据已成功取得的资料回答'))))
+  assert.ok(requests.filter(request=>!request.tools?.length).every(request=>request.messages.every(message=>message.role!=='tool'&&!message.tool_calls?.length)))
  })
 })
 
@@ -762,10 +873,10 @@ test('productive auto continuation completes beyond sixty rounds',async()=>{
 test('browser snapshot IDs do not keep an unchanged page loop running',async()=>{
  let executed=0,text='',outcome
  const browser={...capability('browser.read_page'),parameters:{type:'object',properties:{}},source:{type:'builtin'},runtime:'builtin'}
- await withModel(input=>toolCall(input,'browser.read_page',{}),async(connection)=>{
+ await withModel(input=>input.tools?.length?toolCall(input,'browser.read_page',{}):{content:'页面资料仍不足以完成'},async(connection)=>{
   await runCoreChat({list:()=>[browser],execute:async()=>({success:true,output:{snapshot:'fresh-'+ ++executed,url:'http://localhost/',text:'unchanged',elements:[]}})},options({...connection,contextLength:131072},{onOutcome:value=>outcome=value,onContent:value=>text+=value}))
   assert.equal(executed,7);assert.equal(outcome,'blocked');assert.match(text,/连续 6 轮/)
- })
+ },()=>({content:JSON.stringify({status:'continue',reason:'页面内容没有变化',nextStep:'核对其他来源'})}))
 })
 
 test('explicit limits above twenty are honored without an early stop',async()=>{
@@ -827,6 +938,60 @@ test('saved task items continue past the former sixteen-round cap and complete w
  assert.equal(executed,25);assert.equal(outcome,'complete')
  assert.equal(saved.at(-1).items[0].status,'complete')
  assert.equal(saved.at(-1).items[0].evidenceIds.length,25)
+})
+
+test('resumed optimization advice defers an unrelated failed test instead of blocking its checklist',async()=>{
+ const goal='项目还可以怎么优化',scope=createTaskScope(goal),check={id:'old-test',signature:'old-test',revision:0,status:'failed',attempts:1,title:'运行 Gomoku 测试',capability:'agent.run_test_case',args:{target:'tests/gomoku.test.js',runner:'node'},basis:goal,required:true,summary:'3 个用例失败'}
+ const plan={taskId:'advice',workspace:tmpdir(),scope,items:[{id:'advice-item',title:'梳理并确认可优化项清单',acceptance:'列出可优化项，不修改文件',status:'blocked',attempts:1,summary:'此前测试失败',evidenceIds:[],verification:[{kind:'test',script:'test'}],reviewQueue:{revision:0,checks:[check]}}],updatedAt:''}
+ let outcome='',verified=0
+ await runTaskPlan(options({endpoint:'http://127.0.0.1:9/v1',key:'',maxTokens:1024,contextLength:8192},{onOutcome:value=>outcome=value}),{taskId:plan.taskId,plan,save(){}},async step=>{
+  assert.equal(step.reviewQueue.checks[0].status,'deferred')
+  assert.deepEqual(plan.items[0].verification,[])
+  step.onOutcome('complete');step.onContent('候选优化项：补充失败用例分析与边界条件测试。')
+ },async()=>{verified++;return []})
+ assert.equal(outcome,'complete')
+ assert.equal(verified,0)
+ assert.equal(plan.items[0].status,'complete')
+})
+test('completed advice checklist discards model-added implementation tasks on resume',async()=>{
+ const scope=createTaskScope('项目还可以怎么优化'),workspace=tmpdir()
+ const plan={taskId:'advice-only',workspace,scope,items:[
+  {id:'list',title:'梳理并确认可优化项清单',acceptance:'列出优化建议，不修改文件',status:'complete',attempts:1,summary:'P0 测试稳定性；P1 搜索性能；P2 移动端清晰度。',evidenceIds:['source']},
+  {id:'edit',title:'实现 AI 搜索优化（置换表与迭代加深）',acceptance:'修改 useAI.js，npm test 全部通过',status:'blocked',attempts:1,summary:'没有修改源码',evidenceIds:[]},
+  {id:'review',title:'核对整体任务结果',acceptance:'整体检查',status:'pending',attempts:0,summary:'',evidenceIds:[]},
+ ],updatedAt:''}
+ let saved,outcome='',content=''
+ await runTaskPlan(options({endpoint:'http://127.0.0.1:9/v1',key:'',maxTokens:1024,contextLength:8192},{workspace,onOutcome:value=>outcome=value,onContent:value=>content+=value}),{taskId:plan.taskId,plan,save:value=>saved=value},async()=>assert.fail('已完成的建议清单无需再执行'))
+ assert.equal(outcome,'complete')
+ assert.equal(saved.items.length,1)
+ assert.equal(saved.items[0].id,'list')
+ assert.match(content,/搜索性能/)
+ assert.doesNotMatch(content,/实现 AI 搜索优化/)
+})
+
+test('new optimization advice gets one read-only task regardless of planner output',async()=>{
+ let seen,outcome=''
+ await runTaskPlan(options({endpoint:'http://127.0.0.1:9/v1',key:'',maxTokens:1024,contextLength:8192},{workspace:tmpdir(),onOutcome:value=>outcome=value}),{taskId:'new-advice',goal:'项目还可以怎么优化',save:value=>{seen=value}},async step=>{
+  assert.equal(step.currentStep.title,'梳理项目可优化项')
+  assert.match(step.currentStep.acceptance,/不修改任何文件/)
+  step.onOutcome('complete');step.onContent('候选项：改善 AI 搜索和测试稳定性。')
+ })
+ assert.equal(outcome,'complete')
+ assert.equal(seen.items.length,1)
+})
+test('optimization review treats prior failing tests as findings without requiring a rerun',async()=>{
+ const goal='项目还可以怎么优化';let outcome='',answer=''
+ await withModel(input=>{
+  assert.equal(input.tools?.some(tool=>/agent\.run_test_case|agent\.run_test|agent\.run_command/.test(tool.function.description)),false)
+  assert.ok(input.messages.some(message=>String(message.content).includes('失败结果是可引用的问题线索')))
+  return {content:'测试记录显示 63 项通过、3 项失败。候选优化项：定位失败用例的边界条件，补充对应测试；梳理性能和可维护性问题。'}
+ },async connection=>{
+  await runCoreChat({list:()=>[capability('agent.run_test_case'),capability('agent.read_file','read')],execute:async()=>assert.fail('无需重复运行测试')},options(connection,{filesEnabled:true,taskScope:createTaskScope(goal),currentStep:{title:'梳理并确认可优化项清单',acceptance:'依据已读取资料列出候选优化点，不修改文件'},onOutcome:value=>outcome=value,onContent:value=>answer+=value}))
+ },input=>{
+  assert.ok(input.messages.some(message=>String(message.content).includes('已有失败测试是待分析的项目现状')))
+  return {content:JSON.stringify({status:'complete',reason:'已列出候选优化项'})}
+ })
+ assert.equal(outcome,'complete');assert.match(answer,/3 项失败/)
 })
 
 test('remembered operations bypass waiting while changed arguments still prompt',async()=>{

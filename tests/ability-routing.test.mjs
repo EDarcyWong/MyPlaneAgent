@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AbilityModuleManager } from '../dist-electron/main/ability-modules/manager.js'
-import { routerContract, routerBaseline, validateRouterOutput, validateRouterInput, taskMessages, taskProgress,lookupBoundary } from '../dist-electron/main/ability-modules/routing.js'
+import { routerContract, routerBaseline, validateRouterOutput, validateRouterInput, taskMessages, taskProgress,lookupBoundary,standaloneProjectTask } from '../dist-electron/main/ability-modules/routing.js'
 
 const input = (text, intent = 'new_task', taskStatus = 'ready', hasAttachments = false) => ({ messages: [{ id: 'current', text }], intent, taskStatus, hasAttachments })
 test('standalone weather questions isolate destinations; aliases replace only the current target',()=>{
@@ -15,6 +15,13 @@ test('standalone weather questions isolate destinations; aliases replace only th
  for(const text of ['继续','明天呢','改成成都','补充：成都市明天下雨吗','还要查成都','读取天气查询代码'])assert.equal(lookupBoundary(text,'北京市明天下雨吗'),undefined,text)
  assert.deepEqual(validateRouterOutput({action:'new_task'},input('明天成都下雨吗','supplement','blocked')),{action:'new_task'})
  assert.equal(lookupBoundary('搜索最新科技新闻','北京市明天下雨吗'),'new_task')
+})
+test('project requests have their own task boundary after an unrelated weather question',()=>{
+ for(const text of ['分析当前项目','打开项目','项目还可以怎么优化']){
+  assert.equal(standaloneProjectTask(text),true)
+  assert.deepEqual(validateRouterOutput({action:'new_task'},input(text,'supplement','blocked')),{action:'new_task'})
+ }
+ for(const text of ['继续','补充：分析当前项目','改成分析当前项目'])assert.equal(standaloneProjectTask(text),false)
 })
 function fixture(t, generate) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myplane-routing-'))

@@ -11,7 +11,7 @@ import {estimateTokens} from '../dist-electron/main/local-ai-context.js'
 import {AgentWorkspace} from '../dist-electron/main/agent/workspace.js'
 import {extractDocument,makeDocument,makeSpreadsheet} from '../dist-electron/main/agent/documents.js'
 import {LocalAgentService} from '../dist-electron/main/agent/service.js'
-import {requestAgentModel,agentModelTiming,llamaToolDefinitions} from '../dist-electron/main/agent/model.js'
+import {requestAgentModel,agentModelTiming,llamaToolDefinitions,ModelResponseSizeError} from '../dist-electron/main/agent/model.js'
 const signal=()=>new AbortController().signal
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))
 async function until(check,label='condition'){const end=Date.now()+10000;while(!check()){if(Date.now()>end)throw new Error('Timed out: '+label);await pause(10)}}
@@ -354,6 +354,58 @@ test('stream errors and invalid tool indexes fail before any tool execution',asy
   const connection=await modelServer(t,async(_body,res)=>{streamHeaders(res);res.end(wire)})
   await assert.rejects(ask(connection),/overloaded|序号|格式错误/)
  }
+})
+
+test('oversized SSE payloads report a recoverable size error and discard partial tool calls',async t=>{
+ const connection=await modelServer(t,async(_body,res)=>{
+  streamHeaders(res)
+  const pending=frame({tool_calls:[{index:0,id:'partial',function:{name:'write_file',arguments:'{"path":"never.txt"'}}]})
+  const filler='data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:null}],padding:'x'.repeat(900000)})+'\n\n'
+  res.end(pending+filler.repeat(10))
+ })
+ await assert.rejects(ask(connection),error=>{
+  assert.ok(error instanceof ModelResponseSizeError)
+  assert.equal(error.kind,'wire')
+  assert.ok(error.observed>error.limit)
+  assert.deepEqual(error.output,{text:0,reasoning:0,arguments:19,calls:1})
+  return true
+ })
+})
+
+test('small SSE deltas can exceed the old transport ceiling without exceeding content capacity',async t=>{
+ const connection=await modelServer(t,async(_body,res)=>{
+  streamHeaders(res)
+  res.end(frame({content:'x'}).repeat(45000)+frame({},'stop')+'data: [DONE]\n\n')
+ })
+ const answer=await ask({...connection,maxTokens:65536,contextLength:131072})
+ assert.equal(answer.content.length,45000)
+})
+
+test('semantic response ceiling has a distinct size error with output breakdown',async t=>{
+ const connection=await modelServer(t,async(_body,res)=>{
+  streamHeaders(res)
+  res.end(frame({content:'a'.repeat(700000)})+frame({content:'b'.repeat(400000)})+frame({},'stop')+'data: [DONE]\n\n')
+ })
+ await assert.rejects(ask(connection),error=>{
+  assert.ok(error instanceof ModelResponseSizeError)
+  assert.equal(error.kind,'characters')
+  assert.equal(error.output.text,1100000)
+  assert.equal(error.output.calls,0)
+  return true
+ })
+})
+
+test('runaway SSE envelope overhead raises a recoverable wire-size error',async t=>{
+ const connection=await modelServer(t,async(_body,res)=>{
+  streamHeaders(res)
+  res.end(frame({content:'x'}).repeat(120000)+frame({},'stop')+'data: [DONE]\n\n')
+ })
+ await assert.rejects(ask({...connection,maxTokens:65536,contextLength:131072}),error=>{
+  assert.ok(error instanceof ModelResponseSizeError)
+  assert.equal(error.kind,'wire')
+  assert.ok(error.output.text<1024*1024)
+  return true
+ })
 })
 
 test('collects usage-only SSE trailers after finish_reason, including duplicate snapshots',async t=>{

@@ -1,4 +1,4 @@
-import {createTaskScope,scopeInstruction,isWebLookup,projectCheckTools,projectChecksRequested} from '../../../shared/task-scope.js'
+import {createTaskScope,scopeInstruction,isWebLookup,projectAdviceRequested,projectCheckTools,projectChecksRequested} from '../../../shared/task-scope.js'
 import {requiresImplementation} from './implementation-stage.js'
 import {recoverReviewQueue} from './review-dispatch.js'
 import {isReadCommand} from './read-evidence.js'
@@ -40,7 +40,18 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
   const goal=execution.goal??(typeof firstUser==='string'?firstUser:'')
   const scope=plan?.scope&&!plan.needsReplan?plan.scope:createTaskScope(goal)
   const save=()=>{plan!.updatedAt=new Date().toISOString();execution.save(structuredClone(plan!))}
-  if(!plan||plan.needsReplan||plan.taskId!==execution.taskId||plan.workspace!==options.workspace){
+  const adviceOnly=projectAdviceRequested(scope.goal)
+  if(adviceOnly){
+    const sameTask=plan?.taskId===execution.taskId&&plan.workspace===options.workspace&&!plan.needsReplan
+    const readOnly=sameTask?plan!.items.find(item=>!item.parentId&&!requiresImplementation(item.title,item.acceptance)&&item.status==='complete')??plan!.items.find(item=>!item.parentId&&!requiresImplementation(item.title,item.acceptance)):undefined
+    if(!sameTask||plan!.items.length!==1||!readOnly||plan!.items[0]!==readOnly){
+      const item=readOnly??{id:randomUUID(),title:'梳理项目可优化项',acceptance:'依据现有项目结构、源码、测试与运行记录列出候选优化点、影响范围和优先级；不修改任何文件，不将建议直接实施。',status:'pending' as const,attempts:0,summary:'',evidenceIds:[]}
+      plan={taskId:execution.taskId,workspace:options.workspace,scope,items:[item],editProgress:plan?.editProgress,updatedAt:''}
+      save()
+      options.onProgress?.('已将优化建议限定为清单，移除未获授权的实施步骤','working')
+    }
+  }
+  if(!adviceOnly&&(!plan||plan.needsReplan||plan.taskId!==execution.taskId||plan.workspace!==options.workspace)){
     const editProgress=plan?.taskId===execution.taskId&&plan.workspace===options.workspace?plan.editProgress:undefined
     options.onProgress?.('正在生成任务列表与逐项验收条件','working')
     options.onRequest()
@@ -56,12 +67,16 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     plan={taskId:execution.taskId,workspace:options.workspace,scope,items,editProgress,updatedAt:''}
     save()
   }
+  if(!plan)throw new Error('任务清单未建立')
   if(!plan.scope){plan.scope=scope;save()}
   plan.editProgress??={files:{},ineffective:0}
   for(const item of plan.items){
     options.signal.throwIfAborted()
     if(item.status==='complete')continue
-    const webLookup=isWebLookup(plan.scope!.goal)&&!requiresImplementation(item.title)&&!item.mutationStarted&&!item.requiresVerification&&!item.modifiedFiles?.length
+    // Failed edits from an earlier item or paused attempt must not stop
+    // read/verification tools before this item can inspect the current file.
+    if(plan.editProgress.ineffective){plan.editProgress.ineffective=0;save()}
+    const webLookup=isWebLookup(plan.scope!.goal)&&!requiresImplementation(item.title,item.acceptance)&&!item.mutationStarted&&!item.requiresVerification&&!item.modifiedFiles?.length
     const unrelatedProjectChecks=!projectChecksRequested(plan.scope!.goal)&&!item.mutationStarted&&!item.requiresVerification&&!item.modifiedFiles?.length
     if(unrelatedProjectChecks){
       const excluded=(item.verification||[]).filter(rule=>rule.kind==='test'||rule.kind==='diagnostics')
@@ -122,6 +137,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       await run({...options,planExecution:undefined,taskScope:plan.scope,reviewQueue:item.reviewQueue,onReviewQueue:save,editProgress:plan.editProgress,currentStep:{title:item.title,acceptance:item.acceptance,visualConfirmed,implementationChanged:!!item.modifiedFiles?.length,implementationPaths:[...new Set([...(item.modifiedFiles||[]),...(item.verification||[]).flatMap(rule=>rule.kind==='file'?[rule.path]:[])])]},maxRounds:options.maxRounds,
         onCompletionReview:review=>{item.completionReview=review;save();options.onCompletionReview?.(review)},
         beforeMutation:async(capability,args)=>{
+          if(adviceOnly)return '当前任务只要求提出优化建议，不包含修改文件或落实建议。请根据已取得的资料完成清单。'
           if(webLookup)return '当前任务仅查询网页信息，不包含本地修改。请读取目标页面并核对原验收要求。'
           const externalBlock=await options.beforeMutation?.(capability,args)
           if(externalBlock)return externalBlock
@@ -146,7 +162,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
         onActivity:activity=>{
           if(activity.status==='denied')denied=true
           if(activity.status==='complete'&&!item.evidenceIds.includes(activity.id))item.evidenceIds.push(activity.id)
-          if(activity.status==='complete'&&(textEditTools.has(activity.capability)||['agent.run_command','agent.create_document','agent.create_spreadsheet'].includes(activity.capability)&&!isReadCommand(activity.capability,activity.args)))item.requiresVerification=true
+          if(activity.status==='complete'&&(textEditTools.has(activity.capability)||['agent.run_command','agent.create_document','agent.replace_document_text','agent.create_spreadsheet','agent.update_spreadsheet_cells'].includes(activity.capability)&&!isReadCommand(activity.capability,activity.args)))item.requiresVerification=true
           if(activity.status==='complete'&&item.requiresVerification)item.mutationStarted=true
           if(activity.status==='complete'&&textEditTools.has(activity.capability)&&parsedToolResult(activity.output).changed!==false){
             const paths=activity.fileChanges?.map(change=>change.path)??(Array.isArray(activity.args.changes)?activity.args.changes.map(change=>change.path):[activity.args.path])

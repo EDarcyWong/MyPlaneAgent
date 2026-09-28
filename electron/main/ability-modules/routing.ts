@@ -7,6 +7,11 @@ import {isWebLookup} from '../../shared/task-scope.js'
 
 const clean = (text: string) => text.trim().replace(/[。！!？?\s]+$/g, '').toLowerCase()
 export const explicitNewTask = (text: string) => /^(新任务|换个任务|另外一个任务|new task)[:：\s]/i.test(text.trim())
+export function standaloneProjectTask(text:string){
+ const value=text.trim()
+ if(/^(补充|另外|还要|请注意|要求|不要|不许|保持|注意|改成|换成|更正|纠正|不是|继续)/.test(value))return false
+ return /^(?:请|帮我|麻烦)?(?:分析|梳理|检查|审查|打开|运行|启动|预览|评估)(?:一下)?(?:当前|这个|该|我的)?(?:项目|代码|仓库|源码)(?:$|[，。！？?\s]|还|有)/.test(value)||/^(?:当前|这个|该|我的)?项目(?:还可以|还能|还有哪些|如何|怎么).{0,24}优化/.test(value)
+}
 export function standaloneLookup(text:string){
  if(/^(补充|另外|还要|请注意|要求|不要|不许|保持|注意|改成|换成|更正|纠正|不是|日期改为|also|do not|change to|actually)/i.test(text.trim()))return false
  const weather=parseWeatherRequest(text)
@@ -40,7 +45,7 @@ export function validateRouterOutput(value: unknown, input: AbilityInput): Route
   if (explicitNewTask(text) && action !== 'new_task') throw new Error('明确新任务必须隔离旧任务上下文')
   if (action === 'cancel' && (input.hasAttachments || !cancelCommand(text))) throw new Error('取消必须来自明确的当前用户命令')
   if (action === 'progress' && (input.hasAttachments || !(progressCommand(text) || input.intent === 'progress'))) throw new Error('进度路由必须来自当前查询')
-  if (action === 'new_task' && input.taskStatus !== 'none' && !explicitNewTask(text)&&!standaloneLookup(text)) throw new Error('不能静默丢弃已有任务')
+  if (action === 'new_task' && input.taskStatus !== 'none' && !explicitNewTask(text)&&!standaloneLookup(text)&&!standaloneProjectTask(text)) throw new Error('不能静默丢弃已有任务')
   if ((action === 'continue' || action === 'amend') && input.taskStatus === 'none') throw new Error('没有可继续或补充的任务')
   if (action === 'continue' && !continueCommand(text) && input.intent !== 'continue') throw new Error('继续必须有当前用户请求')
   return { action }
@@ -49,6 +54,7 @@ export const routerBaseline = `function process(input) {
   const text = input.messages[0].text.trim();
   const clean = text.replace(/[。！!？?\\s]+$/g, '').toLowerCase();
   if (/^(新任务|换个任务|另外一个任务|new task)[:：\\s]/i.test(text)) return {action:'new_task'};
+  if (/^(?:请|帮我|麻烦)?(?:分析|梳理|检查|审查|打开|运行|启动|预览|评估)(?:一下)?(?:当前|这个|该|我的)?(?:项目|代码|仓库|源码)(?:$|[，。！？?\\s]|还|有)/.test(text) || /^(?:当前|这个|该|我的)?项目(?:还可以|还能|还有哪些|如何|怎么).{0,24}优化/.test(text)) return {action:'new_task'};
   if (!input.hasAttachments) {
     if (/^(取消|停止|暂停|不用做了|停止任务|取消任务|暂停任务|cancel|stop|pause)$/.test(clean)) return {action:'cancel'};
     if (/^(做到哪了|进度如何|现在进度|进度|查看进度|任务进度|status|progress)$/.test(clean) || input.intent==='progress') return {action:'progress'};

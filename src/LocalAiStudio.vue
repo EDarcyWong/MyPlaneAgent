@@ -8,7 +8,7 @@ import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue'
 import ChatWorkbench from './local-ai/ChatWorkbench.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import AutomationTasks from './local-ai/AutomationTasks.vue'
-import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ArrowLeft,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
+import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ChatDotRound,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentSkillManager from './local-ai/AgentSkillManager.vue'
 import ExperienceLibraryCard from './local-ai/ExperienceLibraryCard.vue'
@@ -31,22 +31,35 @@ const agentSkillManager=ref<InstanceType<typeof AgentSkillManager>|null>(null)
 const workflowDesigner=ref<InstanceType<typeof WorkflowDesigner>|null>(null)
 const automationTasks=ref<InstanceType<typeof AutomationTasks>|null>(null)
 const logOutputOpen=ref(false)
+const moreOpen=ref(false)
+const moreWrap=ref<HTMLElement|null>(null)
+const moreTrigger=ref<HTMLButtonElement|null>(null)
 let disposeLogToggle:(()=>void)|undefined,disposeLogRequest:(()=>void)|undefined
-onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true})})
-onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.()})
-const navigation=[{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'abilities',label:'能力模块',icon:Cpu},{id:'experience',label:'知识库',icon:Document},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
+function closeMoreOnOutside(event:PointerEvent){if(!moreWrap.value?.contains(event.target as Node))moreOpen.value=false}
+onMounted(()=>{disposeLogToggle=window.myplane.onApplicationLogToggle(()=>{logOutputOpen.value=!logOutputOpen.value});disposeLogRequest=applicationLogRequested(()=>{logOutputOpen.value=true});document.addEventListener('pointerdown',closeMoreOnOutside)})
+onBeforeUnmount(()=>{disposeLogToggle?.();disposeLogRequest?.();document.removeEventListener('pointerdown',closeMoreOnOutside)})
+const navigation=[{id:'chat',label:'会话',icon:ChatDotRound},{id:'workflow',label:'工作流',icon:Share},{id:'automation',label:'定时任务',icon:AlarmClock},{id:'abilities',label:'能力模块',icon:Cpu},{id:'experience',label:'知识库',icon:Document},{id:'skills',label:'插件',icon:Operation},{id:'mcp',label:'MCP 服务',icon:Connection},{id:'discover',label:'发现模型',icon:Search},{id:'models',label:'我的模型',icon:FolderOpened},{id:'server',label:'模型服务',icon:VideoPlay},{id:'settings',label:'应用设置',icon:Setting}] as const
+const visibleNavigation=navigation.slice(0,4)
+const moreNavigation=navigation.slice(4)
+const moreActive=computed(()=>moreNavigation.some(item=>item.id===tab.value))
 const settingsMode=computed(()=>tab.value!=='chat')
-const settingsQuery=ref('')
-const lastSettingsTab=ref<typeof tab.value>('settings')
-const settingsKeywords:Record<string,string>={experience:'知识库 经验 记忆 流程 天气 验证 knowledge memory',skills:'Skills Skill 技能插件编辑 编译 能力注册表 可用能力 工具',mcp:'工具 服务',discover:'搜索 下载 Hugging Face',models:'本地 导入 模型库',server:'本地 远程 API 启动 配置',workflow:'流程 自动化',automation:'计划 定时 自动化',settings:'外观 主题 存储 偏好'}
-const filteredNavigation=computed(()=>{
- const words=settingsQuery.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
- return navigation.filter(item=>words.every(word=>`${item.label} ${item.id} ${settingsKeywords[item.id]||''}`.toLowerCase().includes(word)))
-})
-watch(tab,value=>{if(value!=='chat')lastSettingsTab.value=value})
-async function openSettings(){settingsQuery.value='';tab.value=lastSettingsTab.value;await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.settings-back')?.focus()}
-async function openModelSettings(){settingsQuery.value='';tab.value='server';await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.settings-back')?.focus()}
-async function returnToChat(){drawer.value=false;logOutputOpen.value=false;tab.value='chat';await nextTick();studioRoot.value?.querySelector<HTMLButtonElement>('.chat-settings-button')?.focus()}
+watch(tab,()=>{moreOpen.value=false})
+async function focusActiveNavigation(){await nextTick();if(moreActive.value)moreTrigger.value?.focus();else studioRoot.value?.querySelector<HTMLButtonElement>('.settings-feature-list [aria-current="page"]')?.focus()}
+async function toggleMoreMenu(){moreOpen.value=!moreOpen.value;if(moreOpen.value){await nextTick();const item=moreWrap.value?.querySelector<HTMLButtonElement>('.settings-more-menu [aria-current="page"]')||moreWrap.value?.querySelector<HTMLButtonElement>('.settings-more-menu button');item?.focus()}}
+function closeMoreMenu(){moreOpen.value=false;moreTrigger.value?.focus()}
+function onNavigationEscape(event:KeyboardEvent){if(!moreOpen.value)return;event.preventDefault();event.stopPropagation();closeMoreMenu()}
+function onMoreMenuKeydown(event:KeyboardEvent){
+ if(!['ArrowDown','ArrowUp','Home','End'].includes(event.key))return
+ const items=Array.from(moreWrap.value?.querySelectorAll<HTMLButtonElement>('.settings-more-menu button')||[])
+ if(!items.length)return
+ event.preventDefault()
+ const current=items.indexOf(document.activeElement as HTMLButtonElement)
+ const next=event.key==='Home'?0:event.key==='End'?items.length-1:event.key==='ArrowDown'?(current+1)%items.length:(current-1+items.length)%items.length
+ items[next]?.focus()
+}
+async function openModelSettings(){tab.value='server';await focusActiveNavigation()}
+function selectNavigation(id:typeof tab.value){if(id==='chat'){drawer.value=false;logOutputOpen.value=false}tab.value=id;moreOpen.value=false}
+function returnToChat(){selectNavigation('chat')}
 const appearanceStyles=[{id:'minimal',name:'极简',description:'克制的灰阶界面'},{id:'ocean',name:'海蓝',description:'清爽的蓝色工作区'},{id:'paper',name:'暖纸',description:'柔和的暖色层次'},{id:'terminal',name:'程式',description:'编辑器配色与高对比强调'}] as const
 const pageTitle=computed(()=>navigation.find(item=>item.id===tab.value)?.label||'本地 AI')
 const memoryPercent=computed(()=>hardware.value?Math.round((1-hardware.value.freeMemory/hardware.value.totalMemory)*100):0)
@@ -107,18 +120,21 @@ function fillRemotePreset(event:Event){
 
 <template>
  <section ref="studioRoot" class="local-ai-studio" :class="{standalone,'has-background':validBackgroundImage(settings.backgroundImage),'settings-view':settingsMode,'chat-view':!settingsMode,'narrow-layout':narrow,'compact-layout':compact,'floating-inspector':floatingInspector,'is-resizing':resizing}" :style="[layoutStyle,backgroundStyle]" :data-theme="settings.theme" :data-style="settings.appearanceStyle" @keydown="layoutKey">
-  <aside v-if="settingsMode" class="settings-navigation" aria-label="设置导航">
-   <button type="button" class="settings-back" @click="returnToChat"><ArrowLeft/><span>返回应用</span></button>
-   <label class="settings-search"><Search/><input v-model="settingsQuery" type="search" placeholder="搜索设置" aria-label="搜索设置"/></label>
-   <nav class="settings-feature-list" aria-label="功能设置">
-    <button v-for="item in filteredNavigation" :key="item.id" type="button" :class="{active:tab===item.id}" :aria-label="item.label" :aria-current="tab===item.id?'page':undefined" @click="tab=item.id"><component :is="item.icon"/><span>{{item.label}}</span></button>
-    <p v-if="!filteredNavigation.length" class="settings-search-empty" role="status">没有匹配的设置</p>
+  <aside class="settings-navigation" aria-label="主菜单">
+   <nav class="settings-feature-list" aria-label="主菜单" @keydown.esc="onNavigationEscape">
+    <button v-for="item in visibleNavigation" :key="item.id" type="button" class="settings-rail-button" :class="{active:tab===item.id}" :title="item.label" :aria-label="item.label" :aria-current="tab===item.id?'page':undefined" @click="selectNavigation(item.id)"><component :is="item.icon"/></button>
+    <div ref="moreWrap" class="settings-more">
+     <button ref="moreTrigger" type="button" class="settings-rail-button settings-more-trigger" :class="{active:moreActive}" title="更多菜单" aria-label="更多菜单" aria-haspopup="menu" aria-controls="settings-more-menu" :aria-expanded="moreOpen" @click="toggleMoreMenu">···</button>
+     <div v-if="moreOpen" id="settings-more-menu" class="settings-more-menu" role="menu" aria-label="更多菜单" @keydown="onMoreMenuKeydown">
+      <button v-for="item in moreNavigation" :key="item.id" type="button" role="menuitem" :class="{active:tab===item.id}" :aria-current="tab===item.id?'page':undefined" @click="selectNavigation(item.id)"><component :is="item.icon"/><span>{{item.label}}</span></button>
+     </div>
+    </div>
    </nav>
   </aside>
   <div class="studio-main">
-   <header v-if="settingsMode" class="studio-topbar"><div class="brand"><strong>设置</strong><span class="topbar-divider"></span><span>{{pageTitle}}</span></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" title="新建工作流" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建插件" aria-label="新建插件" @click="agentSkillManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本机托管 · 数据留在本机':'外部 API · 请求发送至 API'}}</span></header>
+   <header v-if="settingsMode" class="studio-topbar"><div class="brand"><strong>{{pageTitle}}</strong></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" title="新建工作流" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建插件" aria-label="新建插件" @click="agentSkillManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本机托管 · 数据留在本机':'外部 API · 请求发送至 API'}}</span></header>
    <div v-if="error" class="error-banner" role="alert"><span>{{error}}</span><button @click="error=''">关闭</button></div>
-   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" @settings="openSettings" @models="openModelSettings"/>
+   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" @models="openModelSettings"/>
    <div v-if="!ready" class="initial-loading"><div class="loading-orbit"></div><h3>{{error?'工作区暂时无法载入':'正在准备本地工作区'}}</h3><p>{{error?'请检查上方错误提示，修复后重新打开此窗口。':'读取本地模型、配置和会话记录'}}</p></div>
 
    <WorkflowDesigner ref="workflowDesigner" v-else-if="tab==='workflow'" :model="model" :models="workflowModels" :theme="settings.theme" :appearance-style="settings.appearanceStyle"/>
@@ -244,21 +260,24 @@ function fillRemotePreset(event:Event){
 <style scoped src="./local-ai/studio-workbench.css"></style>
 
 <style scoped>
-.settings-view{--s-rail-width:224px}
-.settings-navigation{width:var(--s-rail-width);flex:none;display:flex;flex-direction:column;gap:20px;padding:22px 14px 16px;background:var(--s-rail);border-right:1px solid var(--s-border);min-height:0}
-.settings-back{display:flex;align-items:center;gap:10px;align-self:flex-start;border:0;background:transparent;padding:8px 10px;border-radius:8px;font-weight:600;color:var(--s-text)}
-.settings-back:hover{background:var(--s-accent-soft)}
-.settings-search{display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--s-panel);border:1px solid var(--s-border);border-radius:8px;color:var(--s-dim)}
-.settings-search svg{width:16px;height:16px}.settings-search input{width:100%;border:0;padding:9px 0;background:transparent;font-size:13px}
-.settings-feature-list{display:flex;flex-direction:column;gap:5px;overflow:auto;min-height:0}
-.settings-feature-list>button{display:flex;align-items:center;gap:12px;flex:none;text-align:left;border:0;background:transparent;border-radius:8px;padding:11px 12px;color:var(--s-dim)}
-.settings-feature-list>button:hover{background:var(--s-muted);color:var(--s-text)}
-.settings-feature-list>button.active{background:var(--s-accent-soft);color:var(--s-text);font-weight:600}
-.settings-feature-list svg{width:18px;height:18px}
-.settings-search-empty{padding:12px 8px;color:var(--s-dim);font-size:13px}
+.settings-navigation{position:relative;z-index:30;width:var(--s-rail-width);flex:none;display:flex;flex-direction:column;padding:14px 6px;background:var(--s-rail);border-right:1px solid var(--s-border);min-height:0}
+.settings-feature-list{display:flex;flex-direction:column;align-items:center;gap:5px;min-height:0}
+.settings-rail-button{position:relative;display:grid;place-items:center;width:42px;height:42px;flex:none;border:0;background:transparent;border-radius:9px;padding:0;color:var(--s-dim);cursor:pointer}
+.settings-feature-list>.settings-rail-button:first-child{margin-bottom:12px}
+.settings-feature-list>.settings-rail-button:first-child::after{content:'';position:absolute;bottom:-9px;left:7px;width:28px;height:1px;background:var(--s-border)}
+.settings-rail-button:hover{background:var(--s-muted);color:var(--s-text)}
+.settings-rail-button.active{background:var(--s-accent-soft);color:var(--s-text)}
+.settings-rail-button:focus-visible,.settings-more-menu button:focus-visible{outline:2px solid var(--s-accent);outline-offset:2px}
+.settings-rail-button svg{width:20px;height:20px}
+.settings-more{position:relative;flex:none}
+.settings-more-trigger{font-size:23px;line-height:1;letter-spacing:-2px;padding-right:3px;padding-bottom:10px}
+.settings-more-menu{position:absolute;top:0;left:calc(100% + 10px);width:176px;max-height:calc(100vh - 230px);min-height:100px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;padding:7px;background:var(--s-panel);border:1px solid var(--s-border);border-radius:10px;box-shadow:var(--s-shadow,0 12px 36px #0002)}
+.settings-more-menu button{display:flex;align-items:center;gap:11px;flex:none;width:100%;min-height:38px;padding:7px 10px;border:0;border-radius:7px;background:transparent;color:var(--s-text);font-size:13px;text-align:left;white-space:nowrap;cursor:pointer}
+.settings-more-menu button:hover,.settings-more-menu button.active{background:var(--s-accent-soft)}
+.settings-more-menu svg{width:17px;height:17px;color:var(--s-dim)}
 .chat-view>.studio-main{padding-bottom:0}
 .settings-view .studio-topbar{display:flex}
-@media(max-width:900px){.settings-view{--s-rail-width:188px}.settings-navigation{padding:16px 10px}.settings-view .privacy-label{display:none}.settings-view .studio-topbar{padding:0 14px;gap:10px}}
+@media(max-width:900px){.settings-view .privacy-label{display:none}.settings-view .studio-topbar{padding:0 14px;gap:10px}}
 </style>
 
 <style scoped>

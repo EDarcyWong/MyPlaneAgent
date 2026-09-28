@@ -20,8 +20,16 @@ export class AgentToolStore {
  }
  private seed(){
   let changed=false;const runtimeRevision=this.python.revision()
-  for(const definition of agentTools as ToolDefinition[]){const key=definition.function.name;if(this.tools.some(tool=>tool.key===key))continue;const id=randomUUID(),version:AgentToolVersion={toolId:id,version:1,name:key,description:definition.function.description,parameters:definition.function.parameters,python:builtinPython(key),risk:readTools.has(key)||['read_history','set_plan'].includes(key)?'read':['run_command','run_test','run_test_case','get_diagnostics','http_request'].includes(key)?'high':'write',timeoutMs:['read_document','create_document','create_spreadsheet','image_ocr','archive_inspect'].includes(key)?120000:['run_test_case','get_diagnostics'].includes(key)?300000:30000,runtimeRevision,changeNote:'系统初始版本',createdAt:new Date().toISOString()};this.tools.push({id,key,builtin:true,enabled:true,archived:false,activeVersion:1,versions:[version]});changed=true}
-  for(const tool of this.tools.filter(item=>item.builtin)){const current=tool.versions.find(version=>version.version===tool.activeVersion);if(!current||current.python!==builtinPython(tool.key)||current.runtimeRevision===runtimeRevision)continue;const version=Math.max(0,...tool.versions.map(item=>item.version))+1;tool.versions.push({...current,version,runtimeRevision,changeNote:'同步 Python 运行时实现 '+runtimeRevision.slice(0,12),createdAt:new Date().toISOString()});tool.activeVersion=version;changed=true}
+  for(const definition of agentTools as ToolDefinition[]){const key=definition.function.name;if(this.tools.some(tool=>tool.key===key))continue;const id=randomUUID(),version:AgentToolVersion={toolId:id,version:1,name:key,description:definition.function.description,parameters:definition.function.parameters,python:builtinPython(key),risk:readTools.has(key)||['read_history','set_plan'].includes(key)?'read':['run_command','run_test','run_test_case','get_diagnostics','http_request'].includes(key)?'high':'write',timeoutMs:['read_document','create_document','replace_document_text','create_spreadsheet','update_spreadsheet_cells','image_ocr','pdf_ocr','archive_inspect'].includes(key)?120000:['run_test_case','get_diagnostics'].includes(key)?300000:30000,runtimeRevision,changeNote:'系统初始版本',createdAt:new Date().toISOString()};this.tools.push({id,key,builtin:true,enabled:true,archived:false,activeVersion:1,versions:[version]});changed=true}
+  for(const tool of this.tools.filter(item=>item.builtin)){
+   const current=tool.versions.find(version=>version.version===tool.activeVersion),definition=(agentTools as ToolDefinition[]).find(item=>item.function.name===tool.key)?.function
+   if(!current||current.python!==builtinPython(tool.key))continue
+   const managed=current.changeNote==='系统初始版本'||current.changeNote.startsWith('同步 Python 运行时实现 ')
+   const schemaChanged=!!definition&&managed&&(current.description!==definition.description||JSON.stringify(current.parameters)!==JSON.stringify(definition.parameters))
+   if(current.runtimeRevision===runtimeRevision&&!schemaChanged)continue
+   const version=Math.max(0,...tool.versions.map(item=>item.version))+1
+   tool.versions.push({...current,...(schemaChanged?{description:definition!.description,parameters:definition!.parameters}:{}),version,runtimeRevision,changeNote:'同步 Python 运行时实现 '+runtimeRevision.slice(0,12),createdAt:new Date().toISOString()});tool.activeVersion=version;changed=true
+  }
   for(const tool of this.tools)for(const version of tool.versions){const risk=this.risk(tool,version);if(version.risk!==risk){version.risk=risk;changed=true}}
   if(changed)this.persist()
  }
@@ -49,12 +57,12 @@ export class AgentToolStore {
   const v=tool.current,definition:ToolDefinition={type:'function',function:{name:tool.key,description:v.description,parameters:v.parameters}}
   const execute=async(args:Record<string,unknown>,signal:AbortSignal,context:Record<string,unknown>={})=>{
    if(!tool.builtin||v.python!==builtinPython(tool.key))return (await this.python.execute({tool:tool.key,args,workspace,code:v.python,context},signal,v.timeoutMs)).output
-   if(!['write_file','replace_text','apply_patch','create_document','create_spreadsheet','run_command','run_test'].includes(tool.key))return (await this.python.execute({tool:tool.key,args,workspace,code:v.python,context},signal,v.timeoutMs)).output
+   if(!['write_file','replace_text','apply_patch','create_document','replace_document_text','create_spreadsheet','update_spreadsheet_cells','run_command','run_test'].includes(tool.key))return (await this.python.execute({tool:tool.key,args,workspace,code:v.python,context},signal,v.timeoutMs)).output
    const prepared=await this.python.execute({tool:tool.key,args,workspace,code:v.python,context:{...context,phase:'plan'}},signal,v.timeoutMs),value=JSON.parse(prepared.output)
    const committed=await this.python.execute({tool:tool.key,args,workspace,code:v.python,context:{...context,phase:'commit',plan:value.plan}},signal,v.timeoutMs),result=JSON.parse(committed.output)
    return JSON.stringify({...result,_preview:value.preview})
   }
-  const prepare:ToolSpec['prepare']=tool.builtin&&v.python===builtinPython(tool.key)&&['write_file','replace_text','apply_patch','create_document','create_spreadsheet','run_command','run_test'].includes(tool.key)?async(args,signal,context)=>{
+  const prepare:ToolSpec['prepare']=tool.builtin&&v.python===builtinPython(tool.key)&&['write_file','replace_text','apply_patch','create_document','replace_document_text','create_spreadsheet','update_spreadsheet_cells','run_command','run_test'].includes(tool.key)?async(args,signal,context)=>{
    if(['run_command','run_test'].includes(tool.key))return new AgentWorkspace(workspace).prepare(tool.key,args,signal)
    const prepared=await this.python.execute({tool:tool.key,args,workspace,code:v.python,context:{...context,phase:'plan'}},signal,v.timeoutMs),value=JSON.parse(prepared.output)
    return {preview:value.preview,artifact:value.artifact,expectedFiles:value.plan.changes.map((change:{path:string;expected:string|null;afterHex?:string;after?:string})=>({path:change.path,beforeHash:change.expected,afterHash:createHash('sha256').update(change.afterHex!==undefined?Buffer.from(change.afterHex,'hex'):Buffer.from(change.after||'')).digest('hex')})),execute:async commitSignal=>{

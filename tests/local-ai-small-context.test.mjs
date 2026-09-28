@@ -96,6 +96,7 @@ test('external tools share the schema budget and can be selected by name',async 
  let round=0
  const spec=(name,description)=>({definition:{type:'function',function:{name,description,parameters:{type:'object',properties:{},additionalProperties:false}}},source:'mcp:fixture',risk:'high',timeoutMs:1000,execute:async()=>JSON.stringify({ok:true})})
  const h=await harness(t,body=>{
+  if(!body.tools)return response('已保留原始用户要求和已完成的工具调用。')
   const names=body.tools.map(item=>item.function.name);assert.ok(!names.includes('external_huge'))
   if(round++===0)return response(null,[call('load_tool_pack',{pack:'external_small'})])
   assert.ok(names.includes('external_small'));return response('已发现外部工具')

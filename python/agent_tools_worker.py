@@ -1,6 +1,6 @@
 """MyPlane Agent tool worker. One JSON request on stdin, one JSON response on stdout."""
 from __future__ import annotations
-import ast, contextlib, csv, difflib, hashlib, io, ipaddress, json, mimetypes, os, pathlib, re, socket, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
+import ast, contextlib, csv, difflib, fnmatch, hashlib, io, ipaddress, json, mimetypes, os, pathlib, posixpath, re, shutil, socket, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
 from html import escape, unescape
 from xml.etree import ElementTree as ET
 
@@ -233,6 +233,66 @@ def xlsx_bytes(sheets):
         z.writestr('xl/workbook.xml','<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'+''.join(sheet_defs)+'</sheets></workbook>')
         z.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'+''.join(rels)+'</Relationships>')
     return out.getvalue()
+
+def rewrite_zip_part(data,part,content):
+    output=io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source,zipfile.ZipFile(output,'w') as target:
+        entries=source.infolist();names=[item.filename for item in entries]
+        if part not in names: raise ValueError('文档缺少目标 XML 部件')
+        if len(entries)>10000 or len(names)!=len(set(names)) or sum(item.file_size for item in entries)>200*1024*1024: raise ValueError('Office 文档过大或压缩包结构异常')
+        for item in entries: target.writestr(item,content if item.filename==part else source.read(item.filename))
+    result=output.getvalue()
+    with zipfile.ZipFile(io.BytesIO(result)) as check:
+        if check.testzip() is not None: raise ValueError('修改后文档压缩包校验失败')
+        ET.fromstring(check.read(part))
+    return result
+
+def replace_docx_text(data,old,new):
+    part='word/document.xml'
+    with zipfile.ZipFile(io.BytesIO(data)) as archive: source=archive.read(part).decode('utf-8')
+    pattern=re.compile(r'(<w:t\b[^>]*>)(.*?)(</w:t>)',re.S)
+    matches=[match for match in pattern.finditer(source) if old in unescape(match.group(2))]
+    if len(matches)!=1 or unescape(matches[0].group(2)).count(old)!=1:
+        raise ValueError('待替换文字须在一个 Word 文本片段中唯一出现；跨格式片段或多处匹配请手动编辑')
+    match=matches[0];replacement=match.group(1)+office_xml(unescape(match.group(2)).replace(old,new))+match.group(3)
+    return rewrite_zip_part(data,part,(source[:match.start()]+replacement+source[match.end():]).encode('utf-8'))
+
+def update_xlsx_cells(data,sheet,updates):
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        ns={'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main','r':'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+        book=ET.fromstring(archive.read('xl/workbook.xml'))
+        node=next((item for item in book.findall('.//s:sheet',ns) if item.get('name')==sheet),None)
+        if node is None: raise ValueError('工作表不存在：'+sheet)
+        relation=node.get('{'+ns['r']+'}id')
+        links=ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))
+        link=next((item for item in links if item.get('Id')==relation),None)
+        if link is None: raise ValueError('工作表关系无效')
+        destination=link.get('Target','')
+        part=destination.lstrip('/') if destination.startswith('/') else posixpath.normpath(posixpath.join('xl',destination))
+        if not part.startswith('xl/worksheets/') or part not in archive.namelist(): raise ValueError('工作表路径无效')
+        source=archive.read(part).decode('utf-8')
+    if not 1<=len(updates)<=50: raise ValueError('每次只能更新 1–50 个单元格')
+    seen=set()
+    for item in updates:
+        address=str(item['cell']).upper()
+        if not re.fullmatch(r'[A-Z]{1,3}[1-9][0-9]{0,6}',address) or address in seen: raise ValueError('单元格地址无效或重复')
+        seen.add(address)
+        pattern=re.compile(r'<(?P<prefix>[A-Za-z_][\w.-]*:)?c\b(?P<attrs>[^>]*\br=["\']'+re.escape(address)+r'["\'][^>]*)>(?P<body>.*?)</(?:[A-Za-z_][\w.-]*:)?c>',re.S)
+        matches=list(pattern.finditer(source))
+        if len(matches)!=1: raise ValueError('只允许修改已存在且唯一的单元格：'+address)
+        match=matches[0]
+        if re.search(r'<(?:\w+:)?f\b',match.group('body')): raise ValueError('公式单元格不可直接覆盖：'+address)
+        prefix=match.group('prefix') or ''
+        attrs=re.sub(r'\s+t=["\'][^"\']*["\']','',match.group('attrs'))
+        value=item.get('value')
+        if isinstance(value,str): content=f'<{prefix}is><{prefix}t>{office_xml(value)}</{prefix}t></{prefix}is>';attrs+=' t="inlineStr"'
+        elif isinstance(value,(int,float)) and not isinstance(value,bool): content=f'<{prefix}v>{value}</{prefix}v>'
+        elif value is None: content=''
+        else: raise ValueError('单元格值必须是文本、数字或 null')
+        replacement=f'<{prefix}c{attrs}>{content}</{prefix}c>'
+        source=source[:match.start()]+replacement+source[match.end():]
+    return rewrite_zip_part(data,part,source.encode('utf-8'))
+
 def prepare_write(root,tool,args):
     if tool=='apply_patch':
         changes=[];seen=set()
@@ -257,12 +317,30 @@ def prepare_write(root,tool,args):
     elif tool=='replace_text':
         if before is None: raise ValueError('待修改文件不存在')
         source=before.decode();old=args['oldText']
-        if source.count(old)!=1: raise ValueError('待替换片段必须唯一匹配')
+        matches=source.count(old)
+        if matches!=1:
+            detail=f'待替换片段必须唯一匹配（实际匹配 {matches} 处）。'
+            if matches==0:
+                if '\\\\n' in old and source.count(old.replace('\\\\n','\\n'))==1:
+                    detail+='旧片段使用了两个反斜杠加 n，文件中是一个反斜杠加 n；请重新读取文件并按原文传入 oldText。'
+                elif '\\n' in old and source.count(old.replace('\\n','\n'))==1:
+                    detail+='旧片段使用了字面的反斜杠加 n，文件中是实际换行；请重新读取文件并按原文传入 oldText。'
+                else: detail+='请重新读取目标文件，核对 oldText 与当前内容完全一致。'
+            else: detail+='请扩大 oldText 的上下文，使其只出现一次。'
+            raise ValueError(detail)
         shown=source.replace(old,args['newText']);data=shown.encode();kind='file'
     elif tool=='create_document':
         if not re.search(r'\.(docx|md|txt)$',relative,re.I): raise ValueError('文档输出仅支持 .docx、.md、.txt；Word 文档必须使用 .docx，不能使用 .doc')
         kind='document';shown='# '+args['title']+'\n\n'+args['content'];data=docx_bytes(args['title'],args['content']) if relative.lower().endswith('.docx') else shown.encode()
+    elif tool=='replace_document_text':
+        if file.suffix.lower()!='.docx' or before is None: raise ValueError('请选择现有 DOCX 文档')
+        if len(before)>50*1024*1024: raise ValueError('Office 文档不能超过 50 MB')
+        kind='document';shown=args['oldText']+' → '+args['newText'];data=replace_docx_text(before,args['oldText'],args['newText'])
     elif tool=='create_spreadsheet': kind='spreadsheet';shown=compact(args['sheets']);data=xlsx_bytes(args['sheets'])
+    elif tool=='update_spreadsheet_cells':
+        if file.suffix.lower()!='.xlsx' or before is None: raise ValueError('请选择现有 XLSX 工作簿')
+        if len(before)>50*1024*1024: raise ValueError('Office 文档不能超过 50 MB')
+        kind='spreadsheet';shown=compact({'sheet':args['sheet'],'updates':args['updates']});data=update_xlsx_cells(before,args['sheet'],args['updates'])
     else: raise ValueError('未知写入工具')
     return {'preview':{'path':relative,'before':before.decode(errors='replace') if before and kind=='file' else None,'after':shown,'note':'由 Python 工具生成；确认时会重新检查文件版本。'},'plan':{'kind':'files','changes':[{'path':relative,'afterHex':data.hex(),'expected':sha(before) if before is not None else None}]},'artifact':{'path':relative,'kind':kind}}
 def execute_plan(root,plan):
@@ -324,10 +402,52 @@ def execute_plan(root,plan):
     return compact({'status':'saved' if prepared else 'unchanged','changed':bool(prepared),'paths':[c['path'] for c,_,_,_,_ in prepared],'unchangedPaths':unchanged,'note':'文件内容未变化，未执行替换；请核验目标是否已满足，不要重复写入。' if not prepared else ''})
 
 def code_files(root,relative='.',limit=1800):
-    paths=[]
-    for name in listing(root,relative,8,limit)['paths']:
+    paths=[];scan=listing(root,relative,8,limit)
+    for name in scan['paths']:
         if not name.endswith('/') and pathlib.Path(name).suffix.lower() in CODE_EXT: paths.append(name)
-    return paths
+    return paths,scan['truncated']
+
+TS_OUTLINE_SCRIPT=r'''
+const fs=require('fs');
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+let ts;
+try { ts=require(require.resolve('typescript',{paths:[input.workspace]})); }
+catch { process.exit(3); }
+let source=input.text,offset=0;
+if(input.path.endsWith('.vue')){
+  const match=/<script\b[^>]*>([\s\S]*?)<\/script>/i.exec(source);
+  if(!match){process.stdout.write(JSON.stringify({symbols:[],diagnostics:[]}));process.exit(0);}
+  offset=source.slice(0,match.index+match[0].indexOf(match[1])).split('\n').length-1;
+  source=match[1];
+}
+const kind=/\.(tsx|jsx)$/.test(input.path)?ts.ScriptKind.TSX:/\.(js|mjs|cjs)$/.test(input.path)?ts.ScriptKind.JS:ts.ScriptKind.TS;
+const file=ts.createSourceFile(input.path,source,ts.ScriptTarget.Latest,true,kind);
+const symbols=[];
+function add(node,name,type){
+  if(!name)return;
+  const start=file.getLineAndCharacterOfPosition(node.getStart(file)).line+1+offset;
+  const end=file.getLineAndCharacterOfPosition(node.end).line+1+offset;
+  symbols.push({name:name.getText(file),kind:type,line:start,endLine:end});
+}
+function visit(node){
+  if(ts.isClassDeclaration(node))add(node,node.name,'class');
+  else if(ts.isInterfaceDeclaration(node)||ts.isTypeAliasDeclaration(node)||ts.isEnumDeclaration(node))add(node,node.name,'type');
+  else if(ts.isFunctionDeclaration(node))add(node,node.name,'function');
+  else if(ts.isMethodDeclaration(node))add(node,node.name,'method');
+  else if(ts.isVariableDeclaration(node)&&ts.isIdentifier(node.name))add(node,node.name,node.initializer&&(ts.isArrowFunction(node.initializer)||ts.isFunctionExpression(node.initializer))?'function':'variable');
+  ts.forEachChild(node,visit);
+}
+visit(file);
+process.stdout.write(JSON.stringify({symbols,diagnostics:file.parseDiagnostics.map(d=>String(d.messageText)).slice(0,5)}));
+'''
+
+def typescript_outline(root,name,text):
+    if not shutil.which('node'): return None
+    try:
+        done=subprocess.run(['node','-e',TS_OUTLINE_SCRIPT],cwd=root,input=compact({'workspace':str(root),'path':name,'text':text}),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=10)
+        if done.returncode or not done.stdout: return None
+        return json.loads(done.stdout)
+    except (OSError,ValueError,subprocess.TimeoutExpired): return None
 
 def inspect_project(root,args):
     base=resolve(root,args.get('path','.'),False);relative=base.relative_to(root).as_posix() or '.'
@@ -337,12 +457,13 @@ def inspect_project(root,args):
     for child in sorted(base.iterdir(),key=lambda item:item.name.lower()):
         if child.name in IGNORED or SECRET.search(child.name) or child.is_symlink(): continue
         if child.is_dir(): directories.append(child.name+'/')
-    for name in listing(root,relative,5,2500)['paths']:
+    scan=listing(root,relative,5,2500)
+    for name in scan['paths']:
         if name.endswith('/'): continue
         files+=1;ext=pathlib.Path(name).suffix.lower()
         labels={'.py':'Python','.ts':'TypeScript','.tsx':'TypeScript JSX','.js':'JavaScript','.jsx':'JavaScript JSX','.vue':'Vue','.go':'Go','.rs':'Rust','.java':'Java','.cs':'C#','.php':'PHP','.rb':'Ruby'}
         if ext in labels: languages[labels[ext]]=languages.get(labels[ext],0)+1
-    result={'path':relative,'markers':found,'directories':directories[:80],'fileCount':files,'languages':dict(sorted(languages.items(),key=lambda item:-item[1]))}
+    result={'path':relative,'markers':found,'directories':directories[:80],'fileCount':files,'scanTruncated':scan['truncated'],'languages':dict(sorted(languages.items(),key=lambda item:-item[1]))}
     package=base/'package.json'
     if package.is_file():
         data=json.loads(package.read_text('utf-8'));deps={**data.get('dependencies',{}),**data.get('devDependencies',{})}
@@ -356,6 +477,11 @@ def code_outline(root,args):
     file=resolve(root,args['path']);ext=file.suffix.lower()
     if not file.is_file() or ext not in CODE_EXT: raise ValueError('请选择支持的代码文件')
     text=read_text(root,args['path']);symbols=[]
+    if ext in {'.ts','.tsx','.js','.jsx','.mjs','.cjs','.vue'}:
+        parsed=typescript_outline(root,args['path'],text)
+        if parsed is not None:
+            symbols=parsed['symbols']
+            return compact({'path':args['path'],'language':ext.lstrip('.'),'parser':'typescript','symbols':symbols[:500],'count':len(symbols),'truncated':len(symbols)>500,'parseDiagnostics':parsed['diagnostics']})
     if ext in ('.py','.pyi'):
         try: tree=ast.parse(text)
         except SyntaxError as error: raise ValueError(f'Python 语法错误：第 {error.lineno or 0} 行 {error.msg}')
@@ -381,21 +507,22 @@ def code_outline(root,args):
             for kind,pattern in patterns:
                 match=pattern.search(line)
                 if match: symbols.append({'name':match.group(1),'kind':kind,'line':line_number,'text':line.strip()[:500]});break
-    return compact({'path':args['path'],'language':ext.lstrip('.'),'symbols':symbols[:500],'count':len(symbols),'truncated':len(symbols)>500})
+    return compact({'path':args['path'],'language':ext.lstrip('.'),'parser':'python-ast' if ext in ('.py','.pyi') else 'heuristic','symbols':symbols[:500],'count':len(symbols),'truncated':len(symbols)>500})
 
 def find_todos(root,args):
     tags=[str(tag).upper() for tag in args.get('tags') or ['TODO','FIXME','HACK','XXX']]
     if any(not re.fullmatch(r'[A-Z][A-Z0-9_-]{1,19}',tag) for tag in tags): raise ValueError('待办标签格式无效')
     limit=max(1,min(500,int(args.get('limit',200))));matcher=re.compile(r'\b('+'|'.join(map(re.escape,tags))+r')\b[:\s-]*(.*)',re.I);matches=[];counts={tag:0 for tag in tags};scanned=0
-    for name in code_files(root,args.get('path','.'),3000):
+    files,scan_truncated=code_files(root,args.get('path','.'),3000)
+    for name in files:
         try: lines=read_text(root,name).splitlines();scanned+=1
         except Exception: continue
         for line_number,line in enumerate(lines,1):
             match=matcher.search(line)
             if not match: continue
             tag=match.group(1).upper();counts[tag]=counts.get(tag,0)+1;matches.append({'path':name,'line':line_number,'tag':tag,'text':match.group(2).strip()[:500]})
-            if len(matches)>=limit: return compact({'matches':matches,'counts':counts,'scanned':scanned,'truncated':True})
-    return compact({'matches':matches,'counts':counts,'scanned':scanned,'truncated':False})
+            if len(matches)>=limit: return compact({'matches':matches,'counts':counts,'scanned':scanned,'truncated':True,'truncationReason':'match-limit'})
+    return compact({'matches':matches,'counts':counts,'scanned':scanned,'truncated':scan_truncated,'truncationReason':'file-limit' if scan_truncated else None})
 
 def dependency_report(root,args):
     base=resolve(root,args.get('path','.'),False)
@@ -473,25 +600,27 @@ def find_symbol(root,args):
       'type':rf'\b(?:type|interface|class|enum|struct)\s+{re.escape(plain)}\b'}
     selected=list(patterns.values()) if kind=='any' else [patterns[kind]]
     matcher=re.compile('|'.join(f'(?:{pattern})' for pattern in selected))
-    for name in code_files(root,args.get('path','.'),2200):
+    files,scan_truncated=code_files(root,args.get('path','.'),2200)
+    for name in files:
         try: lines=read_text(root,name).splitlines()
         except Exception: continue
         for index,line in enumerate(lines,1):
             if matcher.search(line): matches.append({'path':name,'line':index,'text':line.strip()[:500]})
-            if len(matches)>=80: return compact({'query':query,'matches':matches,'truncated':True})
-    return compact({'query':query,'matches':matches,'truncated':False})
+            if len(matches)>=80: return compact({'query':query,'matches':matches,'truncated':True,'truncationReason':'match-limit'})
+    return compact({'query':query,'matches':matches,'truncated':scan_truncated,'truncationReason':'file-limit' if scan_truncated else None})
 
 def find_references(root,args):
     query=str(args['query'])
     if not re.fullmatch(r'[A-Za-z_$][\w$]{0,299}',query): raise ValueError('引用名称必须是单个标识符')
     matcher=re.compile(r'(?<![\w$])'+re.escape(query)+r'(?![\w$])');matches=[];scanned=0
-    for name in code_files(root,args.get('path','.'),2400):
+    files,scan_truncated=code_files(root,args.get('path','.'),2400)
+    for name in files:
         try: lines=read_text(root,name).splitlines();scanned+=1
         except Exception: continue
         for index,line in enumerate(lines,1):
             if matcher.search(line): matches.append({'path':name,'line':index,'text':line.strip()[:500]})
-            if len(matches)>=120: return compact({'query':query,'matches':matches,'scanned':scanned,'truncated':True})
-    return compact({'query':query,'matches':matches,'scanned':scanned,'truncated':False})
+            if len(matches)>=120: return compact({'query':query,'matches':matches,'scanned':scanned,'truncated':True,'truncationReason':'match-limit'})
+    return compact({'query':query,'matches':matches,'scanned':scanned,'truncated':scan_truncated,'truncationReason':'file-limit' if scan_truncated else None})
 
 def parsed_diagnostics(output):
     rows=[]
@@ -556,13 +685,29 @@ def run_test_case(root,args):
     target=resolve(root,args['target'],False)
     if not target.is_file(): raise ValueError('测试目标必须是文件')
     runner=args.get('runner','auto');name=str(args.get('name','')).strip();timeout=max(1,min(300,int(args.get('timeoutSeconds',120))))
-    if runner=='pytest' or runner=='auto' and target.suffix.lower()=='.py':
+    relative=target.relative_to(root).as_posix()
+    if runner=='auto' and target.suffix.lower()=='.py': runner='pytest'
+    if runner=='auto':
+        package=json.loads(read_text(root,'package.json'))
+        script=str(package.get('scripts',{}).get('test',''))
+        runner='node' if re.search(r'\bnode\s+--test\b',script) else 'vitest' if re.search(r'\bvitest\b',script) else 'jest' if re.search(r'\bjest\b',script) else 'npm'
+    if runner=='pytest':
         command=[sys.executable,'-m','pytest',target.relative_to(root).as_posix()]
         if name: command+=['-k',name]
+    elif runner=='node':
+        command=['node','--test']
+        if name: command+=['--test-name-pattern',name]
+        command.append(relative)
+    elif runner=='vitest':
+        command=['npm.cmd' if os.name=='nt' else 'npm','run','test','--','--run',relative]
+        if name: command+=['-t',name]
+    elif runner=='jest':
+        command=['npm.cmd' if os.name=='nt' else 'npm','run','test','--','--runInBand','--runTestsByPath',relative]
+        if name: command+=['--testNamePattern',name]
     else:
         package=json.loads(read_text(root,'package.json'))
         if 'test' not in package.get('scripts',{}): raise ValueError('package.json 未定义 test 脚本')
-        command=['npm.cmd' if os.name=='nt' else 'npm','run','test','--','--run',target.relative_to(root).as_posix()]
+        command=['npm.cmd' if os.name=='nt' else 'npm','run','test','--',relative]
         if name: command+=['-t',name]
     started=time.time();done=subprocess.run(command,cwd=root,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout);invalidate(root);output=(done.stdout+done.stderr)
     passed=len(re.findall(r'\b(?:pass(?:ed)?|✓)\b',output,re.I));failed=len(re.findall(r'\b(?:fail(?:ed)?|✗)\b',output,re.I))
@@ -586,7 +731,30 @@ def process_status(args):
         for line in done.stdout.splitlines():
             fields=line.split(None,2)
             if len(fields)>=2 and (not query or query in fields[1].lower()): rows.append({'pid':int(fields[0]),'name':fields[1],'memoryKb':int(fields[2]) if len(fields)>2 and fields[2].isdigit() else None})
-    return compact({'processes':rows[:limit],'listeners':listeners[:limit],'truncated':len(rows)>limit or len(listeners)>limit})
+        if shutil.which('lsof'):
+            command=['lsof','-nP','-iTCP','-sTCP:LISTEN','-F','pcn']
+            if port is not None: command[2]=f'-iTCP:{int(port)}'
+            net=subprocess.run(command,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=15)
+            pid=None;name=''
+            for line in net.stdout.splitlines():
+                if line.startswith('p') and line[1:].isdigit(): pid=int(line[1:]);name=''
+                elif line.startswith('c'): name=line[1:]
+                elif line.startswith('n') and pid is not None:
+                    address=line[1:]
+                    if port is None or address.endswith(':'+str(port)) or address.endswith(':'+str(port)+' (LISTEN)'):
+                        listeners.append({'address':address,'pid':pid,'name':name})
+        elif shutil.which('ss'):
+            command=['ss','-ltnpH']
+            if port is not None: command+=['sport','=',':'+str(int(port))]
+            net=subprocess.run(command,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=15)
+            for line in net.stdout.splitlines():
+                fields=line.split()
+                if len(fields)<4: continue
+                address=fields[3]
+                if port is not None and not address.endswith(':'+str(port)): continue
+                match=re.search(r'pid=(\d+)',line)
+                listeners.append({'address':address,'pid':int(match.group(1)) if match else None,'name':None})
+    return compact({'processes':rows[:limit],'listeners':listeners[:limit],'truncated':len(rows)>limit or len(listeners)>limit,'listenerLookupAvailable':os.name=='nt' or bool(shutil.which('lsof') or shutil.which('ss'))})
 
 def local_http(args):
     url=str(args['url']);parsed=urllib.parse.urlsplit(url)
@@ -624,6 +792,31 @@ def image_ocr(root,args):
         except Exception as error: raise ValueError('Tesseract OCR 不可用：'+str(error))
     return compact({'path':args['path'],'provider':provider,'languages':languages or 'auto','text':text[:100000],'characters':len(text),'confidence':confidence,'truncated':len(text)>100000})
 
+def pdf_ocr(root,args):
+    file=resolve(root,args['path'])
+    if file.suffix.lower()!='.pdf' or not file.is_file() or file.stat().st_size>50*1024*1024: raise ValueError('请选择 50 MB 以内的 PDF 文件')
+    if not shutil.which('pdftoppm') or not shutil.which('pdfinfo') or not shutil.which('tesseract'):
+        raise ValueError('扫描 PDF 识别需要本机安装 Poppler（pdfinfo、pdftoppm）和 Tesseract')
+    info=subprocess.run(['pdfinfo',str(file)],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=15)
+    match=re.search(r'^Pages:\s*(\d+)',info.stdout,re.M)
+    if info.returncode or not match: raise ValueError('无法读取 PDF 页数；文件可能已加密或损坏')
+    total=int(match.group(1));start=max(1,int(args.get('startPage',1)));count=max(1,min(5,int(args.get('pageCount',3))))
+    if start>total: raise ValueError('起始页超出 PDF 页数')
+    languages=str(args.get('languages','')).strip()
+    if languages and not re.fullmatch(r'[A-Za-z0-9_+]{1,80}',languages): raise ValueError('OCR 语言参数无效')
+    pages=[]
+    with tempfile.TemporaryDirectory(prefix='myplane-pdf-ocr-') as folder:
+        for number in range(start,min(total,start+count-1)+1):
+            output=os.path.join(folder,'page')
+            rendered=subprocess.run(['pdftoppm','-f',str(number),'-l',str(number),'-singlefile','-r','150','-png',str(file),output],capture_output=True,timeout=45)
+            if rendered.returncode: raise ValueError('PDF 第 '+str(number)+' 页渲染失败')
+            command=['tesseract',output+'.png','stdout']+(['-l',languages] if languages else [])
+            result=subprocess.run(command,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=45)
+            if result.returncode: raise ValueError('PDF 第 '+str(number)+' 页 OCR 失败：'+result.stderr[:300])
+            pages.append({'page':number,'text':result.stdout[:20000],'truncated':len(result.stdout)>20000})
+    next_page=start+len(pages)
+    return compact({'path':args['path'],'sha256':sha(file.read_bytes()),'pageCount':total,'pages':pages,'nextPage':next_page if next_page<=total else None,'truncated':any(page['truncated'] for page in pages),'provider':'pdftoppm+tesseract'})
+
 def builtin(tool,args,context):
     root=root_path(context);phase=context.get('phase','execute')
     if tool=='load_tool_pack':
@@ -658,23 +851,45 @@ def builtin(tool,args,context):
     if tool=='process_status': return process_status(args)
     if tool=='http_request': return local_http(args)
     if tool=='image_ocr': return image_ocr(root,args)
+    if tool=='pdf_ocr': return pdf_ocr(root,args)
     if tool=='list_files': return compact(listing(root,args.get('path','.'),max(0,min(8,int(args.get('depth',4))))))
     if tool=='read_file':
         lines=read_text(root,args['path']).splitlines();start=max(1,int(args.get('startLine',1)));end=min(len(lines),int(args.get('endLine',start+199)),start+249)
         return compact({'path':args['path'],'totalLines':len(lines),'startLine':start,'endLine':end,'text':'\n'.join(f'{i}: {lines[i-1]}' for i in range(start,end+1))[:24000]})
+    if tool=='read_files':
+        requests=args['files']
+        if not isinstance(requests,list) or not 1<=len(requests)<=8: raise ValueError('每次只能读取 1–8 个文件')
+        results=[];total=0
+        for item in requests:
+            lines=read_text(root,item['path']).splitlines();start=max(1,int(item.get('startLine',1)));end=min(len(lines),int(item.get('endLine',start+99)),start+99)
+            content='\n'.join(f'{i}: {lines[i-1]}' for i in range(start,end+1))
+            remaining=max(0,40000-total);shown=content[:min(10000,remaining)];total+=len(shown)
+            results.append({'path':item['path'],'totalLines':len(lines),'startLine':start,'endLine':end,'text':shown,'truncated':len(shown)<len(content)})
+        return compact({'files':results,'truncated':any(item['truncated'] for item in results)})
     if tool=='search_files':
-        query=args['query'].lower();matches=[];scanned=0
-        for name in listing(root,args.get('path','.'),8,1200)['paths']:
-            if name.endswith('/'): continue
+        query=str(args['query']);mode=args.get('mode','literal');pattern=str(args.get('glob','*'))
+        if mode not in ('literal','regex'): raise ValueError('搜索模式必须是 literal 或 regex')
+        if len(query)>300 or not query: raise ValueError('搜索内容长度必须为 1–300 字符')
+        if len(pattern)>200 or '..' in pattern or '\\' in pattern: raise ValueError('文件匹配模式无效')
+        matcher=re.compile(query,re.I) if mode=='regex' else None
+        offset=max(0,min(100000,int(args.get('offset',0))));limit=max(1,min(200,int(args.get('limit',60))))
+        scan=listing(root,args.get('path','.'),8,5000);matches=[];scanned=0;skipped=0;found=0;line_truncated=False;has_more=False
+        for name in scan['paths']:
+            if name.endswith('/') or not fnmatch.fnmatch(name,pattern): continue
             try: lines=read_text(root,name).splitlines();scanned+=1
-            except Exception: continue
+            except Exception: skipped+=1;continue
             for index,line in enumerate(lines,1):
-                if query in line.lower(): matches.append({'path':name,'line':index,'text':line[:400]})
-                if len(matches)>=60: break
-            if len(matches)>=60: break
-        return compact({'matches':matches,'scanned':scanned,'truncated':len(matches)>=60})
+                if len(line)>4000: line_truncated=True
+                sample=line[:4000]
+                if not (matcher.search(sample) if matcher else query.lower() in sample.lower()): continue
+                if found>=offset+limit: has_more=True;break
+                if found>=offset: matches.append({'path':name,'line':index,'text':sample[:400]})
+                found+=1
+            if has_more: break
+        truncated=scan['truncated'] or has_more or line_truncated or skipped>0
+        return compact({'matches':matches,'scanned':scanned,'skipped':skipped,'offset':offset,'nextOffset':offset+len(matches) if has_more else None,'truncated':truncated,'truncationReasons':[reason for reason,condition in [('file-limit',scan['truncated']),('more-matches',has_more),('long-lines',line_truncated),('unreadable-files',skipped>0)] if condition]})
     if tool=='read_document': return read_document(root,args)
-    if tool in {'write_file','replace_text','apply_patch','create_document','create_spreadsheet','run_command','run_test'}: return prepare_write(root,tool,args)
+    if tool in {'write_file','replace_text','apply_patch','create_document','replace_document_text','create_spreadsheet','update_spreadsheet_cells','run_command','run_test'}: return prepare_write(root,tool,args)
     raise ValueError('未知 Python 内置工具：'+tool)
 def handle(request):
     workspace=pathlib.Path(request['workspace']).resolve(strict=True)

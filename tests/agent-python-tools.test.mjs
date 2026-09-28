@@ -33,6 +33,25 @@ test('Python worker reads, searches and atomically writes workspace files',t=>{
  const saved=JSON.parse(call(root,'write_file',{},{phase:'commit',plan:prepared.plan}));assert.deepEqual(saved.paths,['after.txt']);assert.equal(fs.readFileSync(path.join(root,'after.txt'),'utf8'),'created')
 })
 
+test('replace_text reports exact match count and escaped newline mismatch without changing files',t=>{
+ const root=sandbox(t),file=path.join(root,'source.js')
+ const failed=oldText=>{
+  const attempt=spawnSync(python,[worker],{input:JSON.stringify({workspace:root,tool:'replace_text',args:{path:'source.js',oldText,newText:'changed'},context:{phase:'plan'}}),encoding:'utf8'})
+  assert.notEqual(attempt.status,0)
+  return JSON.parse(attempt.stdout).error
+ }
+ const source='console.log(`\\nend`);\n'
+ fs.writeFileSync(file,source)
+ assert.match(failed('console.log(`\\\\nend`);'),/实际匹配 0 处.*两个反斜杠加 n/)
+ assert.match(failed('missing'),/实际匹配 0 处.*重新读取目标文件/)
+ assert.equal(fs.readFileSync(file,'utf8'),source)
+ fs.writeFileSync(file,'A\nB')
+ assert.match(failed('A\\nB'),/实际匹配 0 处.*实际换行/)
+ fs.writeFileSync(file,'repeat repeat')
+ assert.match(failed('repeat'),/实际匹配 2 处.*扩大 oldText 的上下文/)
+ assert.equal(fs.readFileSync(file,'utf8'),'repeat repeat')
+})
+
 test('Python worker creates readable DOCX and XLSX artifacts',t=>{
  const root=sandbox(t)
  for(const [tool,args,file] of [['create_document',{path:'report.docx',title:'Title',content:'Body'},'report.docx'],['create_spreadsheet',{path:'report.xlsx',sheets:[{name:'Data',rows:[['Name','Count'],['A',2]]}]},'report.xlsx']]){
@@ -66,6 +85,47 @@ test('Python worker inspects projects and performs semantic code searches',t=>{
  const processes=JSON.parse(call(root,'process_status',{query:'python',limit:5}));assert.ok(Array.isArray(processes.processes))
 })
 
+test('search reports pagination and reads several bounded source ranges',t=>{
+ const root=sandbox(t);fs.mkdirSync(path.join(root,'src'))
+ fs.writeFileSync(path.join(root,'src','a.ts'),'export const alpha = 1\n')
+ fs.writeFileSync(path.join(root,'src','b.ts'),'export const alpha = 2\n')
+ fs.writeFileSync(path.join(root,'src','ignore.md'),'alpha\n')
+ const first=JSON.parse(call(root,'search_files',{query:'alpha\\s*=',mode:'regex',glob:'src/*.ts',limit:1}))
+ assert.equal(first.matches.length,1);assert.equal(first.truncated,true);assert.equal(first.nextOffset,1)
+ const second=JSON.parse(call(root,'search_files',{query:'alpha\\s*=',mode:'regex',glob:'src/*.ts',limit:1,offset:first.nextOffset}))
+ assert.equal(second.matches.length,1);assert.notEqual(first.matches[0].path,second.matches[0].path)
+ const read=JSON.parse(call(root,'read_files',{files:[{path:'src/a.ts'},{path:'src/b.ts'}]}))
+ assert.equal(read.files.length,2);assert.match(read.files[0].text,/alpha = 1/)
+})
+
+test('targeted tests select the native Node runner from package scripts',t=>{
+ const root=sandbox(t);fs.mkdirSync(path.join(root,'tests'))
+ fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{test:'node --test tests/*.test.mjs'}}))
+ fs.writeFileSync(path.join(root,'tests','sample.test.mjs'),"import {test} from 'node:test'; test('selected case',()=>{});\n")
+ const result=JSON.parse(call(root,'run_test_case',{target:'tests/sample.test.mjs',name:'selected case'}))
+ assert.equal(result.exitCode,0);assert.deepEqual(result.command.slice(0,2),['node','--test'])
+})
+
+test('Vue code outline uses the TypeScript parser when the project provides it',()=>{
+ const outline=JSON.parse(call(process.cwd(),'code_outline',{path:'src/LocalAiStudio.vue'}))
+ assert.equal(outline.parser,'typescript')
+ assert.ok(outline.symbols.some(symbol=>symbol.name==='selectNavigation'))
+})
+
+test('existing DOCX and XLSX can be edited with version checked plans',t=>{
+ const root=sandbox(t)
+ const createdDoc=JSON.parse(call(root,'create_document',{path:'report.docx',title:'Title',content:'Old value'},{phase:'plan'}))
+ call(root,'create_document',{},{phase:'commit',plan:createdDoc.plan})
+ const editedDoc=JSON.parse(call(root,'replace_document_text',{path:'report.docx',oldText:'Old',newText:'New'},{phase:'plan'}))
+ call(root,'replace_document_text',{},{phase:'commit',plan:editedDoc.plan})
+ assert.match(JSON.parse(call(root,'read_document',{path:'report.docx'})).text,/New value/)
+ const createdSheet=JSON.parse(call(root,'create_spreadsheet',{path:'report.xlsx',sheets:[{name:'Data',rows:[['Name','Count'],['A',2]]}]},{phase:'plan'}))
+ call(root,'create_spreadsheet',{},{phase:'commit',plan:createdSheet.plan})
+ const editedSheet=JSON.parse(call(root,'update_spreadsheet_cells',{path:'report.xlsx',sheet:'Data',updates:[{cell:'A2',value:'B'},{cell:'B2',value:3}]},{phase:'plan'}))
+ call(root,'update_spreadsheet_cells',{},{phase:'commit',plan:editedSheet.plan})
+ assert.match(JSON.parse(call(root,'read_document',{path:'report.xlsx'})).text,/B\t3/)
+})
+
 test('Python worker reads bounded Git commit and blame details',t=>{
  const root=sandbox(t);fs.writeFileSync(path.join(root,'tracked.txt'),'first\nsecond\n')
  for(const args of [['init'],['config','user.name','Fixture'],['config','user.email','fixture@example.test'],['add','tracked.txt'],['commit','-m','initial']]){const result=spawnSync('git',args,{cwd:root,encoding:'utf8'});assert.equal(result.status,0,result.stderr)}
@@ -77,6 +137,8 @@ test('Python worker returns structured diagnostics, targeted test results and lo
  const root=sandbox(t);fs.writeFileSync(path.join(root,'broken.py'),'def broken(:\n');const diagnostics=JSON.parse(call(root,'get_diagnostics',{checker:'python',path:'broken.py'}));assert.notEqual(diagnostics.exitCode,0);assert.match(diagnostics.output,/SyntaxError/)
  fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{test:'node test-runner.cjs'}}));fs.writeFileSync(path.join(root,'test-runner.cjs'),'console.log("passed selected test", process.argv.slice(2).join(" "))');fs.writeFileSync(path.join(root,'sample.test.js'),'// fixture');const tested=JSON.parse(call(root,'run_test_case',{target:'sample.test.js',runner:'npm',name:'selected'}));assert.equal(tested.exitCode,0);assert.match(tested.output,/passed selected test/)
  const server=createServer((_request,response)=>{response.setHeader('Content-Type','application/json');response.end(JSON.stringify({ok:true}))});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());const address=server.address();const http=JSON.parse(await callAsync(root,'http_request',{url:`http://127.0.0.1:${address.port}/health`}));assert.equal(http.status,200);assert.deepEqual(JSON.parse(http.body),{ok:true})
+ const processes=JSON.parse(await callAsync(root,'process_status',{port:address.port,limit:10}))
+ if(processes.listenerLookupAvailable)assert.ok(processes.listeners.some(listener=>listener.address.includes(':'+address.port)))
 })
 
 test('image OCR either runs locally or reports its optional dependency clearly',t=>{
@@ -85,9 +147,28 @@ test('image OCR either runs locally or reports its optional dependency clearly',
  if(run.status===0){const result=JSON.parse(envelope.output);assert.ok(['rapidocr-onnxruntime','pytesseract'].includes(result.provider))}else assert.match(envelope.error,/OCR|Tesseract|requirements/)
 })
 
+test('scanned PDF OCR reads a bounded page when local tools are available',t=>{
+ const root=sandbox(t),parts=['%PDF-1.4\n'],objects=[
+  '<< /Type /Catalog /Pages 2 0 R >>',
+  '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+  '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+  '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  '<< /Length 54 >>\nstream\nBT /F1 28 Tf 20 40 Td (HELLO OCR) Tj ET\nendstream'
+ ],offsets=[0]
+ for(let i=0;i<objects.length;i++){offsets.push(Buffer.byteLength(parts.join('')));parts.push(`${i+1} 0 obj\n${objects[i]}\nendobj\n`)}
+ const xref=Buffer.byteLength(parts.join(''));parts.push(`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`)
+ for(const offset of offsets.slice(1))parts.push(`${String(offset).padStart(10,'0')} 00000 n \n`)
+ parts.push(`trailer\n<< /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`)
+ fs.writeFileSync(path.join(root,'scan.pdf'),parts.join(''))
+ const run=spawnSync(python,[worker],{input:JSON.stringify({workspace:root,tool:'pdf_ocr',args:{path:'scan.pdf',pageCount:1}}),encoding:'utf8'})
+ if(run.status!==0){assert.match(JSON.parse(run.stdout).error,/Poppler|Tesseract/);return}
+ const result=JSON.parse(JSON.parse(run.stdout).output)
+ assert.equal(result.pageCount,1);assert.match(result.pages[0].text,/HELLO OCR/i)
+})
+
 test('tool store increments immutable versions and restores by creating a new version',t=>{
  const root=sandbox(t),file=path.join(root,'tools.json'),runtime={revision:()=> 'runtime-v1',execute:async()=>({output:'ok',elapsedMs:1})},store=new AgentToolStore(file,runtime)
- assert.equal(store.list().length,33);assert.ok(store.list().every(tool=>tool.current.runtimeRevision==='runtime-v1'))
+ assert.equal(store.list().length,37);assert.ok(store.list().every(tool=>tool.current.runtimeRevision==='runtime-v1'))
  const created=store.save({key:'hello_python',name:'问候',description:'返回问候',parameters:{type:'object',properties:{name:{type:'string'}},required:['name'],additionalProperties:false},python:'def execute(args, context):\n    return {"hello": args["name"]}\n',risk:'read',timeoutMs:5000,changeNote:'创建'})
  assert.equal(created.activeVersion,1);assert.equal(created.current.risk,'high','user Python remains high risk')
  const changed=store.save({id:created.id,key:created.key,name:'问候',description:'返回新的问候',parameters:created.current.parameters,python:created.current.python,risk:'high',timeoutMs:5000,changeNote:'修改说明'});assert.equal(changed.activeVersion,2);assert.equal(changed.versions.length,2)
@@ -108,6 +189,31 @@ test('tool store routes built-in, control and custom tool versions through Pytho
  const custom=store.save({key:'context_value',name:'上下文',description:'读取执行上下文',parameters:{type:'object',properties:{},additionalProperties:false},python:'def execute(args, context):\n    return context.get("marker", "missing")\n',risk:'read',timeoutMs:5000,changeNote:'创建'})
  const customSpec=store.specs(root).find(spec=>spec.definition.function.name===custom.key)
  assert.equal(await customSpec.execute({},signal,{marker:'passed'}),'passed')
+})
+
+test('existing managed tool definitions upgrade while edited definitions stay intact',t=>{
+ const root=sandbox(t),file=path.join(root,'tools.json'),runtime={revision:()=> 'runtime-v1'}
+ new AgentToolStore(file,runtime)
+ const persisted=JSON.parse(fs.readFileSync(file,'utf8'))
+ const search=persisted.find(tool=>tool.key==='search_files');search.versions[0].parameters={type:'object',properties:{query:{type:'string'}},required:['query']}
+ const custom=persisted.find(tool=>tool.key==='read_files');custom.versions[0].description='自定义说明';custom.versions[0].changeNote='用户编辑'
+ fs.writeFileSync(file,JSON.stringify(persisted))
+ const upgraded=new AgentToolStore(file,runtime)
+ assert.ok(upgraded.list().find(tool=>tool.key==='search_files').current.parameters.properties.mode)
+ assert.equal(upgraded.list().find(tool=>tool.key==='read_files').current.description,'自定义说明')
+})
+
+test('document edits use prepared preview and version checked commit',async t=>{
+ const root=sandbox(t),file=path.join(root,'tools.json')
+ const runtime={revision:()=> 'runtime-v1',execute:async request=>({output:call(request.workspace,request.tool,request.args,request.context,request.code),elapsedMs:1})}
+ const store=new AgentToolStore(file,runtime),signal=new AbortController().signal
+ const created=JSON.parse(call(root,'create_document',{path:'existing.docx',title:'Title',content:'Old'},{phase:'plan'}))
+ call(root,'create_document',{},{phase:'commit',plan:created.plan})
+ const spec=store.specs(root).find(item=>item.definition.function.name==='replace_document_text')
+ const prepared=await spec.prepare({path:'existing.docx',oldText:'Old',newText:'New'},signal,{})
+ assert.match(prepared.preview.after,/Old → New/)
+ assert.match(JSON.parse(await prepared.execute(signal)).paths[0],/existing\.docx/)
+ assert.match(JSON.parse(call(root,'read_document',{path:'existing.docx'})).text,/New/)
 })
 
 

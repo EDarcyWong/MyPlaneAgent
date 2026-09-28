@@ -5,3 +5,19 @@ export class ModelOutputLimitError extends Error {
   this.name='ModelOutputLimitError'
  }
 }
+
+export type ModelResponseBreakdown={text:number;reasoning:number;arguments:number;calls:number}
+
+// The model response is discarded before any returned tool call is executed.
+// Callers may retry a smaller step without replaying completed operations.
+export class ModelResponseSizeError extends Error {
+ constructor(
+  public readonly kind:'wire'|'characters',
+  public readonly limit:number,
+  public readonly observed:number,
+  public readonly output:ModelResponseBreakdown
+ ){
+  super(`模型响应${kind==='wire'?'流':'内容'}超过本轮容量（${observed}/${limit} ${kind==='wire'?'字节':'字符'}），本轮工具未执行。已完成进度仍保留，可缩小单步输出后继续。`)
+  this.name='ModelResponseSizeError'
+ }
+}

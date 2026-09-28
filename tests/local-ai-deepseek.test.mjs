@@ -48,3 +48,15 @@ test('generic endpoints do not receive DeepSeek fields',async t=>{
  })
  await requestAgentModel({endpoint:'http://localhost:1234/v1',key:'',contextLength:4096,maxTokens:512},'local',[{role:'user',content:'hello'},{role:'assistant',content:'hi',reasoning_content:'private provider field'}],new AbortController().signal)
 })
+
+test('text-only review rejects raw DSML and flattens prior tool turns',async t=>{
+ let body
+ t.mock.method(globalThis,'fetch',async(_url,init)=>{
+  body=JSON.parse(init.body)
+  return Response.json({choices:[{message:{content:'<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name="read_file">'},finish_reason:'stop'}]})
+ })
+ const prior={id:'call-1',type:'function',function:{name:'read_file',arguments:'{"path":"a.txt"}'}}
+ await assert.rejects(requestAgentModel({endpoint:'http://localhost:1234/v1',key:'',contextLength:8192,maxTokens:512},'local',[{role:'user',content:'分析项目'},{role:'assistant',content:null,tool_calls:[prior]},{role:'tool',tool_call_id:'call-1',content:'文件内容'}],new AbortController().signal,{tools:false}),/工具调用标记/)
+ assert.ok(body.messages.every(message=>message.role!=='tool'&&!message.tool_calls))
+ assert.ok(body.messages.some(message=>String(message.content).includes('文件内容')))
+})

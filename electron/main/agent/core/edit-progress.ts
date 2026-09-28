@@ -46,6 +46,8 @@ export function inspectTextEdit(workspace:string,name:string,args:Record<string,
 
 export class EditProgress {
   constructor(readonly state:EditProgressState={files:{},ineffective:0}){}
+  /** A resumed run keeps file hashes for cycle detection but gets its own failure budget. */
+  beginAttempt(){this.state.ineffective=0}
   inspect(edits:Edit[]|undefined):'unchanged'|'cycle'|undefined{
     if(!edits)return
     if(edits.every(edit=>edit.before===edit.after))return 'unchanged'

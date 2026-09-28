@@ -8,7 +8,9 @@ import {AbilityModuleManager} from './ability-modules/manager.js';
 import {AbilityCatalogService} from './ability-modules/catalog.js';
 import {policyContracts} from './ability-modules/policies.js';
 import {AbilityPolicyRuntime} from './ability-modules/policy-runtime.js';
-import {routerContract,validateRouterOutput,explicitNewTask,lookupBoundary,taskMessages,taskProgress} from './ability-modules/routing.js';
+import {routerContract,validateRouterOutput,explicitNewTask,lookupBoundary,standaloneLookup,standaloneProjectTask,taskMessages,taskProgress} from './ability-modules/routing.js';
+import {implementsPriorAdvice,projectAdviceRequested} from '../shared/task-scope.js';
+import {requiresImplementation} from './agent/core/implementation-stage.js';
 import type {RouterInput} from '../shared/ability-modules.js';
 import {stateContext} from './ability-modules/conversation.js';
 import {selectionInput,selectionContract,validateSelectionOutput} from './ability-modules/selection.js';
@@ -498,9 +500,9 @@ export class LocalAiStudioService extends LocalAiService {
             if (!existsSync(destination)) cpSync(path.join(bundledSkills, entry.name), destination, { recursive: true })
             else if (entry.name === 'agent-tools') {
               upgradeBundledEngine(path.join(bundledSkills,entry.name,'engine.py'),path.join(destination,'engine.py'),path.join(dataDir,'bundled-plugin-history','agent-tools'));
+              upgradeBundledEngine(path.join(bundledSkills,entry.name,'skill.json'),path.join(destination,'skill.json'),path.join(dataDir,'bundled-plugin-history','agent-tools-manifest'),new Set(['02fb10edef0bf77ec7a2e97253c68a7a9b41dbc92b228ec3239f8b789efba7b6']));
               // Upgrade the known shipped runtime while preserving user-edited Skill code.
-              const entryPath = path.join(destination, 'index.py');
-              if (existsSync(entryPath) && new Set([
+              upgradeBundledEngine(path.join(bundledSkills,entry.name,'index.py'),path.join(destination,'index.py'),path.join(dataDir,'bundled-plugin-history','agent-tools-entry'),new Set([
                 '97b5a11b0df3579bdcb3ef5e221b3ad38c8197dc737032242e2c561eeab86f22',
                 '8022fb6a001ff9749f7710ef6754e5fa16ed8d7aa633d6e373c33de6c75cdadb',
                 '7d4abc2d6e72b1f8b6e9e8fa6d844eed7c4ae36ea217f90128bf21b23e4fa1be',
@@ -509,9 +511,10 @@ export class LocalAiStudioService extends LocalAiService {
                 '8942f9e611f5c4a2a8e1e9c7506125c1b303acb850df7561b2f4d9bc953e0bd1',
                 '9670ade3a70339d9fcb31bdb92641b6279f86f08903eeeaa356223917e46f425',
                 '1607fbd67f8aa564ffd951c83a4c6bf2335006f915eedb14707ee25630e5e71a',
+                'c7d675cc558bef48dc8a81abe6afa3f6405064f02e09e0738dfdf8548dd5d7c2',
+                '0302df202fca961cb3b73f8bf47c9b15bced71d1d977d767e61521e959701274',
                 '7e727bf9a53dbb5292a430e7037372bb691abda34c7742839b1f8d349fbffd3a',
-              ]).has(createHash('sha256').update(readFileSync(entryPath)).digest('hex')))
-                cpSync(path.join(bundledSkills, entry.name, 'index.py'), entryPath);
+              ]));
             }
           }
         }
@@ -1470,6 +1473,32 @@ export class LocalAiStudioService extends LocalAiService {
     );
     if (session.id !== id || !Array.isArray(session.messages))
       throw new Error("会话文件格式错误");
+    const goalParts=session.taskPlan?.scope?.goal.split('\n用户补充：')||[];
+    if(session.abilityTask&&goalParts.length>1&&standaloneLookup(goalParts[0])&&goalParts.slice(1).some(standaloneProjectTask)){
+      const original=session.messages.findIndex(message=>message.role==='user'&&message.content===goalParts[0]);
+      const projectMessages=session.messages.slice(Math.max(0,original+1)).filter(message=>message.role==='user'&&standaloneProjectTask(message.content));
+      const first=projectMessages[0],latest=projectMessages.at(-1);
+      if(first&&latest){
+        session.abilityTask={id:randomUUID(),startMessageId:first.id,goalMessageId:latest.id,status:'ready',updatedAt:new Date().toISOString()};
+        delete session.taskPlan;delete session.checkpoint;
+        this.saveSession(session);
+      }
+    }
+    const advicePlan=session.taskPlan;
+    const originalAdviceGoal=advicePlan?.scope?.goal.split('\n用户补充：')[0];
+    if(advicePlan?.scope&&!advicePlan.needsReplan&&originalAdviceGoal&&projectAdviceRequested(originalAdviceGoal)&&implementsPriorAdvice(advicePlan.scope.goal)&&advicePlan.items.every(item=>!requiresImplementation(item.title,item.acceptance))){
+      advicePlan.needsReplan=true;
+      if(session.abilityTask?.id===advicePlan.taskId){session.abilityTask.status='ready';session.abilityTask.updatedAt=new Date().toISOString();}
+      this.saveSession(session);
+    }
+    if(advicePlan?.scope&&!advicePlan.needsReplan&&projectAdviceRequested(advicePlan.scope.goal)&&advicePlan.items.length>1){
+      const completed=advicePlan.items.find(item=>!item.parentId&&item.status==='complete'&&item.summary?.trim()&&!requiresImplementation(item.title,item.acceptance));
+      if(completed){
+        advicePlan.items=[completed];advicePlan.updatedAt=new Date().toISOString();
+        if(session.abilityTask?.id===advicePlan.taskId){session.abilityTask.status='ready';session.abilityTask.updatedAt=advicePlan.updatedAt;}
+        this.saveSession(session);
+      }
+    }
     session.context = {
       ...this.chatContextStatus(session),
       state: session.context?.state || "ready",
@@ -1855,7 +1884,10 @@ export class LocalAiStudioService extends LocalAiService {
           }
         }
         const lookupChange=!latest.visualDecision&&!latest.images?.length?lookupBoundary(latest.content,session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||''):undefined;
-        const newBoundary = !latest.visualDecision&&(explicitNewTask(latest.content)||!!lookupChange);
+        const projectChange=!latest.visualDecision&&standaloneProjectTask(latest.content);
+        const previousAdviceGoal=session.taskPlan?.scope?.goal.split('\n用户补充：')[0];
+        const implementAdvice=!latest.visualDecision&&!!session.abilityTask&&!!previousAdviceGoal&&projectAdviceRequested(previousAdviceGoal)&&implementsPriorAdvice(latest.content)&&!!session.taskPlan?.items.every(item=>!requiresImplementation(item.title,item.acceptance));
+        const newBoundary = !latest.visualDecision&&(explicitNewTask(latest.content)||!!lookupChange||projectChange);
         let proposedState: typeof previousState;
         try {
           const candidates = selectionInput(newBoundary ? [latest] : taskMessages(session), newBoundary ? undefined : previousState);
@@ -1872,7 +1904,7 @@ export class LocalAiStudioService extends LocalAiService {
         }
         signal.throwIfAborted();
         const routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
-        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:await this.routerModule.execute(routingInput, signal);
+        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await this.routerModule.execute(routingInput, signal);
         const route = validateRouterOutput(routed.output, routingInput);
         if(lookupChange==='new_task'){
           try{
@@ -1962,7 +1994,7 @@ export class LocalAiStudioService extends LocalAiService {
           session.operationJournal[operationKey(taskRunId!,toolOptions!.workspace,capability.name,args)]={status:success?'succeeded':'failed',updatedAt:new Date().toISOString()};
           this.saveSession(session);
         } : undefined,
-        planExecution: taskRunId ? {goal:[session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'',...(session.taskPlan?.needsReplan?[session.messages.filter(message=>message.role==='user').at(-1)?.content||'']:[])].filter(Boolean).join('\n用户补充：'),taskId:taskRunId,plan:session.taskPlan,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
+        planExecution: taskRunId ? {goal:(()=>{const base=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';const latest=session.messages.filter(message=>message.role==='user').at(-1)?.content||'';return session.taskPlan?.needsReplan&&latest&&!base.split('\n用户补充：').includes(latest)?base+'\n用户补充：'+latest:base})(),taskId:taskRunId,plan:session.taskPlan,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
         stateContext: moduleContext,
         abilityPolicies,
         onProgress: progress,
