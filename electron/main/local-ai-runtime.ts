@@ -4,6 +4,7 @@ import {randomUUID} from 'node:crypto'
 import path from 'node:path'
 import {runtimeExecutableName,validRuntimeExecutable} from './local-ai-runtime-package.js'
 import {findVisionProjector} from './local-ai-vision.js'
+import {ModelPerformanceTracker} from './model-performance.js'
 import type {StudioRuntime,StudioSettings,StudioLocalModel} from '../shared/local-ai-studio.js'
 import type {DeveloperPreferences,RuntimeLoadOptions} from '../shared/local-ai-developer.js'
 
@@ -12,10 +13,11 @@ export class LocalAiRuntime {
  private child:ChildProcess|undefined
  private timer:ReturnType<typeof setTimeout>|undefined
  private key=''
+ private performance=new ModelPerformanceTracker()
  private status:StudioRuntime={state:'stopped',modelId:'',modelName:'',endpoint:'',error:'',logs:[]}
  constructor(private readonly onLog?:(level:RuntimeLogLevel,message:string)=>void){}
  get apiKey(){return this.key}
- snapshot():StudioRuntime{return {...this.status,logs:[...this.status.logs]}}
+ snapshot():StudioRuntime{return {...this.status,logs:[...this.status.logs],performance:this.status.state==='running'?this.performance.snapshot():[]}}
  clearLogs(){this.status.logs=[]}
  private log(line:string,level?:RuntimeLogLevel){for(const part of line.split(/[\r\n]+/).filter(Boolean)){const message=part.replaceAll(this.key||'\0','[REDACTED]').slice(0,2000),severity=level||(/error|fatal|failed|exception|失败|错误/i.test(message)?'error':/warn|警告/i.test(message)?'warn':'debug');this.status.logs.push(`${new Date().toLocaleTimeString()} ${message}`);this.onLog?.(severity,message)}this.status.logs=this.status.logs.slice(-160)}
  async start(settings:StudioSettings,model:StudioLocalModel,options:DeveloperPreferences={host:'127.0.0.1',parallel:1,embedding:false,metrics:true,hasApiKey:false},apiKey='',loadOptions:RuntimeLoadOptions={}){
@@ -23,6 +25,7 @@ export class LocalAiRuntime {
   if(!validRuntimeExecutable(settings.runtimePath))throw new Error(`未找到可执行的 ${runtimeExecutableName()}。请在“模型服务 > 本地服务 > 运行时”中自动查找、安装官方运行包，或选择解压后具有执行权限的运行文件`)
   if(!model.exists||model.format!=='GGUF')throw new Error('托管运行需要有效的 GGUF 模型文件')
   const projector=findVisionProjector(model.localPath)
+  this.performance.reset()
   this.status={state:'starting',modelId:model.id,modelName:`myplane-${model.id.slice(0,16)}`,endpoint:`http://127.0.0.1:${settings.runtimePort}/v1`,error:'',logs:[],startedAt:Date.now(),host:options.host,parallel:options.parallel,contextLength:settings.contextLength,embedding:options.embedding}
   try{
    this.status.vision=!!projector
@@ -38,7 +41,7 @@ export class LocalAiRuntime {
    const child=spawn(settings.runtimePath,args,{windowsHide:true,shell:false,cwd:path.dirname(settings.runtimePath),env,stdio:['ignore','pipe','pipe']});this.child=child;this.status.pid=child.pid
    this.log(`正在加载 ${model.file}；上下文 ${settings.contextLength}，GPU 层 ${settings.gpuLayers}`,'info')
    this.log(projector?`已加载视觉组件：${path.basename(projector)}`:'未加载视觉组件，当前仅支持文字输入','info')
-   child.stdout?.on('data',data=>this.log(String(data)));child.stderr?.on('data',data=>this.log(String(data)))
+   child.stdout?.on('data',data=>{if(this.child===child)this.performance.feed('stdout',data);this.log(String(data))});child.stderr?.on('data',data=>{if(this.child===child)this.performance.feed('stderr',data);this.log(String(data))})
    child.once('error',error=>{this.status.state='error';this.status.error=error.message;this.log(error.message,'error');this.child=undefined;clearTimeout(this.timer)})
    child.once('exit',(code,signal)=>{clearTimeout(this.timer);if(this.child===child)this.child=undefined;this.status.pid=undefined;if(this.status.state==='stopping')this.status.state='stopped';else if(this.status.state!=='error'){this.status.state='error';this.status.error=code!==null&&(code>>>0)===0xc0000135?'运行包缺少 DLL，请重新安装完整运行包，不要只复制 llama-server.exe':`模型进程已退出（${code??signal}），请查看日志；检查模型架构、运行包版本、内存和 GPU 参数`};this.log(`进程退出：${code??signal}`,this.status.state==='error'?'error':'info')})
    const deadline=Date.now()+300_000

@@ -12,13 +12,22 @@ import {languages} from '@codemirror/language-data'
 import {linter} from '@codemirror/lint'
 import {tags} from '@lezer/highlight'
 import AiMarkdown from '../AiMarkdown.vue'
-const props=defineProps<{modelValue:string;filename:string;readonly?:boolean}>()
+const props=defineProps<{modelValue:string;filename:string;readonly?:boolean;wrapLines?:boolean}>()
 const emit=defineEmits<{'update:modelValue':[value:string];save:[]}>()
 const host=ref<HTMLElement>()
 const preview=ref(false)
 const position=ref('1:1')
-const language=computed(()=>props.filename.toLowerCase().endsWith('.py')?'Python':props.filename.toLowerCase().endsWith('.json')?'JSON':'Markdown')
+const language=computed(()=>/\.[cm]?jsx?$/i.test(props.filename)?'JavaScript':/\.[cm]?tsx?$/i.test(props.filename)?'TypeScript':props.filename.toLowerCase().endsWith('.py')?'Python':props.filename.toLowerCase().endsWith('.json')?'JSON':'Markdown')
 const editable=new Compartment()
+const wrapping=new Compartment()
+const codeLanguage=new Compartment()
+async function loadCodeLanguage(){
+ const filename=props.filename
+ const description=languages.find(item=>item.name===language.value)
+ if(!description||!['JavaScript','TypeScript'].includes(language.value))return
+ const support=await description.load()
+ if(view&&props.filename===filename)view.dispatch({effects:codeLanguage.reconfigure(support)})
+}
 const states=new Map<string,{state:EditorState;scrollTop:number;scrollLeft:number}>()
 let view:EditorView|undefined
 let activeFile=''
@@ -44,8 +53,8 @@ const colors=HighlightStyle.define([
  {tag:tags.invalid,color:'var(--s-danger)',textDecoration:'underline wavy'}
 ])
 const theme=EditorView.theme({
- '&':{height:'100%',backgroundColor:'var(--s-bg)',color:'var(--s-text)',fontSize:'12px'},
- '.cm-scroller':{overflow:'auto',fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',lineHeight:'1.85'},
+ '&':{height:'100%',backgroundColor:'var(--s-bg)',color:'var(--s-text)',fontSize:'var(--app-code-font-size, 13px)'},
+ '.cm-scroller':{overflow:'auto',fontFamily:'var(--app-code-font-family, "Cascadia Code", Consolas, monospace)',lineHeight:'var(--app-code-line-height, 1.7)'},
  '.cm-content':{padding:'14px 0',caretColor:'var(--s-text)'},
  '.cm-line':{padding:'0 16px'},
  '.cm-gutters':{backgroundColor:'var(--s-bg)',color:'var(--s-dim)',borderRight:'1px solid var(--s-border)'},
@@ -63,9 +72,10 @@ const theme=EditorView.theme({
 function updatePosition(){if(view){const point=view.state.selection.main.head,line=view.state.doc.lineAt(point);position.value=`${line.number}:${point-line.from+1}`}}
 function createState(){
  return EditorState.create({doc:props.modelValue,extensions:[basicSetup,theme,syntaxHighlighting(colors),
-  language.value==='JSON'?[json(),linter(jsonParseLinter())]:language.value==='Python'?python():[markdown({codeLanguages:languages}),EditorView.lineWrapping],
+  codeLanguage.of(language.value==='JSON'?[json(),linter(jsonParseLinter())]:language.value==='Python'?python():language.value==='Markdown'?[markdown({codeLanguages:languages}),EditorView.lineWrapping]:[]),
   indentUnit.of(language.value==='Python'?'    ':'  '),
   editable.of(EditorState.readOnly.of(!!props.readonly)),
+  wrapping.of(props.wrapLines?EditorView.lineWrapping:[]),
   EditorView.contentAttributes.of({'aria-label':props.filename,spellcheck:'false'}),
   keymap.of([{key:'Mod-s',run:()=>{if(!props.readonly)emit('save');return true}},indentWithTab]),
   EditorView.updateListener.of(update=>{if(update.docChanged)emit('update:modelValue',update.state.doc.toString());if(update.docChanged||update.selectionSet)updatePosition()})
@@ -76,7 +86,7 @@ function syncContent(){
  const current=view.state.doc.toString()
  if(current!==props.modelValue)view.dispatch({changes:{from:0,to:current.length,insert:props.modelValue}})
 }
-onMounted(()=>{activeFile=props.filename;view=new EditorView({parent:host.value,state:createState()});updatePosition()})
+onMounted(()=>{activeFile=props.filename;view=new EditorView({parent:host.value,state:createState()});updatePosition();void loadCodeLanguage()})
 watch(()=>props.filename,()=>{
  if(!view)return
  states.set(activeFile,{state:view.state,scrollTop:view.scrollDOM.scrollTop,scrollLeft:view.scrollDOM.scrollLeft})
@@ -84,13 +94,25 @@ watch(()=>props.filename,()=>{
  const cached=states.get(activeFile)
  view.setState(cached?.state||createState())
  view.dispatch({effects:editable.reconfigure(EditorState.readOnly.of(!!props.readonly))})
- syncContent();updatePosition()
+ syncContent();updatePosition();void loadCodeLanguage()
  view.requestMeasure({read:()=>null,write:()=>{if(view){view.scrollDOM.scrollTop=cached?.scrollTop||0;view.scrollDOM.scrollLeft=cached?.scrollLeft||0}}})
 })
 watch(()=>props.modelValue,syncContent)
 watch(()=>props.readonly,()=>view?.dispatch({effects:editable.reconfigure(EditorState.readOnly.of(!!props.readonly))}))
+watch(()=>props.wrapLines,()=>view?.dispatch({effects:wrapping.reconfigure(props.wrapLines?EditorView.lineWrapping:[])}))
 watch(preview,value=>{if(!value)view?.requestMeasure()})
-onBeforeUnmount(()=>view?.destroy())
+async function formatCode(){
+ const editor=view
+ if(!editor||props.readonly||language.value!=='JavaScript')return false
+ const state=editor.state,filename=props.filename
+ const [{formatWithCursor},babel,estree]=await Promise.all([import('prettier/standalone'),import('prettier/plugins/babel'),import('prettier/plugins/estree')])
+ const result=await formatWithCursor(state.doc.toString(),{parser:'babel',plugins:[babel,estree],cursorOffset:state.selection.main.head,tabWidth:2,useTabs:false,printWidth:90,singleQuote:true,semi:false,trailingComma:'all',endOfLine:'lf'})
+ if(view!==editor||editor.state!==state||props.filename!==filename||props.readonly)return false
+ if(result.formatted!==state.doc.toString())editor.dispatch({changes:{from:0,to:state.doc.length,insert:result.formatted},selection:{anchor:result.cursorOffset},userEvent:'input.format'})
+ return true
+}
+defineExpose({formatCode})
+onBeforeUnmount(()=>{view?.destroy();view=undefined})
 </script>
 <template>
  <div class="skill-code-editor">

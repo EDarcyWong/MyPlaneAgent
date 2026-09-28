@@ -7,7 +7,12 @@ declare global {
  interface Window {
   myplane:{
    desktopPlatform?:string
+   inspectorSnapshot():Promise<import('../electron/shared/execution-inspector').InspectorWindowContext>
+   inspectorContext(value:import('../electron/shared/execution-inspector').InspectorWindowContext):Promise<void>
+   inspectorWindow(action:'open'|'close'|'state'):Promise<boolean>
+   onInspectorWindowState(callback:(open:boolean)=>void):()=>void
    showTitleMenu(label:string,x:number):Promise<void>
+   setTitleBarColors(color:string,symbolColor:string):Promise<void>
    localAiStudio<K extends keyof StudioCommands>(action:K,payload?:StudioCommands[K]['input']):Promise<StudioCommands[K]['output']>
    onLocalAiAgentEvent(callback:(task:AgentTask)=>void):()=>void
    onAgentCoreEvent(callback:(event:AgentCoreUiEvent)=>void):()=>void
@@ -18,7 +23,10 @@ declare global {
    onBrowserState(callback:(state:BrowserState)=>void):()=>void
    openAiLink(url:string):Promise<void>
    openWorkflowEditor(workflowId?:string):Promise<void>
-   openHelpDocument(documentId?:'workflow'):Promise<void>
+   openHelpDocument(documentId?:import('../electron/shared/help-documents').HelpDocumentId):Promise<void>
+   performanceWindow(action:'open'|'close'|'state'):Promise<boolean>
+   performanceSnapshot():Promise<{runtime:import('../electron/shared/local-ai-studio').StudioRuntime;source:'managed'|'external';theme:'system'|'light'|'dark'}>
+   onPerformanceWindowState(callback:(open:boolean)=>void):()=>void
    closeWorkflowEditor():Promise<void>
    workflowEditorSaved(workflowId:string):Promise<void>
    onWorkflowSaved(callback:(workflowId?:string)=>void):()=>void

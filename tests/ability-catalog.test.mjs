@@ -135,3 +135,21 @@ test('read-only details distinguish missing code from available managed modules'
   assert.equal(catalog.list().modules[0].name, '目标与约束提取')
   assert.deepEqual(catalog.list().modules[0].dependencies, [])
 })
+
+
+test('current and archived implementation previews return complete large files', t => {
+  const { root } = fixture(t)
+  const install = path.join(root, 'full-source-install')
+  const relative = abilityDefinitions.find(module => module.id === 'call-validation').implementation[0]
+  const file = path.join(install, relative)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const code = '// complete implementation\n' + 'const value = 1;\n'.repeat(4000) + '// END OF FILE'
+  fs.writeFileSync(file, code)
+  const catalog = new AbilityCatalogService(new Map(), install, root)
+  const current = catalog.details('call-validation').sources.find(source => source.path.endsWith(relative))
+  const archived = catalog.archive('call-validation', JSON.parse(fs.readFileSync(path.join(root, 'catalog', 'current.json'), 'utf8')).snapshotId).sources.find(source => source.path === relative)
+  for (const source of [current, archived]) {
+    assert.equal(source.code, code)
+    assert.equal(source.truncated, false)
+  }
+})

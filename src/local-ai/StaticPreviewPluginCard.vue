@@ -4,5 +4,13 @@ const enabled=ref(false),running=ref(0),busy=ref(false),error=ref('')
 onMounted(async()=>{try{const state=await window.myplane.localAiStudio('previewPluginState');enabled.value=state.enabled;running.value=state.running}catch(cause){error.value=String(cause)}})
 async function toggle(){busy.value=true;error.value='';try{const state=await window.myplane.localAiStudio('previewPluginConfigure',{enabled:!enabled.value});enabled.value=state.enabled;running.value=state.running}catch(cause){error.value=String(cause)}finally{busy.value=false}}
 </script>
-<template><section class="preview-plugin-card"><div><strong>静态网页预览 <small>内置插件 · 可停用</small></strong><p>让 Agent 启动、查询和停止本地静态网页服务，无需 package.json 或命令行。选择项目目录并开启会话联网后可用。停用插件或退出应用会停止它启动的服务。</p><p>当前运行 {{running}} 个服务；启动后以工具返回的网址为准。</p><p v-if="error" role="alert">{{error}}</p></div><button role="switch" :aria-checked="enabled" aria-label="启用静态网页预览插件" :disabled="busy" @click="toggle">{{busy?'处理中…':enabled?'已启用':'启用插件'}}</button></section></template>
-<style scoped>.preview-plugin-card{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--s-border);background:var(--s-panel);flex:none;flex-wrap:wrap}.preview-plugin-card>div{flex:1;min-width:200px}.preview-plugin-card strong{font-size:13px}.preview-plugin-card small,.preview-plugin-card p{font-size:11px;color:var(--s-dim)}.preview-plugin-card p{line-height:1.6;margin:5px 0}.preview-plugin-card button{border:1px solid var(--s-border);border-radius:6px;padding:6px 12px;color:var(--s-text);background:var(--s-panel)}.preview-plugin-card button[aria-checked=true]{background:var(--s-accent);color:var(--s-on-accent)}</style>
+<template>
+  <section class="builtin-plugin preview-plugin-card" aria-label="静态网页预览插件">
+    <header><div><div class="plugin-title"><h2>静态网页预览</h2><span>内置插件</span></div><p>为项目启动本地静态网页预览。</p></div></header>
+    <div class="plugin-state"><div><strong>允许 Agent 使用</strong><small>{{ enabled ? '已启用' : '已停用' }} · {{ running }} 个服务运行中</small></div><button class="plugin-switch" role="switch" :aria-checked="enabled" aria-label="启用静态网页预览插件" :disabled="busy" @click="toggle"><span/></button></div>
+    <p v-if="error" class="error" role="alert">{{error}}</p>
+    <section class="plugin-section"><h3>提供的能力</h3><ul><li>启动、查询和停止本地静态网页服务</li><li>无需 package.json 或额外执行命令</li></ul></section>
+    <section class="plugin-section"><h3>使用条件</h3><p>选择项目目录并开启会话联网。启动后，通过工具返回的网址访问预览。</p><p>停用插件或退出应用会停止该插件启动的服务。</p></section>
+  </section>
+</template>
+<style scoped src="./builtin-plugin-detail.css"></style>

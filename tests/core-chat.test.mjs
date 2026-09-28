@@ -15,6 +15,20 @@ import {enqueueReviewActions} from '../dist-electron/main/agent/core/review-disp
 import {runTaskPlan,parseTaskItems} from '../dist-electron/main/agent/core/task-plan-runner.js'
 import {weatherDate} from '../dist-electron/main/agent/core/weather-workflow.js'
 import {createTaskScope} from '../dist-electron/shared/task-scope.js'
+import {ExecutionInspector} from '../dist-electron/main/agent/core/execution-inspector.js'
+
+test('inspection edits reach approval, execution and subsequent model history',async()=>{
+ const controller=new AbortController(),inspector=new ExecutionInspector(controller.signal,true),executions=[],approvals=[]
+ await withModel(input=>executions.length?{content:'查询完成'}:toolCall(input,'agent.web_search',{query:'original'}),async(connection,requests)=>{
+  const run=runCoreChat({list:()=>[capability('agent.web_search')],execute:async request=>{executions.push(request.args);return {success:true,output:'verified result'}}},options(connection,{signal:controller.signal,inspectTool:(cap,args,id)=>inspector.before('tool',cap.name,'plugin',args,cap.parameters,id),approve:async activity=>{approvals.push(activity.args);return true}}))
+  for(let i=0;i<200&&!inspector.snapshot().checkpointId;i++)await new Promise(resolve=>setTimeout(resolve,10))
+  assert.ok(inspector.snapshot().checkpointId);assert.equal(executions.length,0);assert.equal(approvals.length,0)
+  inspector.command({action:'continue',checkpointId:inspector.snapshot().checkpointId,args:{query:'edited by user'}})
+  await run
+  assert.deepEqual(executions,[{query:'edited by user'}]);assert.deepEqual(approvals,executions)
+  assert.ok(requests.some(request=>request.messages.some(message=>message.tool_calls?.some(call=>JSON.parse(call.function.arguments).query==='edited by user'))))
+ })
+})
 
 test('read-only weather task does not expose unrelated project diagnostics',()=>{
  const diagnostic=capability('agent.get_diagnostics','read')

@@ -1,4 +1,5 @@
 import { requestBudget, readModelCapacityError, rememberModelCapacity, ModelContextCapacityError } from './model-budget.js'
+import {externalModelPerformance} from '../external-model-performance.js'
 import {isDeepSeek,deepseekThinking} from '../../shared/local-ai-providers.js'
 import {readTokenUsage,mergeTokenUsage,type TokenUsage} from '../../shared/local-ai-usage.js'
 import {record,sseData} from '../local-ai-utils.js'
@@ -34,6 +35,33 @@ function textOnlyHistory(messages:AgentMessage[]):AgentMessage[]{
  })
 }
 const leakedToolSyntax=/<[|｜]\s*[|｜]\s*DSML|<\|(?:tool_call|im_start)\|>\s*(?:assistant\s+to=|\{?\s*"?name"?)/i
+type StreamToolCall={id:string;type:string;function:{name:string;arguments:string}}
+function streamToolIndex(call:Record<string,unknown>,calls:Map<number,StreamToolCall>,batchSize:number):number{
+ // An index identifies a call, not the number of calls in this response.
+ if(call.index!==undefined&&call.index!==null){
+  const index=typeof call.index==='string'&&/^\d+$/.test(call.index)?Number(call.index):call.index
+  if(typeof index!=='number'||!Number.isSafeInteger(index)||index<0)throw new ModelFormatError('模型返回了无效的工具调用序号（需为非负整数）')
+  return index
+ }
+ const fn=record(call.function)
+ if(typeof call.id==='string'&&call.id){
+  const match=[...calls].find(([,current])=>current.id===call.id)
+  if(match)return match[0]
+  // A new complete identity can establish a call even when index is omitted.
+  if(typeof fn.name==='string'&&fn.name){
+   const next=calls.size?Math.max(...calls.keys())+1:0
+   if(Number.isSafeInteger(next))return next
+  }
+ }
+ if(batchSize===1){
+  if(!calls.size)return 0
+  if(calls.size===1){
+   const [index,current]=[...calls][0]
+   if((call.id==null||call.id===''||call.id===current.id)&&(fn.name==null||fn.name===''||fn.name===current.function.name))return index
+  }
+ }
+ throw new ModelFormatError('模型工具片段缺少 index，且无法唯一匹配调用 ID；为避免混合工具入参，本轮未执行工具')
+}
 export const containsLeakedToolSyntax=(text:string)=>leakedToolSyntax.test(text)
 export async function requestAgentModel(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions={}):Promise<AgentAnswer>{
  if(options.tools===false)messages=textOnlyHistory(messages)
@@ -62,6 +90,19 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
  }
 }
 async function requestAgentModelOnce(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions):Promise<AgentAnswer>{
+ if(connection.localLlama)return requestAgentModelUnmeasured(connection,model,messages,signal,options)
+ const id=externalModelPerformance.begin(connection.endpoint,model)
+ try{
+  const answer=await requestAgentModelUnmeasured(connection,model,messages,signal,{...options,
+   onProgress:progress=>{externalModelPerformance.progress(id,progress.characters);options.onProgress?.(progress)},
+   onUsage:usage=>{externalModelPerformance.usage(id,usage);options.onUsage?.(usage)}
+  })
+  const characters=(answer.content?.length||0)+(answer.reasoning?.length||0)+(answer.tool_calls||[]).reduce((sum,call)=>sum+call.function.name.length+call.function.arguments.length,0)
+  externalModelPerformance.finish(id,'complete',characters)
+  return answer
+ }catch(error){externalModelPerformance.finish(id,signal.aborted?'cancelled':'error');throw error}
+}
+async function requestAgentModelUnmeasured(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions):Promise<AgentAnswer>{
  const timing={...agentModelTiming,...options.timing},timeout=new AbortController(),combined=AbortSignal.any([signal,timeout.signal])
  const abort=(message:string)=>timeout.abort(new Error(message+' 本轮未执行工具，可检查模型状态后继续任务。'))
  const minutes=(ms:number)=>`${Math.max(1,Math.round(ms/60000))} 分钟`
@@ -83,7 +124,7 @@ async function requestAgentModelOnce(connection:AgentConnection,model:string,mes
   let data:Record<string,unknown>
   if(response.ok&&response.headers.get('content-type')?.includes('text/event-stream')){
    let content='',reasoning='',characters=0,wireSize=0,finish=''
-   const calls=new Map<number,{id:string;type:string;function:{name:string;arguments:string}}>()
+   const calls=new Map<number,StreamToolCall>()
    for await(const frame of sseData(response.body,combined)){
     options.onResponse?.(frame+'\n')
     if(frame==='[DONE]')break
@@ -98,12 +139,15 @@ async function requestAgentModelOnce(connection:AgentConnection,model:string,mes
     if(delta.tool_calls!=null){
      if(!Array.isArray(delta.tool_calls)||delta.tool_calls.length>8)throw new ModelFormatError('模型工具调用格式错误或单轮超过 8 个')
      for(const raw of delta.tool_calls){
-      const call=record(raw),fn=record(call.function),index=call.index
-      if(typeof index!=='number'||!Number.isInteger(index)||index<0||index>7)throw new ModelFormatError('模型返回了无效的工具调用序号')
+      const call=record(raw),fn=record(call.function),index=streamToolIndex(call,calls,delta.tool_calls.length)
+      if(!calls.has(index)&&calls.size>=8)throw new ModelFormatError('模型单轮工具调用超过 8 个')
+      if(call.type!=null&&call.type!=='function')throw new ModelFormatError('模型返回了不支持的工具调用类型')
       const current=calls.get(index)||{id:'',type:'function',function:{name:'',arguments:''}}
+      if(current.id&&typeof call.id==='string'&&call.id&&call.id!==current.id)throw new ModelFormatError('模型为同一工具序号返回了不同调用 ID，本轮未执行工具')
       for(const [target,key,value] of [[current,'id',call.id],[current.function,'name',fn.name],[current.function,'arguments',fn.arguments]] as const){
        if(value!=null&&typeof value!=='string')throw new ModelFormatError('模型返回了无效的工具调用片段')
-       if(typeof value==='string'){(target as Record<string,string>)[key]+=value;added+=value.length}
+       // Compatible providers may repeat an unchanged ID/name in every delta.
+       if(typeof value==='string'&&!(key!=='arguments'&&value===(target as Record<string,string>)[key])){(target as Record<string,string>)[key]+=value;added+=value.length}
       }
       if(current.id.length>200||current.function.name.length>200||current.function.arguments.length>150000)throw new Error('模型工具调用过长，请缩小任务')
       calls.set(index,current)

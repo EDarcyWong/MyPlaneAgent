@@ -19,9 +19,12 @@ import { AbilityModelEvaluation } from './ability-modules/model-evaluation.js';
 import { comparisonSnapshot } from './ability-modules/comparison.js';
 import type {ModulePolicy} from '../shared/ability-modules.js';
 import {sessionPdf} from './session-pdf.js';
+import {normalizeAppearance} from '../shared/app-appearance.js';
 import {validBackgroundImage,backgroundOpacity} from '../shared/app-background.js';
 import { modelCapacity, ModelContextCapacityError } from './agent/model-budget.js';
 import type { ChatRunOptions } from './agent/core/chat-runner.js';
+import { ExecutionInspector } from './agent/core/execution-inspector.js';
+import {externalModelPerformance} from './external-model-performance.js';
 import { workflowValidationMessage } from "../shared/workflow-validation.js";
 import {
   compactContext,
@@ -192,6 +195,11 @@ export class LocalAiStudioService extends LocalAiService {
   private readonly sessionsDirectory: string;
   private readonly downloads: LocalAiDownloads;
   private readonly runtime: LocalAiRuntime;
+  private readonly inspectors=new Map<string,ExecutionInspector>();
+  private readonly inspectorOwners=new Map<number,number>();
+  authorizeInspector(view:number,owner?:number){if(owner===undefined)this.inspectorOwners.delete(view);else this.inspectorOwners.set(view,owner)}
+  hasPausedInspection(owner:number){return [...this.chats.entries()].some(([id,chat])=>chat.owner===owner&&this.inspectors.get(id)?.snapshot().pauseRequested)}
+  private readonly inspectedRuns=new Map<string,{owner:number;state:import('../shared/execution-inspector.js').InspectionState}>();
   private readonly chats = new Map<
     string,
     { owner: number; sessionId: string; controller: AbortController }
@@ -593,6 +601,9 @@ export class LocalAiStudioService extends LocalAiService {
         ),
       ),
       gpuLayers: Math.round(numeric(p.gpuLayers, -1, 999, 0)),
+      showTokenSpeed: p.showTokenSpeed === true,
+      showExecutionInspector: p.showExecutionInspector === true,
+      pauseBeforeAgentCalls: p.pauseBeforeAgentCalls === true,
       threads: Math.round(
         numeric(p.threads, 1, 256, Math.max(1, Math.min(8, os.cpus().length))),
       ),
@@ -600,6 +611,7 @@ export class LocalAiStudioService extends LocalAiService {
       topP: numeric(p.topP, 0.01, 1, 0.95),
       repeatPenalty: numeric(p.repeatPenalty, 0.1, 2, 1.1),
       systemPrompt: textValue(p.systemPrompt, 12000),
+      appearance: normalizeAppearance(p.appearance),
       backgroundImage: validBackgroundImage(p.backgroundImage) ? p.backgroundImage : '',
       backgroundOpacity: backgroundOpacity(p.backgroundOpacity),
       theme: p.theme === "light" || p.theme === "dark" ? p.theme : "system",
@@ -654,6 +666,7 @@ export class LocalAiStudioService extends LocalAiService {
     if (value.backgroundImage !== undefined && value.backgroundImage !== '' && !validBackgroundImage(value.backgroundImage))
       throw new Error('背景图片格式无效或文件过大');
     if (value.backgroundOpacity !== undefined) value.backgroundOpacity = backgroundOpacity(value.backgroundOpacity);
+    if (value.appearance !== undefined) value.appearance = normalizeAppearance(value.appearance);
     super.saveSettings(value);
     const keys = [
       "source",
@@ -662,12 +675,16 @@ export class LocalAiStudioService extends LocalAiService {
       "contextLength",
       "gpuLayers",
       "threads",
+      "showTokenSpeed",
+      "showExecutionInspector",
+      "pauseBeforeAgentCalls",
       "temperature",
       "topP",
       "repeatPenalty",
       "systemPrompt",
       "theme",
       "appearanceStyle",
+      "appearance",
       "backgroundImage",
       "backgroundOpacity",
     ] as const;
@@ -1345,6 +1362,7 @@ export class LocalAiStudioService extends LocalAiService {
   private runtimeSnapshot() {
     return {
       ...this.runtime.snapshot(),
+      externalPerformance: externalModelPerformance.snapshot(this.studioSettings().endpoint),
       endpoint:
         this.gateway.endpoint ||
         `http://127.0.0.1:${this.studioSettings().runtimePort}/v1`,
@@ -1648,6 +1666,8 @@ export class LocalAiStudioService extends LocalAiService {
     session.model = model;
     this.saveSession(session);
     const controller = new AbortController();
+    const inspector=new ExecutionInspector(controller.signal,settings.showExecutionInspector===true&&settings.pauseBeforeAgentCalls===true);
+    this.inspectors.set(requestId,inspector);
     this.chats.set(requestId, {
       owner: sender.id,
       sessionId: session.id,
@@ -1670,6 +1690,7 @@ export class LocalAiStudioService extends LocalAiService {
       {
         workspace, initializeLocalGit: !!grant || !!project, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled, webAllowSyntheticIp:project?.webAllowSyntheticIp!==false,
         approvalMode: session.approvalMode || 'ask',
+        inspectTool:(capability,args,id)=>inspector.before('tool',capability.name,capability.source.type==='skill'?`插件 · ${capability.source.skillId}`:capability.source.type==='mcp'?`MCP · ${capability.source.serverId}`:'内置工具',args,capability.parameters,id),
         getApprovalMode: () => session.approvalMode || 'ask',
         approvalGranted: activity => approvalGrants.allows(activity),
         approve: activity => new Promise<boolean>(resolve => {
@@ -1692,6 +1713,9 @@ export class LocalAiStudioService extends LocalAiService {
     ).finally(() => {
       sender.removeListener("destroyed", destroyed);
       this.chats.delete(requestId);
+      this.inspectedRuns.set(requestId,{owner:sender.id,state:inspector.finish()});
+      while(this.inspectedRuns.size>8)this.inspectedRuns.delete(this.inspectedRuns.keys().next().value!);
+      this.inspectors.delete(requestId);
       for (const pending of this.chatApprovals.values()) if (pending.requestId === requestId) pending.resolve(false);
     });
     return { started: true };
@@ -1834,7 +1858,7 @@ export class LocalAiStudioService extends LocalAiService {
     emit: (event: StudioEvent) => void,
     requestId: string,
     compactOnly = false,
-    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'webAllowSyntheticIp'|'approvalMode'|'approve'|'getApprovalMode'|'approvalGranted'>,
+    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'webAllowSyntheticIp'|'approvalMode'|'approve'|'getApprovalMode'|'approvalGranted'|'inspectTool'>,
   ) {
     const started = Date.now(),
       answer: StudioMessage = {
@@ -1871,7 +1895,10 @@ export class LocalAiStudioService extends LocalAiService {
     try {
       this.saveSession(session);
       let moduleContext: string | undefined;
-      const abilityPolicies = this.abilityPolicies.fork();
+      const inspector=this.inspectors.get(requestId);
+      const moduleSchema={type:'object',properties:{data:{type:'object'},messages:{type:'array',items:{type:'object',properties:{id:{type:'string'},text:{type:'string'}},required:['id','text']}}},required:['messages']};
+      const inspectModule=<I extends object,O>(name:string,input:I,work:(input:I)=>Promise<O>,schema:object=moduleSchema)=>inspector?inspector.run(name,input,schema,work,value=>this.abilityCatalog.managed(name).validateInspectionInput(value as import('../shared/ability-modules.js').AbilityInput)):work(input);
+      const abilityPolicies = this.abilityPolicies.fork(inspector?(id,input,execute)=>inspectModule(id,input,execute):undefined);
       if (!compactOnly) {
         const latest = session.messages.filter(message => message.role === 'user').at(-1)!;
         const previousState = session.abilityState;
@@ -1891,11 +1918,11 @@ export class LocalAiStudioService extends LocalAiService {
         let proposedState: typeof previousState;
         try {
           const candidates = selectionInput(newBoundary ? [latest] : taskMessages(session), newBoundary ? undefined : previousState);
-          const selection = await this.selectionModule.execute(candidates.input, signal);
+          const selection = await inspectModule('state-context-selection',candidates.input,value=>{candidates.input=value;return this.selectionModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,requiredIds:{type:'array',items:{type:'string'}},maxMessages:{type:'integer',minimum:1,maximum:1000},maxCharacters:{type:'integer',minimum:1,maximum:200000}},required:['messages','requiredIds','maxMessages','maxCharacters']});
           const selected = validateSelectionOutput(selection.output, candidates.input);
           const input = { messages: candidates.input.messages.filter(message => selected.selectedMessageIds.includes(message.id)) };
           this.selectionModule.recordSample(candidates.input, selection.versionId);
-          proposedState = await this.abilityModules.process(input, candidates.total - input.messages.length, signal);
+          proposedState = await inspectModule('conversation-state',input,value=>this.abilityModules.process(value,Math.max(0,candidates.total-value.messages.length),signal));
           proposedState.selectionVersionId = selection.versionId;
           const intent = await abilityPolicies.invoke('message-intent', {}, '', signal, input.messages.map(message=>({...message,text:message.text.slice(0,12000)})));
           proposedState.proposal.intent = intent.intent;
@@ -1903,8 +1930,8 @@ export class LocalAiStudioService extends LocalAiService {
           this.applicationLog?.('warn', 'ability-modules', `状态模块未应用，保留原始对话继续：${String(cause)}`);
         }
         signal.throwIfAborted();
-        const routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
-        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await this.routerModule.execute(routingInput, signal);
+        let routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
+        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await inspectModule('task-message-router',routingInput,value=>{routingInput=value;return this.routerModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,intent:{type:'string'},taskStatus:{const:routingInput.taskStatus},hasAttachments:{const:routingInput.hasAttachments}},required:['messages','intent','taskStatus','hasAttachments']});
         const route = validateRouterOutput(routed.output, routingInput);
         if(lookupChange==='new_task'){
           try{
@@ -1921,7 +1948,7 @@ export class LocalAiStudioService extends LocalAiService {
           // Initial task after unrelated questions also starts from the current user message.
           if (!newBoundary && proposedState?.proposal.goalMessageId !== latest.id) {
             const selectionVersionId = proposedState?.selectionVersionId;
-            proposedState = await this.abilityModules.process({messages:[{id:latest.id,text:latest.content}]}, 0, signal);
+            proposedState = await inspectModule('conversation-state',{messages:[{id:latest.id,text:latest.content}]},value=>this.abilityModules.process(value,0,signal));
             proposedState.selectionVersionId = selectionVersionId;
           }
           session.abilityState = proposedState;
@@ -2016,6 +2043,7 @@ export class LocalAiStudioService extends LocalAiService {
           emit({type:'delta',requestId,content:'',reasoning:'',usage:answer.usage,sessionUsage:session.usage});
         },
         onActivity: activity => {
+          inspector?.update(activity.id,activity.status==='waiting'?'ready':activity.status==='denied'?'error':activity.status,activity.output);
           answer.toolActivity ??= [];
           const index = answer.toolActivity.findIndex(item => item.id === activity.id);
           if (index >= 0) answer.toolActivity[index] = activity; else {
@@ -3582,10 +3610,20 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
         pending.resolve(value.approved === true,scope as 'once'|'similar'|'full');
         return;
       }
+      case "chatInspect": {
+        const ownerId=this.inspectorOwners.get(event.sender.id)??event.sender.id;
+        const requestId=required(value.requestId,'请求 ID'),chat=this.chats.get(requestId),inspector=this.inspectors.get(requestId);
+        const finished=this.inspectedRuns.get(requestId);
+        if(value.action==='state'&&finished?.owner===ownerId)return finished.state;
+        // The renderer allocates its request ID before asynchronous chat startup finishes.
+        if(value.action==='state'&&!chat&&!finished)return {pauseRequested:false,calls:[]};
+        if(!chat||chat.owner!==ownerId||!inspector)throw new Error('对话已结束或不属于当前窗口');
+        return inspector.command(value as unknown as import('../shared/execution-inspector.js').InspectionCommand);
+      }
       case "stopChat":
         return this.stopChat(
           required(value.requestId, "请求 ID"),
-          event.sender.id,
+          this.inspectorOwners.get(event.sender.id)??event.sender.id,
         );
       default:
         throw new Error("不支持的本地 AI 操作");

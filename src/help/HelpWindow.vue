@@ -53,7 +53,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyDown))
     <div class="help-layout">
       <aside class="help-sidebar">
         <label for="help-search">搜索文档</label>
-        <div class="help-search"><input id="help-search" ref="searchInput" v-model="query" type="search" placeholder="组件、JSON、用例…" autocomplete="off" /><button v-if="query" type="button" aria-label="清空搜索" @click="query = ''">清空</button></div>
+        <div class="help-search"><input id="help-search" ref="searchInput" v-model="query" type="search" placeholder="输入关键词搜索章节…" autocomplete="off" /><button v-if="query" type="button" aria-label="清空搜索" @click="query = ''">清空</button></div>
         <p class="help-search-status" aria-live="polite">{{ query.trim() ? `${visibleSections.length} 个匹配章节` : `${sections.length} 个章节 · Ctrl/Cmd+F 搜索` }}</p>
         <nav aria-label="帮助文档目录">
           <button v-for="(section, index) in visibleSections" :key="section.id" type="button" :class="{ active: activeId === section.id }" :aria-current="activeId === section.id ? 'location' : undefined" @click="navigate(section.id)"><span>{{ String(index + 1).padStart(2, '0') }}</span>{{ section.title }}</button>
@@ -61,7 +61,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyDown))
         <p class="help-sidebar-note">帮助在独立窗体中打开，可与编辑器并排查看。</p>
       </aside>
       <main ref="reader" class="help-reader" aria-label="帮助文档正文">
-        <div v-if="!visibleSections.length" class="help-empty"><h2>没有找到匹配章节</h2><p>试试“汇合”“变量”或“输出”，也可以清空搜索查看全文。</p><button type="button" @click="query = ''">查看全部文档</button></div>
+        <div v-if="!visibleSections.length" class="help-empty"><h2>没有找到匹配章节</h2><p>试试更短的关键词，也可以清空搜索查看全文。</p><button type="button" @click="query = ''">查看全部文档</button></div>
         <article v-for="section in visibleSections" :key="section.id" class="help-section">
           <h2 :id="section.id" tabindex="-1">{{ section.title }}</h2>
           <div class="help-prose" v-html="section.html"></div>

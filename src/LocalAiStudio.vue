@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import AppearanceBackground from './local-ai/AppearanceBackground.vue'
+import AppPreferences from './local-ai/AppPreferences.vue'
+import {appearanceVariables,normalizeAppearance} from '../electron/shared/app-appearance'
+import {backgroundImageUrl} from './local-ai/background-presets'
 import {validBackgroundImage,backgroundOpacity} from '../electron/shared/app-background'
 import {modelFileRole} from '../electron/shared/model-library'
 import type {StudioLocalModel,StudioModelFile} from '../electron/shared/local-ai-studio'
@@ -24,7 +26,28 @@ import {applicationLogRequested} from './local-ai/service-error-dialog'
 defineProps<{standalone?:boolean}>()
 const studio=useLocalAiStudio()
 const {modelsBusy,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,input,model,systemPrompt,query,format,sort,searching,results,selected,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,serverModels,workflowModels,statusText,online,bytes,count,percent,downloadLabel,fit,refreshModels,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,chooseDirectory,copy,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}=studio
-const backgroundStyle=computed(()=>validBackgroundImage(settings.backgroundImage)?{'--app-background':`url("${settings.backgroundImage}")`,'--app-background-opacity':backgroundOpacity(settings.backgroundOpacity)}:{})
+const appearance=computed(()=>normalizeAppearance(settings.appearance))
+const performanceDetached=ref(false)
+const inspectorDetached=ref(false),inspectorLastRequest=ref('')
+let disposeInspectorState:(()=>void)|undefined,contextTimer:ReturnType<typeof setTimeout>|undefined
+async function publishInspector(){const message=studio.pending.value||studio.session.value?.messages.filter(item=>item.role==='assistant').at(-1);await window.myplane.inspectorContext({requestId:studio.requestId.value,historyRequestId:inspectorLastRequest.value,sessionId:studio.session.value?.id,content:(message?.content||'').slice(-800000),reasoning:(message?.reasoning||'').slice(-800000),theme:settings.theme})}
+async function openInspector(){try{await publishInspector();inspectorDetached.value=await window.myplane.inspectorWindow('open')}catch(cause){error.value=`打开执行检查器失败：${String(cause)}`}}
+watch(()=>studio.session.value?.id,()=>{inspectorLastRequest.value=''})
+watch(()=>studio.requestId.value,id=>{if(id)inspectorLastRequest.value=id})
+watch(()=>[studio.requestId.value,studio.session.value?.id,studio.pending.value?.content,studio.pending.value?.reasoning,studio.session.value?.messages.at(-1)?.content,settings.theme],()=>{if(!contextTimer)contextTimer=setTimeout(()=>{contextTimer=undefined;void publishInspector().catch(()=>{})},100)})
+watch(()=>[ready.value,settings.showExecutionInspector],async([loaded,enabled])=>{if(!loaded)return;if(enabled)await openInspector();else if(inspectorDetached.value){const open=await window.myplane.inspectorWindow('close').catch(()=>false);if(open)settings.showExecutionInspector=true}})
+let disposePerformanceState:(()=>void)|undefined
+async function detachPerformance(){try{performanceDetached.value=await window.myplane.performanceWindow('open')}catch(cause){error.value=`打开性能窗口失败：${String(cause)}`}}
+onMounted(()=>{
+ disposePerformanceState=window.myplane.onPerformanceWindowState(open=>{performanceDetached.value=open})
+ void window.myplane.performanceWindow('state').then(open=>{performanceDetached.value=open}).catch(()=>{})
+ disposeInspectorState=window.myplane.onInspectorWindowState(open=>{inspectorDetached.value=open})
+ void window.myplane.inspectorWindow('state').then(open=>{inspectorDetached.value=open}).catch(()=>{})
+})
+onBeforeUnmount(()=>{disposePerformanceState?.();disposeInspectorState?.();clearTimeout(contextTimer)})
+watch(()=>[ready.value,settings.showTokenSpeed],([loaded,enabled])=>{if(!loaded)return;if(enabled)void detachPerformance();else if(performanceDetached.value)void window.myplane.performanceWindow('close').catch(cause=>{error.value=String(cause)})})
+const appearanceStyle=computed(()=>appearanceVariables(appearance.value))
+const backgroundStyle=computed(()=>validBackgroundImage(settings.backgroundImage)?{'--app-background':`url("${backgroundImageUrl(settings.backgroundImage)}")`,'--app-background-opacity':backgroundOpacity(settings.backgroundOpacity)}:{})
 const {studioRoot,narrow,compact,floatingInspector,detailsOpen,resizing,layoutStyle,layoutKey}=useStudioLayout(parameters,tab,drawer)
 const {modelIcons,iconFailed}=useModelIcons(computed(()=>ready.value&&tab.value==='discover'?results.value.map(item=>item.author):[]))
 const agentSkillManager=ref<InstanceType<typeof AgentSkillManager>|null>(null)
@@ -60,7 +83,7 @@ function onMoreMenuKeydown(event:KeyboardEvent){
 async function openModelSettings(){tab.value='server';await focusActiveNavigation()}
 function selectNavigation(id:typeof tab.value){if(id==='chat'){drawer.value=false;logOutputOpen.value=false}tab.value=id;moreOpen.value=false}
 function returnToChat(){selectNavigation('chat')}
-const appearanceStyles=[{id:'minimal',name:'极简',description:'克制的灰阶界面'},{id:'ocean',name:'海蓝',description:'清爽的蓝色工作区'},{id:'paper',name:'暖纸',description:'柔和的暖色层次'},{id:'terminal',name:'程式',description:'编辑器配色与高对比强调'}] as const
+
 const pageTitle=computed(()=>navigation.find(item=>item.id===tab.value)?.label||'本地 AI')
 const memoryPercent=computed(()=>hardware.value?Math.round((1-hardware.value.freeMemory/hardware.value.totalMemory)*100):0)
 const profileName=ref(''),profileId=ref(''),profileNameEdited=ref(false)
@@ -119,7 +142,7 @@ function fillRemotePreset(event:Event){
 </script>
 
 <template>
- <section ref="studioRoot" class="local-ai-studio" :class="{standalone,'has-background':validBackgroundImage(settings.backgroundImage),'settings-view':settingsMode,'chat-view':!settingsMode,'narrow-layout':narrow,'compact-layout':compact,'floating-inspector':floatingInspector,'is-resizing':resizing}" :style="[layoutStyle,backgroundStyle]" :data-theme="settings.theme" :data-style="settings.appearanceStyle" @keydown="layoutKey">
+ <section ref="studioRoot" class="local-ai-studio" :class="{standalone,'custom-font-size':appearance.fontSize!==14,'reduce-motion':appearance.reduceMotion,'has-background':validBackgroundImage(settings.backgroundImage),'settings-view':settingsMode,'chat-view':!settingsMode,'narrow-layout':narrow,'compact-layout':compact,'floating-inspector':floatingInspector,'is-resizing':resizing}" :style="[layoutStyle,backgroundStyle,appearanceStyle]" :data-theme="settings.theme" :data-style="settings.appearanceStyle" @keydown="layoutKey">
   <aside class="settings-navigation" aria-label="主菜单">
    <nav class="settings-feature-list" aria-label="主菜单" @keydown.esc="onNavigationEscape">
     <button v-for="item in visibleNavigation" :key="item.id" type="button" class="settings-rail-button" :class="{active:tab===item.id}" :title="item.label" :aria-label="item.label" :aria-current="tab===item.id?'page':undefined" @click="selectNavigation(item.id)"><component :is="item.icon"/></button>
@@ -240,16 +263,14 @@ function fillRemotePreset(event:Event){
    <AgentSkillManager v-else-if="tab==='skills'" ref="agentSkillManager"/>
    <AbilityModuleManager v-else-if="tab==='abilities'"/>
 
-   <main v-else-if="tab==='settings'" class="scroll-page settings-page"><header class="page-intro with-actions"><div><span class="eyebrow">PREFERENCES</span><h1>应用设置</h1><p>管理模型存储、界面外观和新会话默认值。服务连接请前往“模型服务”。</p></div><button class="primary-button" :disabled="!!busy||sending" @click="saveSettings()"><Check/>{{busy==='save'?'保存中':'保存设置'}}</button></header><div class="settings-grid">
-    <section class="content-card appearance-card"><header><div><h3>界面风格</h3><p>选择后立即预览，保存设置后下次打开仍会使用。</p></div><Operation/></header><div class="appearance-options" role="group" aria-label="界面风格"><button v-for="style in appearanceStyles" :key="style.id" type="button" class="appearance-option" :class="['preview-'+style.id,{selected:settings.appearanceStyle===style.id}]" :aria-pressed="settings.appearanceStyle===style.id" @click="settings.appearanceStyle=style.id"><span class="appearance-preview"><i/><i/><i/><b/></span><strong>{{style.name}}</strong><small>{{style.description}}</small><Check v-if="settings.appearanceStyle===style.id" class="appearance-selected-icon"/></button></div><label class="field appearance-mode">明暗模式<select v-model="settings.theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><AppearanceBackground :image="settings.backgroundImage" :opacity="settings.backgroundOpacity" @change="Object.assign(settings,$event)"/></section>
-    <section class="content-card"><header><h3>模型存储与 Hugging Face</h3><FolderOpened/></header><label class="field">下载目录<div class="path-field"><input v-model="settings.downloadDirectory" placeholder="选择模型保存目录"/><button class="icon-btn" :disabled="!!busy" aria-label="选择下载目录" @click="chooseDirectory"><FolderOpened/></button></div></label><p class="quiet">修改目录只影响新任务；现有模型和未完成下载仍使用原位置。</p><label class="field">Hugging Face Token<input v-model="hfToken" type="password" autocomplete="new-password" :placeholder="settings.hasHfToken?'已安全保存，留空不修改':'公开模型通常不需要 Token'"/></label><button v-if="settings.hasHfToken" class="text-button danger-text" :disabled="!!busy" @click="clearKey('hf')">移除已保存的 Token</button><div class="settings-tip"><Check/><p>密钥使用操作系统安全存储加密；下载可暂停、恢复，关闭应用后会保留进度。</p></div></section>
-    <section class="content-card"><header><h3>工作区默认值</h3><Operation/></header><label class="field">新会话系统提示词<textarea v-model="settings.systemPrompt" rows="4" maxlength="12000" placeholder="例如：请使用中文，回答简洁，并给出必要的示例。"></textarea></label><div class="field-pair"><label class="field">Temperature<input v-model.number="settings.temperature" type="number" min="0" max="2" step="0.05"/></label><label class="field">最大输出 tokens<input v-model.number="settings.maxTokens" type="number" min="128" :max="LOCAL_AI_MAX_OUTPUT_TOKENS" step="128"/></label></div><p class="quiet">DeepSeek 推荐默认 65,536；快速 Agent 单轮使用 8,192。深度 Agent 与聊天使用这里的完整预算，且不超过有效上下文的一半。</p></section>
-   </div></main>
+   <AppPreferences v-else-if="tab==='settings'" :settings="settings" v-model:hf-token="hfToken" :busy="!!busy||sending" :saving="busy==='save'" @save="saveSettings()" @directory="chooseDirectory" @clear-token="clearKey('hf')" @service="tab='server'"/>
    <ApplicationLogOutput v-if="settingsMode&&logOutputOpen" @close="logOutputOpen=false"/>
    <footer v-if="settingsMode" class="status-bar"><div><span class="status-dot" :class="{online}"></span><span>{{settings.source==='managed'?'本地 llama.cpp':'远程 API'}}</span><span class="footer-model">{{model||'未选择模型'}}</span></div><div><button :class="{active:logOutputOpen}" aria-label="切换日志输出" @click="logOutputOpen=!logOutputOpen">日志</button><span v-if="hardware">RAM {{bytes(hardware.totalMemory-hardware.freeMemory)}} / {{bytes(hardware.totalMemory)}}</span><button @click="drawer=!drawer"><Download/>{{activeDownloads.length?activeDownloads.length+' 个下载任务':'下载队列'}}<span v-if="downloads.length" class="count-badge">{{downloads.length}}</span></button></div></footer>
   </div>
   <button v-if="drawer" class="download-backdrop" aria-label="关闭下载队列遮罩" @click="drawer=false"></button>
   <aside v-if="drawer" id="studio-downloads" class="downloads-drawer" role="dialog" aria-modal="true" aria-label="下载队列"><header><div><Download/><h3>下载队列</h3><span class="count-badge">{{downloads.length}}</span></div><button class="icon-btn" aria-label="关闭下载队列" @click="drawer=false"><Close/></button></header><p class="drawer-note">顺序下载 · 支持断点续传 · 下载完成后自动加入模型库</p><div class="download-items"><div v-if="!downloads.length" class="empty-panel"><Download/><h3>还没有下载任务</h3><button class="text-button" @click="tab='discover';drawer=false">去发现模型 <ArrowRight/></button></div><article v-for="item in [...downloads].reverse()" :key="item.id" class="download-item"><div class="download-item-head"><span class="format-chip">{{item.file.split('.').at(-1)?.toUpperCase()}}</span><span class="download-state" :class="item.status">{{downloadLabel(item.status)}}</span></div><strong :title="item.file">{{item.file}}</strong><small>{{item.repoId}}</small><div class="progress-track" :class="{indeterminate:item.status==='verifying'||!item.total&&item.status==='downloading'}"><span :style="{width:percent(item)+'%'}"></span></div><div class="download-progress-label"><span>{{bytes(item.received)}} / {{item.total?bytes(item.total):'未知大小'}}</span><span v-if="item.status==='downloading'">{{bytes(item.speed)}}/s · {{percent(item)}}%</span><span v-else-if="item.status==='completed'">{{item.sha256?'SHA-256 已校验':'已完成'}}</span></div><p v-if="item.error" class="download-error">{{item.error}}</p><div class="download-actions"><button v-if="['downloading','queued'].includes(item.status)" class="text-button" @click="downloadAction(item,'pause')"><VideoPause/>暂停</button><button v-if="['paused','failed'].includes(item.status)" class="text-button" @click="downloadAction(item,'resume')"><VideoPlay/>{{item.status==='failed'?'重试':'继续'}}</button><button v-if="!['completed','cancelled'].includes(item.status)" class="text-button" @click="downloadAction(item,'cancel')"><Close/>取消</button><button v-if="['completed','cancelled','failed'].includes(item.status)" class="text-button" @click="downloadAction(item,'remove')">清除记录</button><button v-if="item.status==='completed'" class="text-button" @click="tab='models';drawer=false">查看模型 <ArrowRight/></button></div></article></div></aside>
+  <button v-if="settings.showTokenSpeed" class="performance-window-launcher" @click="detachPerformance">显示性能窗口 ↗</button>
+  <button v-if="settings.showExecutionInspector" class="performance-window-launcher" style="top:118px" @click="openInspector">显示执行检查器 ↗</button>
  </section>
 </template>
 
@@ -260,6 +281,7 @@ function fillRemotePreset(event:Event){
 <style scoped src="./local-ai/studio-workbench.css"></style>
 
 <style scoped>
+.performance-window-launcher{position:fixed;right:18px;top:80px;z-index:40;padding:9px 12px;background:var(--s-panel);border:1px solid var(--s-border);border-radius:8px;color:var(--s-text);font-size:12px}
 .settings-navigation{position:relative;z-index:30;width:var(--s-rail-width);flex:none;display:flex;flex-direction:column;padding:14px 6px;background:var(--s-rail);border-right:1px solid var(--s-border);min-height:0}
 .settings-feature-list{display:flex;flex-direction:column;align-items:center;gap:5px;min-height:0}
 .settings-rail-button{position:relative;display:grid;place-items:center;width:42px;height:42px;flex:none;border:0;background:transparent;border-radius:9px;padding:0;color:var(--s-dim);cursor:pointer}
@@ -289,4 +311,10 @@ function fillRemotePreset(event:Event){
 .local-ai-studio.has-background :deep(.agent-prompt.composer){background:color-mix(in srgb,var(--s-panel) 68%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-color:color-mix(in srgb,var(--s-border) 75%,transparent);box-shadow:0 4px 20px #00000008}
 .local-ai-studio.has-background :deep(.agent-prompt.composer:focus-within){border-color:var(--s-dim);box-shadow:0 0 0 1px var(--s-border),0 4px 20px #00000008}
 .local-ai-studio.has-background :deep(.agent-composer-wrap>.context-usage){padding-inline:8px;text-shadow:0 1px 4px var(--s-bg)}
+</style>
+
+<style scoped>
+.local-ai-studio.custom-font-size :deep(:is(button,input,textarea,select,p,li,dt,dd,label)){font-size:var(--app-font-size)}
+.local-ai-studio.reduce-motion :deep(*),.local-ai-studio.reduce-motion::before,.local-ai-studio.reduce-motion :deep(*::before),.local-ai-studio.reduce-motion :deep(*::after){animation:none!important;transition:none!important;scroll-behavior:auto!important}
+@media(prefers-reduced-motion:reduce){.local-ai-studio :deep(*),.local-ai-studio::before,.local-ai-studio :deep(*::before),.local-ai-studio :deep(*::after){animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>

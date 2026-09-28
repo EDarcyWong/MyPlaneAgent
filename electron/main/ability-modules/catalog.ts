@@ -157,7 +157,7 @@ export class AbilityCatalogService {
       const file = path.join(this.mainDirectory, relative)
       if (!fs.existsSync(file)) { missingSources.push(relative); continue }
       const code = fs.readFileSync(file, 'utf8')
-      sources.push({ path: `electron/main/${relative}`, code: code.slice(0, 40000), hash: createHash('sha256').update(code).digest('hex'), truncated: code.length > 40000 })
+      sources.push({ path: `electron/main/${relative}`, code, hash: createHash('sha256').update(code).digest('hex'), truncated: false })
     }
     const fingerprint = sources.length ? 'app-' + createHash('sha256').update(JSON.stringify(sources.map(source => [source.path, source.hash]))).digest('hex').slice(0, 12) : undefined
     return { module: this.item(descriptor), implementationVersion: missingSources.length ? undefined : fingerprint, sources, missingSources,
@@ -194,7 +194,7 @@ export class AbilityCatalogService {
       if(!/^[a-f0-9]{64}$/.test(hash))throw new Error('存档哈希无效')
       const value=readIntegrationJson<{code:string}|null>(path.join(this.storage.directory,'catalog','sources',`${hash}.json`),null)
       if(!value||typeof value.code!=='string'||createHash('sha256').update(value.code).digest('hex')!==hash)throw new Error('存档内容校验失败')
-      sources.push({path:relative,hash,code:value.code.slice(0,40000),truncated:value.code.length>40000})
+      sources.push({path:relative,hash,code:value.code,truncated:false})
     }
     return {module:archived,implementationVersion:snapshotId,sources,missingSources}
   }

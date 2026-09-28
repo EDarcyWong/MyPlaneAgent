@@ -42,6 +42,7 @@ export type ChatRunOptions = {
   onVerificationFailure?: (activity:StudioToolActivity)=>void
   beforeMutation?: (capability:Capability,args:Record<string,unknown>)=>Promise<string|undefined>
   beforeExecution?: (capability:Capability,args:Record<string,unknown>)=>string|undefined
+  inspectTool?: (capability:Capability,args:Record<string,unknown>,id:string)=>Promise<Record<string,unknown>>
   afterExecution?: (capability:Capability,args:Record<string,unknown>,success:boolean)=>void
   planExecution?: import('./task-plan-runner.js').PlanExecution
   connection: AgentConnection; model: string; messages: AgentMessage[]; workspace: string
@@ -601,23 +602,30 @@ ${browserEvidenceContext} 不要提出本轮不存在的工具。继续必须有
       }
       unresolvedFailures.delete('__invalid_tool__')
       let args: Record<string, unknown>
+      const activityId=randomUUID()
       try {
         args = JSON.parse(call.function.arguments) as Record<string, unknown>
+        if(options.inspectTool){
+          args=await options.inspectTool(capability,args,activityId)
+          options.signal.throwIfAborted()
+          call.function.arguments=JSON.stringify(args)
+        }
         validateToolArguments(capability.parameters, args)
         if (outputRecovery) validateToolArguments(recoveryToolSchema(capability.parameters), args)
       } catch (error) {
+        options.signal.throwIfAborted()
         failed++
         unresolvedFailures.add(capability.name)
         const output = '工具未执行，请修正参数后重试：' + String(error)
         if(call.id.startsWith('experience-'))experienceFlow?.fail('当前工具参数与流程不兼容','input')
         if(dispatchedCheck){dispatchedCheck.status='invalid';dispatchedCheck.attempts=0;dispatchedCheck.summary=output;dispatchedCheck=undefined;options.onReviewQueue?.()}
         if(textEditTools.has(capability.name))editProgress.record(undefined,true)
-        options.onActivity({ id: randomUUID(), capability: capability.name, args: {}, status: 'error', output })
+        options.onActivity({ id: activityId, capability: capability.name, args: {}, status: 'error', output })
         history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ status: 'error', output }) })
         if(textEditTools.has(capability.name)&&recoverFailedEdits(output))return
         continue
       }
-      const activity: StudioToolActivity = { id: randomUUID(), capability: capability.name, args, status: 'running' }
+      const activity: StudioToolActivity = { id: activityId, capability: capability.name, args, status: 'running' }
       if(!searchAttempted&&['agent.web_fetch','browser.open'].includes(capability.name)&&availableWeb.some(([,cap])=>cap.name==='agent.web_search')&&!/百科|维基|wikipedia|baike|https?:\/\/|www\./i.test(query)){
         let encyclopedia=false
         try{const host=new URL(String(args.url)).hostname;encyclopedia=host==='wikipedia.org'||host.endsWith('.wikipedia.org')||/^baike\./.test(host)}catch{}

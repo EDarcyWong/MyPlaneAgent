@@ -5,6 +5,7 @@ import type {ChatRunOptions} from './chat-runner.js'
 import type {ExperienceStore} from './experience-store.js'
 import type {StudioToolActivity} from '../../../shared/local-ai-studio.js'
 import type {Capability} from '../../../shared/types/capability.js'
+import {validateToolArguments} from './execution-guards.js'
 
 // Conservative routing: compound requests and unrecognised locations stay with the general agent.
 const cities:Record<string,string>={北京:'Beijing',上海:'Shanghai',广州:'Guangzhou',深圳:'Shenzhen',杭州:'Hangzhou',南京:'Nanjing',成都:'Chengdu',重庆:'Chongqing',武汉:'Wuhan',西安:"Xi'an",天津:'Tianjin',苏州:'Suzhou',郑州:'Zhengzhou',长沙:'Changsha',青岛:'Qingdao',厦门:'Xiamen',济南:'Jinan',合肥:'Hefei',福州:'Fuzhou',昆明:'Kunming'}
@@ -57,13 +58,15 @@ export class WeatherWorkflow {
   return result
  }
  async run(query:string,options:ChatRunOptions,store:ExperienceStore):Promise<boolean>{
-  const request=parseWeatherRequest(query)
+  let request=parseWeatherRequest(query)
   if(!request||options.currentStep||options.planExecution)return false
   options.signal.throwIfAborted()
   if(!request.city||!request.day){options.onOutcome?.('needs_input');options.onContent(`请补充${!request.city?'城市':''}${!request.city&&!request.day?'和':''}${!request.day?'日期（例如今天或明天）':''}，我会查询对应的天气预报。`);return true}
   if(!options.webEnabled){options.onOutcome?.('blocked');options.onContent('查询最新天气需要开启本会话的联网开关。');return true}
-  const cap:Capability={name:'weather.forecast',description:'向 Open-Meteo 发送城市名称与坐标，查询并校验目标日期的天气预报',category:'weather',source:{type:'builtin'},runtime:'builtin',permissions:['network'],tags:['requires-approval'],parameters:{type:'object',properties:{city:{type:'string'},day:{type:'string'}}}}
+  const cap:Capability={name:'weather.forecast',description:'向 Open-Meteo 发送城市名称与坐标，查询并校验目标日期的天气预报',category:'weather',source:{type:'builtin'},runtime:'builtin',permissions:['network'],tags:['requires-approval'],parameters:{type:'object',properties:{city:{type:'string',enum:Object.keys(cities)},day:{type:'string',minLength:1,maxLength:10}},required:['city','day'],additionalProperties:false}}
   const activity:StudioToolActivity={id:randomUUID(),capability:cap.name,args:request,status:'waiting'}
+  if(options.inspectTool){request=await options.inspectTool(cap,request,activity.id) as WeatherRequest;options.signal.throwIfAborted();activity.args=request}
+  validateToolArguments(cap.parameters,request)
   if((options.getApprovalMode?.()??options.approvalMode)==='ask'&&options.approvalGranted?.(activity)!==true){options.onActivity({...activity});const approved=await options.approve({...activity});options.signal.throwIfAborted();if(!approved){activity.status='denied';activity.output='天气查询被拒绝，已停止。';options.onActivity({...activity});options.onOutcome?.('blocked');options.onContent(activity.output);return true}}
   const block=options.beforeExecution?.(cap,request)
   if(block){options.onOutcome?.('blocked');options.onContent(block);return true}

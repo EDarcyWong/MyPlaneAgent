@@ -8,6 +8,8 @@ import {fileURLToPath} from 'node:url'
 import {LocalAiStudioService,registerLocalAiStudio} from './local-ai-studio.js'
 import {protectedHandle,trackAuthWindow} from './auth.js'
 import {ApplicationLogger} from './application-logger.js'
+import {helpDocumentMetadata,type HelpDocumentId} from '../shared/help-documents.js'
+import type {InspectorWindowContext} from '../shared/execution-inspector.js'
 
 const directory=path.dirname(fileURLToPath(import.meta.url))
 app.setName('MyPlaneAgent')
@@ -21,7 +23,53 @@ const browser=new InternalBrowser(directory,developmentUrl)
 configureBrowserPlugin(browser)
 let window:BrowserWindow|undefined
 let workflowEditorWindow:BrowserWindow|undefined
-let helpWindow:BrowserWindow|undefined
+let performanceWindow:BrowserWindow|undefined
+let performanceBounds:Electron.Rectangle|undefined
+let inspectorWindow:BrowserWindow|undefined,inspectorBounds:Electron.Rectangle|undefined
+let inspectorContext:InspectorWindowContext={requestId:'',content:'',reasoning:'',theme:'system'}
+async function openInspectorWindow(){
+ if(inspectorWindow&&!inspectorWindow.isDestroyed()){if(inspectorWindow.isMinimized())inspectorWindow.restore();inspectorWindow.show();inspectorWindow.focus();return}
+ if(!window||window.isDestroyed())throw new Error('主窗口不可用')
+ const owner=window.webContents.id,savedBounds=inspectorBounds?{...inspectorBounds}:undefined
+ const next=new BrowserWindow({title:'执行检查器 · MyPlaneAgent',width:520,height:680,...savedBounds,minWidth:340,minHeight:280,resizable:true,movable:true,show:false,autoHideMenuBar:true,icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ inspectorWindow=next;next.setMenu(null)
+ const id=next.webContents.id
+ service!.authorizeInspector(id,owner)
+ const remember=()=>{if(!next.isDestroyed()&&!next.isMinimized()&&!next.isMaximized())inspectorBounds=next.getBounds()}
+ next.on('resize',remember);next.on('move',remember)
+ next.on('closed',()=>{service?.authorizeInspector(id);if(inspectorWindow===next){inspectorWindow=undefined;window?.webContents.send('inspector:window-state',false)}})
+ next.webContents.setWindowOpenHandler(()=>({action:'deny'}));next.webContents.on('will-navigate',event=>event.preventDefault());next.webContents.on('will-attach-webview',event=>event.preventDefault())
+ trackAuthWindow(next.webContents,true,developmentUrl)
+ try{
+  if(developmentUrl){const url=new URL(developmentUrl);url.searchParams.set('surface','inspector');await next.loadURL(url.href)}
+  else await next.loadFile(path.join(directory,'../../dist/index.html'),{query:{surface:'inspector'}})
+  if(!next.isDestroyed()){if(savedBounds)next.setBounds(savedBounds);next.show();window?.webContents.send('inspector:window-state',true)}
+ }catch(error){if(!next.isDestroyed())next.destroy();throw error}
+}
+
+async function openPerformanceWindow(){
+ if(performanceWindow&&!performanceWindow.isDestroyed()){
+  if(performanceWindow.isMinimized())performanceWindow.restore()
+  performanceWindow.show();performanceWindow.focus();return
+ }
+ const savedBounds=performanceBounds?{...performanceBounds}:undefined
+ const next=new BrowserWindow({title:'Token 速度 · MyPlaneAgent',width:420,height:620,...savedBounds,minWidth:300,minHeight:260,resizable:true,movable:true,show:false,autoHideMenuBar:true,icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ next.setMenu(null)
+ performanceWindow=next
+ const remember=()=>{if(!next.isDestroyed()&&!next.isMinimized()&&!next.isMaximized())performanceBounds=next.getBounds()}
+ next.on('resize',remember);next.on('move',remember)
+ next.on('closed',()=>{if(performanceWindow===next){performanceWindow=undefined;window?.webContents.send('performance:window-state',false)}})
+ next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
+ next.webContents.on('will-navigate',event=>event.preventDefault())
+ next.webContents.on('will-attach-webview',event=>event.preventDefault())
+ trackAuthWindow(next.webContents,true,developmentUrl)
+ try{
+  if(developmentUrl){const url=new URL(developmentUrl);url.searchParams.set('surface','performance');await next.loadURL(url.href)}
+  else await next.loadFile(path.join(directory,'../../dist/index.html'),{query:{surface:'performance'}})
+  if(!next.isDestroyed()){if(savedBounds)next.setBounds(savedBounds);next.show();window?.webContents.send('performance:window-state',true)}
+ }catch(error){if(!next.isDestroyed())next.destroy();throw error}
+}
+const helpWindows=new Map<HelpDocumentId,BrowserWindow>()
 let service:LocalAiStudioService|undefined
 let tray:Tray|undefined
 function focus(){if(window&&!window.isDestroyed()){if(window.isMinimized())window.restore();window.show();window.focus()}}
@@ -67,7 +115,7 @@ function installApplicationMenu(){
    ...(process.platform==='darwin'?[{type:'separator' as const},{label:'前置全部窗体',role:'front' as const}]:[]),
   ]},
   {label:'帮助',submenu:[
-   {label:'工作流使用指南',click:()=>void openHelpDocument().catch(error=>logger.error('help','打开帮助失败',error))},
+   ...helpDocumentMetadata.map(document=>({label:document.title,click:()=>void openHelpDocument(document.id).catch(error=>logger.error('help','打开帮助失败',error))})),
    {type:'separator'},
    {label:'打开日志目录',click:async()=>{const error=await shell.openPath(logger.directory);if(error)logger.warn('menu','无法打开日志目录',error)}},
    {type:'separator'},
@@ -87,7 +135,7 @@ async function createWindow(){
  const next=new BrowserWindow({...windowChrome(),title:'MyPlaneAgent',width:1380,height:900,minWidth:520,minHeight:540,show:false,backgroundColor:nativeTheme.shouldUseDarkColors?'#181b1a':'#f5f8f6',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
  window=next
  logger.info('window','创建主窗体')
- next.on('closed',()=>{logger.info('window','主窗体已关闭');if(window===next)window=undefined})
+ next.on('closed',()=>{logger.info('window','主窗体已关闭');if(window===next){window=undefined;inspectorWindow?.close();inspectorContext={requestId:'',content:'',reasoning:'',theme:'system'}}})
  next.on('unresponsive',()=>logger.warn('window','主窗体无响应'))
  next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
  next.webContents.on('will-navigate',event=>event.preventDefault())
@@ -124,15 +172,17 @@ async function openWorkflowEditor(workflowId=''){
  editor.show();editor.focus()
 }
 
-async function openHelpDocument(documentId='workflow'){
- if(documentId!=='workflow')throw new Error('帮助文档不存在')
+async function openHelpDocument(documentId:HelpDocumentId='workflow'){
+ const document=helpDocumentMetadata.find(item=>item.id===documentId)
+ if(!document)throw new Error('帮助文档不存在')
+ const helpWindow=helpWindows.get(documentId)
  if(helpWindow&&!helpWindow.isDestroyed()){
   if(helpWindow.isMinimized())helpWindow.restore()
   helpWindow.show();helpWindow.focus();return
  }
- const next=new BrowserWindow({...windowChrome(),title:'工作流使用指南 · MyPlaneAgent',width:1160,height:840,minWidth:760,minHeight:560,show:false,backgroundColor:'#f7faf8',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
- helpWindow=next
- next.on('closed',()=>{if(helpWindow===next)helpWindow=undefined})
+ const next=new BrowserWindow({...windowChrome(),title:`${document.title} · MyPlaneAgent`,width:1160,height:840,minWidth:760,minHeight:560,show:false,backgroundColor:'#f7faf8',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ helpWindows.set(documentId,next)
+ next.on('closed',()=>{if(helpWindows.get(documentId)===next)helpWindows.delete(documentId)})
  next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
  next.webContents.on('will-navigate',event=>event.preventDefault())
  next.webContents.on('will-attach-webview',event=>event.preventDefault())
@@ -162,6 +212,26 @@ else{
   }
   registerLocalAiStudio(()=>service!,()=>service?.dispose())
   registerTitleMenu()
+  protectedHandle('inspector:context',(event,value:InspectorWindowContext)=>{
+   if(event.sender.id!==window?.webContents.id)throw new Error('只能由主窗口同步对话')
+   if(!value||typeof value.requestId!=='string'||typeof value.content!=='string'||typeof value.reasoning!=='string'||value.content.length+value.reasoning.length>1600000)throw new Error('检查器上下文无效')
+   inspectorContext={requestId:value.requestId,historyRequestId:value.historyRequestId,sessionId:value.sessionId,content:value.content,reasoning:value.reasoning,theme:value.theme}
+  })
+  protectedHandle('inspector:snapshot',(event)=>{if(event.sender.id!==window?.webContents.id&&event.sender.id!==inspectorWindow?.webContents.id)throw new Error('无权读取检查器');return inspectorContext})
+  protectedHandle('inspector:window',async(event,action:unknown)=>{
+   if(event.sender.id!==window?.webContents.id&&event.sender.id!==inspectorWindow?.webContents.id)throw new Error('无权操作检查器窗口')
+   if(action==='open')await openInspectorWindow()
+   else if(action==='close'){if(service?.hasPausedInspection(window?.webContents.id??-1)){inspectorWindow?.show();return true}inspectorWindow?.close();return false}
+   else if(action!=='state')throw new Error('不支持的检查器窗口操作')
+   return !!inspectorWindow&&!inspectorWindow.isDestroyed()
+  })
+  protectedHandle('performance:snapshot',()=>{const settings=service!.studioSettings();return {runtime:service!.snapshot().runtime,source:settings.source,theme:settings.theme}})
+  protectedHandle('performance:window',async(_event,action:unknown)=>{
+   if(action==='open')await openPerformanceWindow()
+   else if(action==='close')performanceWindow?.close()
+   else if(action!=='state')throw new Error('不支持的性能窗口操作')
+   return !!performanceWindow&&!performanceWindow.isDestroyed()
+  })
   protectedHandle('browser:action',(event,action,value)=>browser.action(event.sender,action,value))
   protectedHandle('ai:open-link',async(_event,value:unknown)=>{
    if(typeof value!=='string'||value.length>8000)throw new Error('链接无效')
@@ -174,8 +244,9 @@ else{
    await openWorkflowEditor(typeof value==='string'?value:'')
   })
   protectedHandle('help:open-document',async(_event,value:unknown)=>{
-   if(value!==undefined&&value!=='workflow')throw new Error('帮助文档不存在')
-   await openHelpDocument('workflow')
+   const document=helpDocumentMetadata.find(item=>item.id===(value===undefined?'workflow':value))
+   if(!document)throw new Error('帮助文档不存在')
+   await openHelpDocument(document.id)
   })
   protectedHandle('workflow:editor-close',async event=>{const owner=BrowserWindow.fromWebContents(event.sender);if(owner&&owner===workflowEditorWindow)setTimeout(()=>{if(!owner.isDestroyed())owner.close()},0)})
   protectedHandle('workflow:editor-saved',async(_event,value:unknown)=>{

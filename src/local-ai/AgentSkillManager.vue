@@ -8,6 +8,7 @@ import AgentCapabilityRegistry from './AgentCapabilityRegistry.vue'
 import {AppMessageBox as ElMessageBox} from './message-box'
 import {
   Refresh,
+  QuestionFilled,
   Check,
   VideoPlay,
   Search,
@@ -57,6 +58,13 @@ const query = ref('')
 const filter = ref<Filter>('all')
 const section = ref<Section>('info')
 const view = ref<'manage' | 'capabilities'>('manage')
+const selectedBuiltin = ref<'browser' | 'preview' | ''>('')
+const builtinPlugins = [
+  {id:'browser' as const,name:'浏览器自动化',description:'网页浏览、交互与自动操作'},
+  {id:'preview' as const,name:'静态网页预览',description:'本地网页预览服务'},
+]
+const visibleBuiltins = computed(() => (filter.value === 'all' || filter.value === 'builtin') ? builtinPlugins.filter(item => `${item.name} ${item.description}`.includes(query.value.trim())) : [])
+function selectBuiltin(id: 'browser' | 'preview') { if (!busy.value && !dirty.value) selectedBuiltin.value = id }
 
 // 编辑状态
 const editingFile = ref<'skill.json' | 'index.py' | 'engine.py' | 'README.md'>('skill.json')
@@ -103,8 +111,9 @@ const entries = computed<SkillEntry[]>(() => skills.value.flatMap(skill => bundl
 const selected = computed(() => entries.value.find(s => s.name === selectedSkill.value))
 
 const categories = computed(() => categoryOrder.filter(category => entries.value.some(skill => skill.category === category)))
-watch(categories, available => { if (filter.value !== 'all' && !available.includes(filter.value)) filter.value = 'all' })
-const enabledCount = computed(() => entries.value.filter(skill => skill.loaded).length)
+watch(categories, available => { if (filter.value !== 'all' && filter.value !== 'builtin' && !available.includes(filter.value)) filter.value = 'all' })
+const toolCount = computed(() => entries.value.filter(skill => skill.focusedToolName).length)
+const pluginCount = computed(() => entries.value.filter(skill => !skill.focusedToolName).length)
 const currentTool = computed(() => selected.value?.tools.find(tool => tool.name === testTool.value))
 const snapshot = () => JSON.stringify({skillJson: skillJsonContent.value, indexPy: indexPyContent.value, enginePy: enginePyContent.value, readme: readmeContent.value})
 
@@ -123,7 +132,10 @@ const filtered = computed(() => {
     return true
   }).sort((left,right) => categoryOrder.indexOf(left.category)-categoryOrder.indexOf(right.category) || left.displayName.localeCompare(right.displayName,'zh-CN'))
 })
-const grouped = computed(() => categories.value.map(category => ({category,items:filtered.value.filter(skill => skill.category === category)})).filter(group => group.items.length))
+const grouped = computed(() => [
+ ...categories.value.map(category => ({category,label: `${categoryLabel(category)}工具`,items:filtered.value.filter(skill => skill.focusedToolName && skill.category === category)})),
+ {category:'plugins',label:'独立插件',items:filtered.value.filter(skill => !skill.focusedToolName)},
+].filter(group => group.items.length))
 
 const categoryLabel = (category: string) => {
   const labels: Record<string, string> = {
@@ -148,6 +160,14 @@ async function load() {
   if (!testWorkspace.value) testWorkspace.value = await window.myplane.localAiStudio('getDefaultWorkspace')
 }
 
+async function openPluginHelp() {
+  try {
+    await window.myplane.openHelpDocument('plugins')
+  } catch (error) {
+    ElMessage.error(`打开插件帮助失败：${String(error).replace(/^Error: /, '')}`)
+  }
+}
+
 async function refresh() {
   await run(async () => {
     await window.myplane.localAiStudio('skillsReload')
@@ -162,6 +182,7 @@ async function loadSkillContent(skill: SkillInfo) {
       skillName: (skill as SkillEntry).sourceName || skill.name
     })
 
+    selectedBuiltin.value = ''
     selectedSkill.value = skill.name
     editingFile.value = 'skill.json'
     skillJsonContent.value = JSON.stringify(content.skillJson, null, 2)
@@ -181,7 +202,7 @@ async function loadSkillContent(skill: SkillInfo) {
 }
 
 async function selectSkill(skillName: string) {
-  if (busy.value || skillName === selectedSkill.value) return
+  if (busy.value || (skillName === selectedSkill.value && !selectedBuiltin.value)) return
 
   if (dirty.value) {
     try {
@@ -358,8 +379,9 @@ defineExpose({ create: createFromToolbar })
 <template>
   <main class="skill-manager" :aria-busy="busy">
     <nav class="skill-view-tabs" aria-label="插件页面">
-      <button type="button" :class="{active:view==='manage'}" :aria-current="view==='manage'?'page':undefined" @click="view='manage'">插件管理</button>
-      <button type="button" :class="{active:view==='capabilities'}" :aria-current="view==='capabilities'?'page':undefined" @click="view='capabilities'">可用能力</button>
+      <button type="button" :class="{active:view==='manage'}" :aria-current="view==='manage'?'page':undefined" @click="view='manage'">插件与工具</button>
+      <button type="button" :class="{active:view==='capabilities'}" :aria-current="view==='capabilities'?'page':undefined" @click="view='capabilities'">能力目录</button>
+      <button type="button" class="icon-action plugin-help-button" aria-label="插件编辑与使用指南" title="打开插件编辑与使用指南" @click="openPluginHelp"><QuestionFilled aria-hidden="true" /></button>
     </nav>
     <p v-if="error" class="skill-error" role="alert">
       <Warning />
@@ -367,15 +389,13 @@ defineExpose({ create: createFromToolbar })
       <button @click="error = ''">关闭</button>
     </p>
 
-    <BrowserPluginCard v-if="view==='manage'"/>
-    <StaticPreviewPluginCard v-if="view==='manage'"/>
     <div v-show="view==='manage'" class="skill-layout">
       <!-- 左侧：插件列表 -->
       <aside class="skill-browser">
         <header class="browser-head">
           <div>
-            <h2>插件管理</h2>
-            <span>{{ entries.length }} 项 · {{ enabledCount }} 项已启用</span>
+            <h2>插件与工具</h2>
+            <span>2 个内置插件 · {{ toolCount }} 个工具<span v-if="pluginCount"> · {{ pluginCount }} 个插件</span></span>
           </div>
           <button
             class="icon-action"
@@ -397,24 +417,26 @@ defineExpose({ create: createFromToolbar })
           <Search />
           <input
             v-model="query"
-            placeholder="搜索插件..."
-            aria-label="搜索插件"
+            placeholder="搜索插件或工具…"
+            aria-label="搜索插件或工具"
           />
         </div>
 
-        <label class="skill-filters"><span>分类</span><select v-model="filter" aria-label="筛选插件分类"><option value="all">全部分类</option><option v-for="cat in categories" :key="cat" :value="cat">{{ categoryLabel(cat) }}</option></select><small>{{ filtered.length }} 项</small></label>
+        <label class="skill-filters"><span>分类</span><select v-model="filter" aria-label="筛选插件分类"><option value="all">全部分类</option><option value="builtin">内置插件</option><option v-for="cat in categories" :key="cat" :value="cat">{{ categoryLabel(cat) }}</option></select><small>{{ filtered.length + visibleBuiltins.length }} 项</small></label>
 
         <div class="skill-list">
+          <div v-if="visibleBuiltins.length" class="skill-group-heading">内置插件<span>{{ visibleBuiltins.length }}</span></div>
+          <button v-for="item in visibleBuiltins" :key="item.id" :data-builtin="item.id" :class="{active:selectedBuiltin===item.id}" :aria-pressed="selectedBuiltin===item.id" :disabled="busy || dirty" @click="selectBuiltin(item.id)"><span class="skill-icon"><Operation/></span><span class="skill-copy"><span class="skill-primary"><strong>{{ item.name }}</strong><span class="entry-kind">内置</span></span><small><span>{{ item.description }}</span></small></span></button>
           <template v-for="group in grouped" :key="group.category">
-          <div class="skill-group-heading">{{ categoryLabel(group.category) }}<span>{{ group.items.length }}</span></div>
+          <div class="skill-group-heading">{{ group.label }}<span>{{ group.items.length }}</span></div>
           <button
             v-for="skill in group.items"
             :key="skill.name"
             :class="{
-              active: selectedSkill === skill.name,
+              active: !selectedBuiltin && selectedSkill === skill.name,
               'not-loaded': !skill.loaded
             }"
-            :disabled="busy" :aria-pressed="selectedSkill === skill.name" @click="selectSkill(skill.name)"
+            :disabled="busy" :aria-pressed="!selectedBuiltin && selectedSkill === skill.name" @click="selectSkill(skill.name)"
           >
             <span class="skill-icon"><Operation /></span>
             <span class="skill-copy">
@@ -423,28 +445,30 @@ defineExpose({ create: createFromToolbar })
                 <i :class="{ loaded: skill.loaded }" :title="skill.loaded ? '已启用' : '未启用'" />
               </span>
               <small>
-                <code>{{ skill.focusedToolName || skill.name }}</code>
+                <code v-if="!skill.focusedToolName">{{ skill.name }}</code>
                 <span>{{ skill.focusedToolName ? skill.description : `${skill.tools.length} 个工具` }}</span>
               </small>
             </span>
           </button>
           </template>
 
-          <div v-if="!filtered.length" class="empty-skills">
+          <div v-if="!filtered.length && !visibleBuiltins.length" class="empty-skills">
             <Search />
-            <p>{{ busy ? '正在加载插件…' : entries.length ? '没有匹配的插件' : '还没有插件' }}</p>
+            <p>{{ busy ? '正在加载插件…' : entries.length ? '没有匹配的插件或工具' : '暂无匹配项' }}</p>
             <button v-if="query || filter !== 'all'" class="text-button" @click="query = ''; filter = 'all'">
               清除筛选
             </button>
           </div>
         </div>
+        <p v-if="dirty" class="plugin-draft-note">有未保存修改，请先保存再切换内置插件。</p>
       </aside>
 
       <!-- 右侧：插件详情/编辑 -->
       <section class="skill-editor">
-        <div v-if="!selected" class="empty-editor">
+        <div v-if="selectedBuiltin" class="builtin-plugin-detail"><BrowserPluginCard v-if="selectedBuiltin==='browser'"/><StaticPreviewPluginCard v-else/></div>
+        <div v-else-if="!selected" class="empty-editor">
           <FolderOpened />
-          <p>选择一个插件开始管理</p>
+          <p>选择一个插件或工具查看详情</p>
           <button class="primary-button" :disabled="busy" @click="createNewSkill">
             <Plus /> 创建新插件
           </button>
@@ -458,7 +482,7 @@ defineExpose({ create: createFromToolbar })
                 <span v-if="dirty" class="unsaved">未保存</span>
                 <span v-else class="saved">{{ selected.version }}</span>
               </div>
-              <p>{{ selected.focusedToolName || selected.name }} · {{ categoryLabel(selected.category) }}</p>
+              <p>{{ selected.focusedToolName ? '插件工具' : '独立插件' }} · {{ categoryLabel(selected.category) }}<span v-if="selected.sourceName"> · 来自 {{ selected.sourceDisplayName }}</span></p>
             </div>
             <div class="editor-actions">
               <button v-if="!selected.focusedToolName" class="secondary-button plugin-delete" :disabled="busy" @click="deleteSelectedSkill">删除插件</button>
@@ -501,7 +525,7 @@ defineExpose({ create: createFromToolbar })
             <section class="info-section">
               <h3>基本信息</h3>
               <dl>
-                <dt>插件标识</dt>
+                <dt>{{ selected.focusedToolName ? '工具标识' : '插件标识' }}</dt>
                 <dd><code>{{ selected.focusedToolName || selected.name }}</code></dd>
 
                 <dt>显示名称</dt>
@@ -525,7 +549,7 @@ defineExpose({ create: createFromToolbar })
             </section>
 
             <section class="info-section">
-              <h3>提供的工具 ({{ selected.tools.length }})</h3>
+              <h3>{{ selected.focusedToolName ? '工具说明' : `提供的工具 (${selected.tools.length})` }}</h3>
               <div class="tools-list">
                 <div v-for="tool in selected.tools" :key="tool.name" class="tool-card">
                   <div class="tool-heading"><code>{{ tool.name }}</code><button class="text-button" @click="testTool = tool.name; section = 'test'">测试 <VideoPlay /></button></div>
@@ -640,7 +664,7 @@ defineExpose({ create: createFromToolbar })
         </template>
       </section>
     </div>
-    <section v-if="view==='capabilities'" class="skill-capability-view" aria-label="可用能力"><AgentCapabilityRegistry/></section>
+    <section v-if="view==='capabilities'" class="skill-capability-view" aria-label="可用能力"><p class="capability-explanation">能力目录汇总内置功能、插件和 MCP 提供的可调用能力；插件配置在“插件与工具”中管理。</p><AgentCapabilityRegistry/></section>
   </main>
 </template>
 

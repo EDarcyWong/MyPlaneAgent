@@ -17,10 +17,14 @@ export type StudioSettings = LocalAiSettings & {
   contextLength: number
   gpuLayers: number
   threads: number
+  showTokenSpeed?: boolean
+  showExecutionInspector?: boolean
+  pauseBeforeAgentCalls?: boolean
   temperature: number
   topP: number
   repeatPenalty: number
   systemPrompt: string
+  appearance?: import('./app-appearance.js').AppAppearance
   backgroundImage?: string
   backgroundOpacity?: number
   theme: 'system'|'light'|'dark'
@@ -36,6 +40,8 @@ export type StudioDownload = {
   received:number;total:number;speed:number;error:string;createdAt:string;etag?:string
 }
 export type StudioRuntime = {
+  performance?: import('./model-performance.js').ModelTokenSample[]
+  externalPerformance?: import('./model-performance.js').ModelTokenSample[]
   state:'stopped'|'starting'|'running'|'stopping'|'error';modelId:string;modelName:string
   endpoint:string;pid?:number;error:string;logs:string[];startedAt?:number;host?:string;parallel?:number;contextLength?:number;embedding?:boolean;vision?:boolean
 }
@@ -57,6 +63,7 @@ export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;h
 export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean;chatToolsSupported?:boolean}
 
 export type StudioCommands = {
+    chatInspect:{input:import('./execution-inspector.js').InspectionCommand;output:import('./execution-inspector.js').InspectionState}
     experienceSearchHealth:{input:undefined;output:import('../main/agent/search-health.js').SearchHealthRow[]}
     experienceConvert:{input:{id:string;revision:number};output:import('./experience.js').ExperienceState}
     experienceState:{input:undefined;output:import('./experience.js').ExperienceState}

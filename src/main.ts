@@ -1,8 +1,12 @@
 import {createApp} from 'vue'
 import DesktopTitleBar from './DesktopTitleBar.vue'
+import {helpDocumentMetadata} from '../electron/shared/help-documents'
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import './style.css'
+import {installThemeBridge} from './themeBridge'
+const disposeThemeBridge=installThemeBridge()
+if(import.meta.hot)import.meta.hot.dispose(disposeThemeBridge)
 import LocalAiStudio from './LocalAiStudio.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import {installTooltips} from './tooltips'
@@ -14,7 +18,7 @@ if(import.meta.hot)import.meta.hot.dispose(disposeFloatingMenus)
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
-if(window.myplane?.desktopPlatform==='win32'){
+if(window.myplane?.desktopPlatform==='win32'&&!['performance','inspector'].includes(params.get('surface')||'')){
  const bar=document.createElement('div');document.body.prepend(bar);createApp(DesktopTitleBar).mount(bar)
  document.documentElement.classList.add('desktop-titlebar-enabled')
 }
@@ -28,10 +32,16 @@ if(!window.myplane){
   const recovery=document.createElement('p');recovery.textContent='如果这是应用主窗口，请完全退出后重新启动；仍无法恢复时，请检查预加载脚本是否完整安装。'
   panel.append(heading,explanation,recovery);root.replaceChildren(panel)
  }
+}else if(params.get('surface')==='inspector'){
+ document.title='执行检查器 · MyPlaneAgent'
+ void import('./local-ai/ExecutionInspectorWindow.vue').then(({default:ExecutionInspectorWindow})=>createApp(ExecutionInspectorWindow).mount('#app'))
+}else if(params.get('surface')==='performance'){
+ document.title='Token 速度 · MyPlaneAgent'
+ void import('./local-ai/ModelPerformanceWindow.vue').then(({default:ModelPerformanceWindow})=>createApp(ModelPerformanceWindow).mount('#app'))
 }else if(params.get('surface')==='browser'){
  void import('./local-ai/InternalBrowser.vue').then(({default:InternalBrowser})=>createApp(InternalBrowser).mount('#app'))
 }else if(params.get('surface')==='help'){
- document.title='工作流使用指南 · MyPlaneAgent'
+ document.title=`${(helpDocumentMetadata.find(item=>item.id===params.get('document'))||helpDocumentMetadata[0]).title} · MyPlaneAgent`
  void import('./help/HelpWindow.vue').then(async({default:HelpWindow})=>{
   const bootstrap=await window.myplane.localAiStudio('bootstrap').catch(()=>null)
   createApp(HelpWindow,{documentId:params.get('document')||'workflow',appearanceStyle:bootstrap?.settings.appearanceStyle||'minimal',theme:bootstrap?.settings.theme||'system'}).mount('#app')

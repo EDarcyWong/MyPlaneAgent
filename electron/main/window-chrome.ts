@@ -6,6 +6,12 @@ export function windowChrome():BrowserWindowConstructorOptions{
  return process.platform==='win32'?{titleBarStyle:'hidden',titleBarOverlay:{color:'#f5f5f5',symbolColor:'#444444',height:titleBarHeight},autoHideMenuBar:true}:{}
 }
 export function registerTitleMenu(){
+ protectedHandle('app:title-colors',(event,color,symbolColor)=>{
+  const valid=(value:unknown)=>typeof value==='string'&&/^(#[\da-f]{6}|rgba?\([\d.,\s%]+\)|color\(srgb [\d.\s/]+\))$/i.test(value)
+  if(!valid(color)||!valid(symbolColor))throw new Error('标题栏颜色无效')
+  const owner=BrowserWindow.fromWebContents(event.sender)
+  if(process.platform==='win32'&&owner)owner.setTitleBarOverlay({color,symbolColor,height:titleBarHeight})
+ })
  protectedHandle('app:title-menu',(event,label,x)=>{
   const owner=BrowserWindow.fromWebContents(event.sender)
   if(!owner||typeof label!=='string'||!['文件','编辑','视图','窗体','帮助'].includes(label)||typeof x!=='number'||!Number.isFinite(x))throw new Error('菜单请求无效')

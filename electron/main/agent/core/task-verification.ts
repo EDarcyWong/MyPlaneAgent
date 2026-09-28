@@ -50,9 +50,14 @@ export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRu
       const name=rule.kind==='test'?'agent.run_test':'agent.get_diagnostics'
       const capability=registry.list().find(cap=>cap.name===name&&cap.source.type==='skill'&&cap.source.skillId==='agent-tools')
       if(!capability||!chatCapabilityAllowed(capability,options)){results.push(result(rule,false,'当前权限或插件未提供验收工具：'+name,true));break}
-      const args=rule.kind==='test'?{script:rule.script,timeoutSeconds:120}:{checker:rule.checker,path:rule.path||'.',timeoutSeconds:120}
+      let args:Record<string,unknown>=rule.kind==='test'?{script:rule.script,timeoutSeconds:120}:{checker:rule.checker,path:rule.path||'.',timeoutSeconds:120}
       const activity:StudioToolActivity={id:randomUUID(),capability:name,args,status:'running'}
       try{
+        // Fixed acceptance targets cannot be replaced by editing a verification call.
+        const targets=Object.fromEntries(Object.entries(args).filter(([key])=>key!=='timeoutSeconds').map(([key,value])=>[key,{const:value}]))
+        const inspectionSchema={allOf:[capability.parameters,{type:'object',properties:targets,required:Object.keys(targets)}]}
+        if(options.inspectTool){args=await options.inspectTool({...capability,parameters:inspectionSchema},args,activity.id);options.signal.throwIfAborted();activity.args=args}
+        validateToolArguments(inspectionSchema,args)
         validateToolArguments(capability.parameters,args)
         if(rule.kind==='test'){
           const root=new AgentWorkspace(options.workspace),file=root.resolve('package.json')

@@ -21,6 +21,7 @@ type Index = { activeId: string; policy: ModulePolicy; quarantined: string[]; re
 export type ModuleGenerator = (prompt: string, policy: ModulePolicy, signal: AbortSignal, onModel: (model: string) => void) => Promise<string>
 
 export class AbilityModuleManager {
+  validateInspectionInput(input: AbilityInput) { this.contract.validateInput(input) }
   private bundledId = baselineId
   private index: Index
   private running?: { job: ModuleJob; abort: AbortController }
