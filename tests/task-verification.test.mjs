@@ -84,7 +84,7 @@ test('identical failure stops after one repair and resume rechecks without repea
 test('different failures still stop after two repairs, including after restart',async t=>{
  const f=fixture(t);let modelCalls=0,checks=0
  const verify=async rules=>rules.map(rule=>{checks++;return {rule,passed:checks===1,summary:'failure '+checks,fingerprint:'f'+checks,issues:checks===1?[]:[{key:'f'+checks,category:'code',message:'failure '+checks}]}})
- await runTaskPlan(f.options,f.execution,async step=>{modelCalls++;step.onOutcome('complete')},verify)
+ await runTaskPlan(f.options,f.execution,async step=>{modelCalls++;await edit(step,f.root,'attempt '+modelCalls);step.onOutcome('complete')},verify)
  assert.equal(modelCalls,3);assert.equal(f.plan.items[0].repairAttempts,2)
  const restored=JSON.parse(JSON.stringify(f.saved.at(-1)))
  await runTaskPlan(f.options,{...f.execution,plan:restored},async()=>assert.fail('repair budget must survive restart'),verify)
@@ -119,6 +119,80 @@ test('unrelated pre-existing failures are recorded without starting a repair loo
  assert.equal(calls,1);assert.equal(f.plan.items[0].repairAttempts,undefined)
  assert.match(f.plan.items[0].summary,/原有 1/)
  assert.equal(fs.readFileSync(path.join(f.root,'value.txt'),'utf8'),'wrong')
+})
+test('resumed verification step can repair failures introduced by a completed edit step',async t=>{
+ const f=fixture(t),rule={kind:'test',script:'test'}
+ const old=f.plan.items[0]
+ old.status='blocked';old.attempts=1
+ old.verificationRuns=[{createdAt:'2026-09-29',passed:false,results:await verifyTaskRules(f.registry,f.options,[rule])}]
+ old.baseline={createdAt:'2026-09-29',passed:false,results:old.verificationRuns[0].results}
+ f.plan.items.unshift({id:'earlier',title:'修改文件',acceptance:'写入正确内容',status:'complete',attempts:1,summary:'已修改',evidenceIds:[],modifiedFiles:['value.txt'],baseline:{createdAt:'2026-09-28',passed:true,results:[{rule,passed:true,summary:'旧版测试通过',fingerprint:'passed',issues:[],issuesComplete:true}]}})
+ let modelCalls=0
+ await runTaskPlan(f.options,f.execution,async step=>{
+  modelCalls++
+  assert.match(step.stateContext,/已完成前置步骤涉及的文件/)
+  await edit(step,f.root,'correct')
+  step.onOutcome('complete')
+ },rules=>verifyTaskRules(f.registry,f.options,rules))
+ assert.equal(modelCalls,1)
+ assert.equal(old.status,'complete')
+ assert.equal(old.repairAttempts,1)
+ assert.equal(old.verificationRuns.at(-2).comparison.failures[0].origin,'new')
+})
+
+test('legacy failed verification rechecks once, then resumes an edit pass if it still fails',async t=>{
+ const f=fixture(t),rule={kind:'test',script:'test'},item=f.plan.items[0]
+ item.title='运行测试套件验证改动';item.acceptance='全部测试通过'
+ item.status='blocked';item.attempts=2;item.repairAttempts=1
+ item.verificationRuns=[{createdAt:'2026-09-29',passed:false,results:await verifyTaskRules(f.registry,f.options,[rule])}]
+ item.baseline={createdAt:'2026-09-28',passed:true,results:[{rule,passed:true,summary:'旧版测试通过',fingerprint:'passed',issues:[],issuesComplete:true}]}
+ f.plan.items.unshift({id:'earlier',title:'实现功能',acceptance:'写入代码',status:'complete',attempts:1,summary:'已修改',evidenceIds:[],modifiedFiles:['value.txt']})
+ const checksBefore=f.state.calls
+ await runTaskPlan(f.options,f.execution,async step=>{
+  assert.equal(step.currentStep.repairRequired,true)
+  assert.equal(f.state.calls,checksBefore+1,'resume checks the current state before requesting another edit')
+  step.onOutcome('complete')
+ },rules=>verifyTaskRules(f.registry,f.options,rules))
+ assert.equal(item.repairPending,true)
+ assert.equal(f.state.calls,checksBefore+1)
+ assert.match(item.summary,/没有产生文件变化/)
+ await runTaskPlan(f.options,f.execution,async step=>{
+  assert.equal(step.currentStep.repairRequired,true)
+  await edit(step,f.root,'correct')
+  step.onOutcome('complete')
+ },rules=>verifyTaskRules(f.registry,f.options,rules))
+ assert.equal(item.status,'complete')
+ assert.equal(item.repairPending,false)
+ assert.equal(f.state.calls,checksBefore+3)
+})
+
+test('a repaired verification-only step completes when the current suite passes',async t=>{
+ const f=fixture(t),rule={kind:'test',script:'test'},item=f.plan.items[0]
+ item.title='运行测试套件验证改动';item.acceptance='npm test 全部断言通过'
+ item.status='blocked';item.attempts=3;item.repairAttempts=1;item.repairPending=true
+ item.verificationRuns=[{createdAt:'2026-09-29',passed:false,results:await verifyTaskRules(f.registry,f.options,[rule])}]
+ f.plan.items.unshift({id:'earlier',title:'修复源码',acceptance:'功能实现',status:'complete',attempts:1,summary:'源码已修改',evidenceIds:[],modifiedFiles:['value.txt']})
+ fs.writeFileSync(path.join(f.root,'value.txt'),'correct')
+ await runTaskPlan(f.options,f.execution,async()=>assert.fail('passing verification must not demand another edit'),rules=>verifyTaskRules(f.registry,f.options,rules))
+ assert.equal(item.status,'complete')
+ assert.equal(item.repairPending,false)
+ assert.equal(item.verificationRuns.at(-1).passed,true)
+})
+
+test('passing test activity reaches independent acceptance despite a stale edit review',async t=>{
+ const f=fixture(t),rule={kind:'test',script:'test'},item=f.plan.items[0]
+ item.title='运行测试套件验证改动';item.acceptance='npm test 全部通过'
+ item.status='blocked';item.repairAttempts=1;item.repairPending=true
+ item.verificationRuns=[{createdAt:'2026-09-29',passed:false,results:await verifyTaskRules(f.registry,f.options,[rule])}]
+ item.baseline={createdAt:'2026-09-28',passed:true,results:[{rule,passed:true,summary:'旧版测试通过',fingerprint:'passed',issues:[],issuesComplete:true}]}
+ f.plan.items.unshift({id:'earlier',title:'修复源码',acceptance:'功能实现',status:'complete',attempts:1,summary:'源码已修改',evidenceIds:[],modifiedFiles:['value.txt']})
+ await runTaskPlan(f.options,f.execution,async step=>{
+  fs.writeFileSync(path.join(f.root,'value.txt'),'correct')
+  step.onActivity({id:'passing-test',capability:'agent.run_test',args:{script:'test'},status:'complete',output:JSON.stringify({exitCode:0,output:'all assertions passed'})})
+  step.onOutcome('blocked')
+ },rules=>verifyTaskRules(f.registry,f.options,rules))
+ assert.equal(item.status,'complete')
+ assert.equal(item.verificationRuns.at(-1).passed,true)
 })
 
 test('baseline denial prevents writes; explicit resume rechecks environment and preserves evidence',async t=>{

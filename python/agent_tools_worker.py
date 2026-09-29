@@ -317,18 +317,31 @@ def prepare_write(root,tool,args):
     elif tool=='replace_text':
         if before is None: raise ValueError('待修改文件不存在')
         source=before.decode();old=args['oldText']
-        matches=source.count(old)
-        if matches!=1:
+        start_line=args.get('startLine')
+        if start_line is not None and (type(start_line) is not int or start_line<1): raise ValueError('startLine 必须是从 1 开始的整数行号')
+        positions=[];offset=0
+        while True:
+            offset=source.find(old,offset)
+            if offset<0: break
+            positions.append(offset)
+            offset+=max(1,len(old))
+        matches=len(positions)
+        if start_line is not None:
+            positions=[offset for offset in positions if source.count('\n',0,offset)+1==start_line]
+        if len(positions)!=1:
             detail=f'待替换片段必须唯一匹配（实际匹配 {matches} 处）。'
-            if matches==0:
+            if start_line is not None:
+                detail+=f'第 {start_line} 行匹配 {len(positions)} 处；请重新读取该行并核对 oldText。'
+            elif matches==0:
                 if '\\\\n' in old and source.count(old.replace('\\\\n','\\n'))==1:
                     detail+='旧片段使用了两个反斜杠加 n，文件中是一个反斜杠加 n；请重新读取文件并按原文传入 oldText。'
                 elif '\\n' in old and source.count(old.replace('\\n','\n'))==1:
                     detail+='旧片段使用了字面的反斜杠加 n，文件中是实际换行；请重新读取文件并按原文传入 oldText。'
                 else: detail+='请重新读取目标文件，核对 oldText 与当前内容完全一致。'
-            else: detail+='请扩大 oldText 的上下文，使其只出现一次。'
+            else: detail+='请扩大 oldText 的上下文，使其只出现一次，或读取目标行号并传入 startLine。'
             raise ValueError(detail)
-        shown=source.replace(old,args['newText']);data=shown.encode();kind='file'
+        index=positions[0]
+        shown=source[:index]+args['newText']+source[index+len(old):];data=shown.encode();kind='file'
     elif tool=='create_document':
         if not re.search(r'\.(docx|md|txt)$',relative,re.I): raise ValueError('文档输出仅支持 .docx、.md、.txt；Word 文档必须使用 .docx，不能使用 .doc')
         kind='document';shown='# '+args['title']+'\n\n'+args['content'];data=docx_bytes(args['title'],args['content']) if relative.lower().endswith('.docx') else shown.encode()
@@ -402,6 +415,10 @@ def execute_plan(root,plan):
     return compact({'status':'saved' if prepared else 'unchanged','changed':bool(prepared),'paths':[c['path'] for c,_,_,_,_ in prepared],'unchangedPaths':unchanged,'note':'文件内容未变化，未执行替换；请核验目标是否已满足，不要重复写入。' if not prepared else ''})
 
 def code_files(root,relative='.',limit=1800):
+    target=resolve(root,relative)
+    if target.is_file():
+        if target.suffix.lower() not in CODE_EXT: raise ValueError('请选择代码文件或目录')
+        return [target.relative_to(root).as_posix()],False
     paths=[];scan=listing(root,relative,8,limit)
     for name in scan['paths']:
         if not name.endswith('/') and pathlib.Path(name).suffix.lower() in CODE_EXT: paths.append(name)
@@ -635,7 +652,7 @@ def parsed_diagnostics(output):
 
 def failed_test_names(output):
     found=[]
-    patterns=[re.compile(r'^not ok\s+\d+\s+-\s+(.+)$',re.I),re.compile(r'^FAILED\s+([^\s]+(?:::[^\s]+)*)'),re.compile(r'^FAIL\s+(.+?(?:\.[cm]?[jt]sx?|\.py))(?:\s|$)'),re.compile(r'^[×✗]\s+(.+)$')]
+    patterns=[re.compile(r'^not ok\s+\d+\s+-\s+(.+)$',re.I),re.compile(r'^FAILED\s+([^\s]+(?:::[^\s]+)*)'),re.compile(r'^FAIL\s+(.+?(?:\.[cm]?[jt]sx?|\.py))(?:\s|$)'),re.compile(r'^FAIL\s{2,}(.+)$'),re.compile(r'^[×✗]\s+(.+)$')]
     for raw in output.splitlines():
         line=raw.strip()
         for pattern in patterns:
@@ -657,7 +674,7 @@ def test_failure_analysis(output,exit_code,action='test'):
         ('environment',r'command not found|not recognized as an internal|ENOENT|EACCES|permission denied|address already in use|EADDRINUSE|connection refused|ECONNREFUSED|无法启动执行环境',.92,'运行环境、权限、端口或外部服务导致测试无法正常执行。',False,['检查运行时、权限、端口和依赖服务状态。','环境恢复后运行原测试，不修改业务断言。']),
         ('transient',r'ECONNRESET|socket hang up|temporary failure|temporarily unavailable|service unavailable|HTTP\s+50[234]|rate limit',.75,'输出包含可能的瞬时外部故障；单次失败不能证明测试不稳定。',True,['保留当前日志和随机种子，允许受控重跑一次。','若结果不一致，标记为 flaky 候选并隔离调查；不要持续重试。']),
         ('test-defect-candidate',r'beforeAll|beforeEach|afterAll|afterEach|fixture.*(?:failed|error)|test setup failed|mock.*(?:not configured|unexpected)',.62,'失败发生在测试夹具、生命周期或 mock 中，可能是测试代码缺陷，也可能由产品代码触发。',False,['核对需求契约和测试前置条件。','只有证据证明预期过期或夹具错误时才修改测试。']),
-        ('assertion',r'AssertionError|assert\.\w+|expected.+(?:received|actual)|\bexpected\b|断言',.82,'测试出现确定性断言失败，需要定位产品实现或测试预期之间的偏差。',False,['读取首个业务相关堆栈、断言期望和实际值。','提出一个根因假设并做最小修改，然后定向复测。'])
+        ('assertion',r'AssertionError|assert\.\w+|expected.+(?:received|actual)|\bexpected\b|断言|^\s*FAIL\s{2,}',.82,'测试断言失败，需要定位产品实现或测试预期之间的偏差。',False,['读取失败用例、断言期望和实际值。','提出一个根因假设并做最小修改，然后定向复测。'])
     ]
     for category,pattern,confidence,summary,rerun,actions in rules:
         matches=[line.strip()[:500] for line in output.splitlines() if re.search(pattern,line,re.I)][:8]

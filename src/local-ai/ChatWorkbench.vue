@@ -4,7 +4,7 @@ import {visualReviewCard,visualDecisionText,type VisualDecision} from '../../ele
 import ConversationOutline from './ConversationOutline.vue'
 import SessionExportMenu from './SessionExportMenu.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { ArrowUp, Close, Connection, FolderOpened, Download, EditPen, Grid, Search, Setting, VideoPause } from '@element-plus/icons-vue'
+import { ArrowUp, Close, Connection, DataLine, FolderOpened, Download, EditPen, Grid, Operation, Search, Setting, VideoPause } from '@element-plus/icons-vue'
 import { ElDialog } from 'element-plus'
 import { LOCAL_AI_MAX_OUTPUT_TOKENS } from '../../electron/shared/local-ai'
 import type { useLocalAiStudio } from './useLocalAiStudio'
@@ -19,8 +19,8 @@ import ChatPermissionSelect from './ChatPermissionSelect.vue'
 import ChatApprovalButton from './ChatApprovalButton.vue'
 import {visibleTaskPlan} from '../../electron/shared/task-plan-presentation'
 
-const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>}>()
-const emit = defineEmits<{models: []}>()
+const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>;showPerformanceLauncher:boolean;showInspectorLauncher:boolean}>()
+const emit = defineEmits<{models: [];performance: [];inspector: []}>()
 const ch = reactive(props.studio)
 const visualItem=computed(()=>{const item=ch.session?.taskPlan?.items.find(item=>item.status!=='complete');return item&&visualReviewCard(item,ch.messages)?item:undefined})
 async function decideVisual(value:VisualDecision){
@@ -86,6 +86,8 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
         <button class="agent-icon agent-history-toggle" aria-label="展开会话导航" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/></button>
         <div class="workspace-heading"><strong>{{hasConversation?ch.session?.title:'新会话'}}</strong><button type="button" class="agent-workspace-picker" :disabled="locked" :title="ch.chatWorkspacePath||'选择工作目录，启用文件与命令工具'" aria-label="选择聊天工作目录" @click="ch.chooseChatWorkspace"><FolderOpened/><span>{{ch.chatWorkspacePath.split(/[\\/]/).filter(Boolean).pop()||'选择工作目录'}}</span></button></div>
         <TokenUsageDisplay v-if="hasConversation" class="agent-token-usage" :usage="ch.session?.usage" :pending="ch.sending" label="Tokens" compact/>
+        <button v-if="showPerformanceLauncher" type="button" class="agent-icon window-launcher" title="显示性能窗口" aria-label="显示性能窗口" @click="emit('performance')"><DataLine/><span>性能</span></button>
+        <button v-if="showInspectorLauncher" type="button" class="agent-icon window-launcher" title="显示执行检查器" aria-label="显示执行检查器" @click="emit('inspector')"><Operation/><span>检查器</span></button>
         <button type="button" class="agent-icon" title="内置浏览器" aria-label="打开内置浏览器" @click="openBrowser"><Connection/></button>
         <SessionExportMenu v-if="ch.session?.messages.length" :disabled="locked" @select="ch.exportSession"/>
 <button v-if="artifacts.length" class="artifact-toggle" @click="selectedArtifact=selectedArtifact?undefined:artifacts[artifacts.length-1]">产物 {{artifacts.length}}</button>
@@ -169,6 +171,9 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
 </style>
 
 <style scoped>
+.window-launcher{display:inline-flex;align-items:center;gap:5px;width:auto;padding:0 8px;white-space:nowrap;font-size:11px}
+.window-launcher svg{width:16px;height:16px}
+@container studio (max-width:1100px){.window-launcher{width:30px;padding:0;justify-content:center}.window-launcher span{display:none}}
 .task-list-toggle{flex:none;border:1px solid var(--s-border);border-radius:8px;padding:5px 9px;background:var(--s-panel);color:var(--s-text);font-size:11px;white-space:nowrap;cursor:pointer}.task-list-toggle:hover{background:var(--s-muted)}
 .floating-task-list{position:absolute;z-index:6;top:74px;right:16px;bottom:calc(var(--composer-height,180px) + 22px);width:238px;min-height:120px;display:flex;flex-direction:column;border:1px solid var(--s-border);border-radius:12px;background:var(--s-panel);box-shadow:0 8px 28px #0002;color:var(--s-text);overflow:hidden}
 .floating-task-list>header{display:flex;align-items:center;justify-content:space-between;padding:12px 12px 8px}.floating-task-list>header>div{display:flex;flex-direction:column;gap:3px;min-width:0}.floating-task-list>header strong{font-size:12px;font-weight:600}.floating-task-list>header small{font-size:10px;color:var(--s-dim)}.floating-task-list>header button{width:24px;height:24px;padding:4px}.floating-task-list>header svg{width:14px;height:14px}

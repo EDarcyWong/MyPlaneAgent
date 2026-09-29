@@ -94,6 +94,11 @@ test('exact replacement requires a unique match and preserves surrounding text',
  const edit=await tools.prepare('replace_text',{path:'a.ts',oldText:'count = 1',newText:'count = 2'});await edit.execute(signal());assert.equal(tools.read('a.ts'),'const count = 2\n// 中文\n')
  await assert.rejects(tools.prepare('replace_text',{path:'a.ts',oldText:'missing',newText:'x'}),/唯一匹配/)
  fs.writeFileSync(path.join(root,'a.ts'),'x x');await assert.rejects(tools.prepare('replace_text',{path:'a.ts',oldText:'x',newText:'y'}),/唯一匹配/)
+ fs.writeFileSync(path.join(root,'a.ts'),'end\n}\nend\n}\n')
+ const targeted=await tools.prepare('replace_text',{path:'a.ts',oldText:'end\n}',newText:'finish\n}',startLine:3})
+ await targeted.execute(signal())
+ assert.equal(tools.read('a.ts'),'end\n}\nfinish\n}\n')
+ await assert.rejects(tools.prepare('replace_text',{path:'a.ts',oldText:'end\n}',newText:'wrong',startLine:3}),/指定 startLine/)
 })
 test('search skips dependencies, private files and binary files',async t=>{
  const root=sandbox(t),tools=new AgentWorkspace(root);fs.mkdirSync(path.join(root,'node_modules'));fs.writeFileSync(path.join(root,'node_modules','a.txt'),'needle');fs.writeFileSync(path.join(root,'.env'),'needle');fs.writeFileSync(path.join(root,'data.bin'),Buffer.from([0,1,2]));fs.writeFileSync(path.join(root,'a.ts'),'hello\nNeedle found')

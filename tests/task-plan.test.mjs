@@ -69,6 +69,30 @@ test('explicit weather code checks retain their baseline gate',async()=>{
  await runTaskPlan(f.options,f.execution,async()=>{ran++},async rules=>{checks++;return rules.map(rule=>({rule,passed:false,blocked:true,summary:'环境不可用',fingerprint:'env'}))})
  assert.equal(ran,0);assert.equal(checks,1);assert.equal(f.plan.items[0].status,'blocked');assert.equal(f.plan.items[0].excludedProjectChecks,undefined)
 })
+test('resumed launch step discards an unrelated diagnostics baseline after earlier code edits',async()=>{
+ const f=fixture();f.execution.goal='优化五子棋并运行 npm test'
+ const rule={kind:'diagnostics',checker:'auto'}
+ f.plan.items=parseTaskItems(JSON.stringify({steps:[
+  {title:'修复五子棋逻辑',acceptance:'源码已修改'},
+  {title:'启动开发服务并核验对局可用',acceptance:'服务可访问且可以落子',verification:[rule]}
+ ]}))
+ f.plan.items[0].status='complete';f.plan.items[0].modifiedFiles=['src/composables/useAI.js']
+ const item=f.plan.items[1];item.status='blocked';item.attempts=1
+ item.baseline={createdAt:'2026-09-29',passed:false,results:[{rule,passed:false,blocked:true,summary:'未找到可用的 TypeScript 检查脚本、tsc 或 Python 项目',fingerprint:'missing-checker',issues:[{key:'env',category:'environment',message:'missing checker'}]}]}
+ let calls=0
+ await runTaskPlan(f.options,f.execution,async step=>{calls++;step.onOutcome('complete');step.onContent('服务已启动并验证落子')},async()=>assert.fail('launch must not run unrelated diagnostics'))
+ assert.equal(calls,1);assert.equal(item.status,'complete')
+ assert.deepEqual(item.verification,[])
+ assert.equal(item.excludedProjectChecks[0].baseline.results[0].fingerprint,'missing-checker')
+})
+test('launch step retains a check explicitly required by its acceptance',async()=>{
+ const f=fixture();f.execution.goal='优化五子棋并运行 npm test'
+ f.plan.items=parseTaskItems(JSON.stringify({steps:[{title:'启动开发服务并核验对局可用',acceptance:'服务可访问且 TypeScript 检查通过',verification:[{kind:'diagnostics',checker:'auto'}]}]}))
+ let checks=0
+ await runTaskPlan(f.options,f.execution,async()=>assert.fail('blocked baseline must stop the launch'),async rules=>{checks++;return rules.map(rule=>({rule,passed:false,blocked:true,summary:'checker unavailable',fingerprint:'env',issues:[{key:'env',category:'environment',message:'checker unavailable'}]}))})
+ assert.equal(checks,1);assert.equal(f.plan.items[0].status,'blocked')
+ assert.equal(f.plan.items[0].excludedProjectChecks,undefined)
+})
 test('bounded recursive plans execute children before parent acceptance',()=>{
  const leaf={title:'子项',acceptance:'核验'}
  const rows=parseTaskItems(JSON.stringify({steps:[{title:'父项',acceptance:'整体通过',children:[leaf]}]}))

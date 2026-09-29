@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import {createHash} from 'node:crypto'
 import {EditProgress,inspectTextEdit} from '../dist-electron/main/agent/core/edit-progress.js'
 test('actual content tracks equivalent edits, allows one rollback and prevents oscillation across tools',t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-edit-progress-'))
@@ -33,4 +34,14 @@ test('missing and empty files differ; invalid patches and non-UTF8 inputs do not
  assert.equal(inspectTextEdit(root,'agent.apply_patch',{changes:[{path:'a.txt',before:'b',after:'c'}]}),undefined)
  fs.writeFileSync(path.join(root,'binary.txt'),Buffer.from([255,254]))
  assert.equal(inspectTextEdit(root,'agent.write_file',{path:'binary.txt',content:'x'}),undefined)
+})
+test('edit progress recognizes a line-targeted replacement of repeated text',t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-edit-line-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
+ fs.writeFileSync(path.join(root,'case.js'),'end\nblock\nend\nblock\n')
+ const base={path:'case.js',oldText:'end\nblock',newText:'end\nnew block'}
+ assert.equal(inspectTextEdit(root,'agent.replace_text',base),undefined)
+ const edits=inspectTextEdit(root,'agent.replace_text',{...base,startLine:3})
+ const expected='end\nblock\nend\nnew block\n'
+ assert.equal(edits?.[0].after,createHash('sha256').update(expected).digest('hex'))
+ assert.equal(inspectTextEdit(root,'agent.replace_text',{...base,startLine:2}),undefined)
 })

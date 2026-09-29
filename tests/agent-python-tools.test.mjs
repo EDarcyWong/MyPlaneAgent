@@ -52,6 +52,30 @@ test('replace_text reports exact match count and escaped newline mismatch withou
  assert.equal(fs.readFileSync(file,'utf8'),'repeat repeat')
 })
 
+test('replace_text can target a repeated snippet by its current line without changing other occurrences',t=>{
+ const root=sandbox(t),file=path.join(root,'gomoku.test.js')
+ const source='g.reset();\n}\n\n// other case\ng.reset();\n}\n\nprocess.exit(fail > 0 ? 1 : 0);\n'
+ fs.writeFileSync(file,source)
+ const args={path:'gomoku.test.js',oldText:'g.reset();\n}',newText:'g.reset();\n}\n\n// added coverage',startLine:5}
+ const prepared=JSON.parse(call(root,'replace_text',args,{phase:'plan'}))
+ assert.equal(fs.readFileSync(file,'utf8'),source)
+ call(root,'replace_text',{}, {phase:'commit',plan:prepared.plan})
+ assert.equal(fs.readFileSync(file,'utf8'),'g.reset();\n}\n\n// other case\ng.reset();\n}\n\n// added coverage\n\nprocess.exit(fail > 0 ? 1 : 0);\n')
+ const invalid=spawnSync(python,[worker],{input:JSON.stringify({workspace:root,tool:'replace_text',args:{...args,startLine:4},context:{phase:'plan'}}),encoding:'utf8'})
+ assert.notEqual(invalid.status,0)
+ assert.match(JSON.parse(invalid.stdout).error,/第 4 行匹配 0 处/)
+})
+
+test('custom FAIL lines are reported as assertion failures with individual test names',()=>{
+ const script="import sys,json;sys.path.insert(0,'python');from agent_tools_worker import test_failure_analysis;print(json.dumps(test_failure_analysis(sys.stdin.read(),1)))"
+ const output='  FAIL  空盘迭代加深返回合法着法 — 无着法\n  FAIL  二次搜索命中置换表 — hits=0\n===== 汇总：78 通过 / 2 失败 ====='
+ const run=spawnSync(python,['-c',script],{input:output,encoding:'utf8'})
+ assert.equal(run.status,0,run.stderr)
+ const analysis=JSON.parse(run.stdout)
+ assert.equal(analysis.category,'assertion')
+ assert.deepEqual(analysis.failedTests,['空盘迭代加深返回合法着法 — 无着法','二次搜索命中置换表 — hits=0'])
+})
+
 test('Python worker creates readable DOCX and XLSX artifacts',t=>{
  const root=sandbox(t)
  for(const [tool,args,file] of [['create_document',{path:'report.docx',title:'Title',content:'Body'},'report.docx'],['create_spreadsheet',{path:'report.xlsx',sheets:[{name:'Data',rows:[['Name','Count'],['A',2]]}]},'report.xlsx']]){
@@ -77,7 +101,9 @@ test('Python worker inspects projects and performs semantic code searches',t=>{
  const project=JSON.parse(call(root,'inspect_project',{}));assert.equal(project.package.name,'fixture');assert.equal(project.package.frameworks[0],'vue');assert.equal(project.languages.TypeScript,2)
  const outline=JSON.parse(call(root,'code_outline',{path:'src/app.ts'}));assert.equal(outline.symbols[0].name,'greet');assert.equal(outline.symbols[0].line,2)
  const symbols=JSON.parse(call(root,'find_symbol',{query:'greet'}));assert.equal(symbols.matches[0].path,'src/app.ts');assert.equal(symbols.matches[0].line,2)
+ const fileSymbols=JSON.parse(call(root,'find_symbol',{query:'greet',path:'src/app.ts'}));assert.deepEqual(fileSymbols.matches.map(match=>match.path),['src/app.ts'])
  const references=JSON.parse(call(root,'find_references',{query:'greet'}));assert.equal(references.matches.length,3)
+ const fileReferences=JSON.parse(call(root,'find_references',{query:'greet',path:'src/app.ts'}));assert.equal(fileReferences.matches.length,2)
  const todos=JSON.parse(call(root,'find_todos',{}));assert.equal(todos.matches[0].tag,'TODO')
  const dependencies=JSON.parse(call(root,'dependency_report',{}));assert.equal(dependencies.dependencies.dependencies[0].name,'vue');assert.deepEqual(dependencies.lockfiles,['package-lock.json'])
  const info=JSON.parse(call(root,'file_info',{path:'src/app.ts'}));assert.equal(info.kind,'file');assert.equal(info.lines,3);assert.match(info.sha256,/^[a-f0-9]{64}$/)

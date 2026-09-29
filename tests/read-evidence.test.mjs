@@ -16,4 +16,9 @@ test('recovery requires successful source evidence for the same file',()=>{
  assert.equal(recoveredReadFailure('/work',{...failure,capability:'agent.code_outline',args:{path:'index.html'},output:'请选择支持的代码文件'},success,true),true)
  assert.equal(recoveredReadFailure('/work',{...failure,capability:'agent.code_outline',args:{path:'index.html'},output:'Permission denied'},success),false)
  assert.equal(recoveredReadFailure('/work',failure,{...success,capability:'agent.read_file',args:{path:'index.html'},output:JSON.stringify({text:'1: <html>',startLine:1})}),true)
+ const symbolFailure={status:'error',capability:'agent.find_symbol',args:{query:'canUndo',path:'src/composables/useGomoku.js'},output:'ValueError: 请选择目录'}
+ const source={status:'complete',capability:'agent.read_file',args:{path:'src/composables/useGomoku.js'},output:JSON.stringify({text:'const canUndo = () => true',truncated:false})}
+ assert.equal(recoveredReadFailure('/work',symbolFailure,source),true)
+ assert.equal(recoveredReadFailure('/work',symbolFailure,{...source,output:JSON.stringify({text:'const aiMove = () => true',truncated:false})}),false)
+ assert.equal(recoveredReadFailure('/work',{...symbolFailure,output:'Permission denied'},source),false)
 })

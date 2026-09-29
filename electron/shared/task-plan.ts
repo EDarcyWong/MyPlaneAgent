@@ -21,7 +21,7 @@ export type TaskItem = {
   reviewQueue?:TaskReviewQueue;
   visualResponses?:Array<import('./visual-review.js').VisualDecision & {createdAt:string}>;
   outcome?:'complete'|'needs_input'|'blocked';completionReview?:TaskCompletionReview;
-  verification?:TaskVerificationRule[];verificationRuns?:TaskVerificationRun[];repairAttempts?:number;modifiedFiles?:string[];requiresVerification?:boolean;
+  verification?:TaskVerificationRule[];verificationRuns?:TaskVerificationRun[];repairAttempts?:number;repairPending?:boolean;modifiedFiles?:string[];requiresVerification?:boolean;
   verificationProblem?:{input:unknown;message:string;attempts:number};
   verificationRepairs?:Array<{createdAt:string;input:unknown;output?:string;error?:string}>;
   baseline?:TaskVerificationRun;baselineHistory?:TaskVerificationRun[];baselineUnavailableReason?:string;mutationStarted?:boolean;

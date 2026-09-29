@@ -34,8 +34,13 @@ export function inspectTextEdit(workspace:string,name:string,args:Record<string,
         if(source!==(change.before??undefined))return
         after=change.after
       }else{
-        if(source===undefined||typeof args.oldText!=='string'||!args.oldText||typeof args.newText!=='string'||source.split(args.oldText).length!==2)return
-        after=source.replace(args.oldText,()=>args.newText as string)
+        if(source===undefined||typeof args.oldText!=='string'||!args.oldText||typeof args.newText!=='string')return
+        const positions:number[]=[]
+        for(let offset=source.indexOf(args.oldText);offset>=0;offset=source.indexOf(args.oldText,offset+args.oldText.length))positions.push(offset)
+        const matches=args.startLine===undefined?positions:positions.filter(offset=>source.slice(0,offset).split('\n').length===args.startLine)
+        if(matches.length!==1)return
+        const index=matches[0]
+        after=source.slice(0,index)+args.newText+source.slice(index+args.oldText.length)
       }
       if(typeof after!=='string')return
       edits.push({file:identity,before:digest(before),after:digest(after)})

@@ -99,8 +99,13 @@ export class AgentWorkspace {
    if(name==='replace_text'){
     const old=bounded(args.oldText,'待替换片段',100000),replacement=typeof args.newText==='string'?args.newText:null
     if(replacement===null||replacement.length>100000)throw new Error('替换内容无效')
-    if(!previous)throw new Error('待修改文件不存在');const before=previous.toString('utf8'),index=before.indexOf(old)
-    if(index<0||before.indexOf(old,index+old.length)>=0)throw new Error('待替换片段必须在文件中唯一匹配，请重新读取并提供更多上下文')
+    if(!previous)throw new Error('待修改文件不存在')
+    const before=previous.toString('utf8'),startLine=args.startLine===undefined?undefined:integer(args.startLine,0,1,1000000)
+    const positions:number[]=[]
+    for(let offset=before.indexOf(old);offset>=0;offset=before.indexOf(old,offset+old.length))positions.push(offset)
+    const matches=startLine===undefined?positions:positions.filter(offset=>before.slice(0,offset).split('\n').length===startLine)
+    if(matches.length!==1)throw new Error(startLine===undefined?'待替换片段必须在文件中唯一匹配；重复片段请读取目标行号并传入 startLine':'待替换片段在指定 startLine 上必须唯一匹配，请重新读取目标行并核对 oldText')
+    const index=matches[0]
     next=Buffer.from(before.slice(0,index)+replacement+before.slice(index+old.length))
    }else{if(typeof args.content!=='string'||args.content.length>100000)throw new Error('写入内容不得超过 100000 字符');next=Buffer.from(args.content)}
    preview={path:relative,before:previous?.toString('utf8'),after:next.toString('utf8'),note:previous?'将替换现有文件；确认时会重新检查文件版本。':'将创建新文件。'}

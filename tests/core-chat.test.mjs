@@ -350,6 +350,31 @@ test('resuming with three old edit failures permits read-only diagnosis before r
  assert.equal(progress.ineffective,0)
 })
 
+test('failed verification exposes edit tools even when the step title only says run tests',async()=>{
+ const policies={invoke:async(id,data)=>{
+  if(id==='clarification-policy')return {ask:false,question:''}
+  if(id==='model-adapter')return {maxTokens:1024,temperature:0.2,toolLimit:32}
+  if(id==='tool-selection')return {ids:[]}
+  if(id==='history-memory')return {ids:[]}
+  if(id==='context-compaction')return {triggerRatio:0.8,retainRecent:4}
+  if(id==='error-recovery')return {action:'pause',reason:'测试仅检查修复工具是否可用'}
+  if(id==='completion-review')return {status:data.status,reason:data.reason,nextStep:data.nextStep}
+  throw new Error(`Unexpected policy ${id}`)
+ }}
+ let offered=false
+ await withModel(input=>{
+  const names=input.tools?.map(tool=>tool.function.description)||[]
+  offered ||= names.some(name=>name.startsWith('agent.replace_text:'))&&names.some(name=>name.startsWith('agent.read_file:'))
+  return {content:'需要修改源码后重新验证'}
+ },async connection=>{
+  await runCoreChat({list:()=>[capability('agent.read_file','read'),capability('agent.replace_text')],execute:async()=>assert.fail('tool need not execute')},options(connection,{
+   filesEnabled:true,approvalMode:'full',abilityPolicies:policies,
+   currentStep:{title:'运行测试套件验证改动',acceptance:'npm test 全部断言通过',repairRequired:true}
+  }))
+ })
+ assert.equal(offered,true)
+})
+
 test('command timing and timeout variations are not fresh evidence',async()=>{
  let executions=0,outcome
  await withModel((input,n)=>input.tools?.length?toolCall(input,'agent.run_command',{query:'same command '+n}):{content:'现有命令结果不足以确认'},async connection=>{

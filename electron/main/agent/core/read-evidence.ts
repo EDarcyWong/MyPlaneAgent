@@ -15,13 +15,21 @@ export function readCommandPath(command:unknown):string|undefined{
 export function isReadCommand(name:string,args:Record<string,unknown>){return name==='agent.run_command'&&!!readCommandPath(args.command)}
 const fileKey=(workspace:string,value:unknown)=>{const resolved=typeof value==='string'?path.resolve(workspace,value).replace(/\\/g,'/'):'';return process.platform==='win32'?resolved.toLowerCase():resolved}
 export function recoveredReadFailure(workspace:string,failure:StudioToolActivity,success:StudioToolActivity,allowStructuralSearch=false){
- if(success.status!=='complete'||failure.status!=='error')return false
- const target=failure.capability==='agent.code_outline'&&/支持的代码文件|unsupported/i.test(failure.output||'')?failure.args.path:
+  if(success.status!=='complete'||failure.status!=='error')return false
+  const target=failure.capability==='agent.code_outline'&&/支持的代码文件|unsupported/i.test(failure.output||'')?failure.args.path:
+  ['agent.find_symbol','agent.find_references'].includes(failure.capability)&&/请选择目录/.test(failure.output||'')?failure.args.path:
   isReadCommand(failure.capability,failure.args)?readCommandPath(failure.args.command):undefined
  if(!target)return false
  const result=parsedToolResult(success.output),key=fileKey(workspace,target)
  const text=result.text??result.content
- if(success.capability==='agent.read_file')return fileKey(workspace,success.args.path)===key&&result.truncated!==true&&typeof text==='string'&&!!text.trim()
+  if(success.capability==='agent.read_file'){
+    if(fileKey(workspace,success.args.path)!==key||result.truncated===true||typeof text!=='string'||!text.trim())return false
+    if(['agent.find_symbol','agent.find_references'].includes(failure.capability)){
+      const query=failure.args.query
+      return typeof query==='string'&&query.length>0&&text.includes(query)
+    }
+    return true
+  }
  // Structural search is a fallback source of project/entry information, not a
  // claim that the failed shell command ran successfully or a full file was read.
  return allowStructuralSearch&&success.capability==='agent.search_files'&&result.truncated===false&&Array.isArray(result.matches)&&result.matches.some((row:Record<string,unknown>)=>fileKey(workspace,row.path)===key&&typeof row.text==='string'&&/<script\b|\b(?:import|export|function|class)\b/.test(row.text))

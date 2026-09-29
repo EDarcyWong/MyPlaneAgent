@@ -10,7 +10,7 @@ import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue'
 import ChatWorkbench from './local-ai/ChatWorkbench.vue'
 import WorkflowDesigner from './local-ai/WorkflowDesigner.vue'
 import AutomationTasks from './local-ai/AutomationTasks.vue'
-import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ChatDotRound,ArrowRight,Check,AlarmClock,Share} from '@element-plus/icons-vue'
+import {Search,FolderOpened,Connection,Setting,Plus,Close,Download,Refresh,CopyDocument,VideoPause,VideoPlay,Operation,Document,Cpu,ChatDotRound,ArrowRight,Check,AlarmClock,Share,DataLine} from '@element-plus/icons-vue'
 import LocalAiDeveloper from './local-ai/LocalAiDeveloper.vue'
 import AgentSkillManager from './local-ai/AgentSkillManager.vue'
 import ExperienceLibraryCard from './local-ai/ExperienceLibraryCard.vue'
@@ -155,9 +155,9 @@ function fillRemotePreset(event:Event){
    </nav>
   </aside>
   <div class="studio-main">
-   <header v-if="settingsMode" class="studio-topbar"><div class="brand"><strong>{{pageTitle}}</strong></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" title="新建工作流" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建插件" aria-label="新建插件" @click="agentSkillManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><span class="privacy-label">{{settings.source==='managed'?'本机托管 · 数据留在本机':'外部 API · 请求发送至 API'}}</span></header>
+   <header v-if="settingsMode" class="studio-topbar"><div class="brand"><strong>{{pageTitle}}</strong></div><button v-if="tab==='workflow'" class="studio-topbar-create" type="button" title="新建工作流" aria-label="新建工作流" @click="workflowDesigner?.create()"><Plus/></button><button v-if="tab==='automation'" class="studio-topbar-create" type="button" title="新建定时任务" aria-label="新建定时任务" @click="automationTasks?.create()"><Plus/></button><button v-if="tab==='skills'" class="studio-topbar-create" type="button" title="新建插件" aria-label="新建插件" @click="agentSkillManager?.create()"><Plus/></button><button class="connection-indicator" :class="{online}" @click="tab='server'"><i></i>{{statusText}}<ArrowRight/></button><button v-if="settings.showTokenSpeed" type="button" class="studio-topbar-create" title="显示性能窗口" aria-label="显示性能窗口" @click="detachPerformance"><DataLine/></button><button v-if="settings.showExecutionInspector" type="button" class="studio-topbar-create" title="显示执行检查器" aria-label="显示执行检查器" @click="openInspector"><Operation/></button><span class="privacy-label">{{settings.source==='managed'?'本机托管 · 数据留在本机':'外部 API · 请求发送至 API'}}</span></header>
    <div v-if="error" class="error-banner" role="alert"><span>{{error}}</span><button @click="error=''">关闭</button></div>
-   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" @models="openModelSettings"/>
+   <ChatWorkbench v-if="ready" v-show="!settingsMode" :studio="studio" :show-performance-launcher="!!settings.showTokenSpeed" :show-inspector-launcher="!!settings.showExecutionInspector" @models="openModelSettings" @performance="detachPerformance" @inspector="openInspector"/>
    <div v-if="!ready" class="initial-loading"><div class="loading-orbit"></div><h3>{{error?'工作区暂时无法载入':'正在准备本地工作区'}}</h3><p>{{error?'请检查上方错误提示，修复后重新打开此窗口。':'读取本地模型、配置和会话记录'}}</p></div>
 
    <WorkflowDesigner ref="workflowDesigner" v-else-if="tab==='workflow'" :model="model" :models="workflowModels" :theme="settings.theme" :appearance-style="settings.appearanceStyle"/>
@@ -269,8 +269,6 @@ function fillRemotePreset(event:Event){
   </div>
   <button v-if="drawer" class="download-backdrop" aria-label="关闭下载队列遮罩" @click="drawer=false"></button>
   <aside v-if="drawer" id="studio-downloads" class="downloads-drawer" role="dialog" aria-modal="true" aria-label="下载队列"><header><div><Download/><h3>下载队列</h3><span class="count-badge">{{downloads.length}}</span></div><button class="icon-btn" aria-label="关闭下载队列" @click="drawer=false"><Close/></button></header><p class="drawer-note">顺序下载 · 支持断点续传 · 下载完成后自动加入模型库</p><div class="download-items"><div v-if="!downloads.length" class="empty-panel"><Download/><h3>还没有下载任务</h3><button class="text-button" @click="tab='discover';drawer=false">去发现模型 <ArrowRight/></button></div><article v-for="item in [...downloads].reverse()" :key="item.id" class="download-item"><div class="download-item-head"><span class="format-chip">{{item.file.split('.').at(-1)?.toUpperCase()}}</span><span class="download-state" :class="item.status">{{downloadLabel(item.status)}}</span></div><strong :title="item.file">{{item.file}}</strong><small>{{item.repoId}}</small><div class="progress-track" :class="{indeterminate:item.status==='verifying'||!item.total&&item.status==='downloading'}"><span :style="{width:percent(item)+'%'}"></span></div><div class="download-progress-label"><span>{{bytes(item.received)}} / {{item.total?bytes(item.total):'未知大小'}}</span><span v-if="item.status==='downloading'">{{bytes(item.speed)}}/s · {{percent(item)}}%</span><span v-else-if="item.status==='completed'">{{item.sha256?'SHA-256 已校验':'已完成'}}</span></div><p v-if="item.error" class="download-error">{{item.error}}</p><div class="download-actions"><button v-if="['downloading','queued'].includes(item.status)" class="text-button" @click="downloadAction(item,'pause')"><VideoPause/>暂停</button><button v-if="['paused','failed'].includes(item.status)" class="text-button" @click="downloadAction(item,'resume')"><VideoPlay/>{{item.status==='failed'?'重试':'继续'}}</button><button v-if="!['completed','cancelled'].includes(item.status)" class="text-button" @click="downloadAction(item,'cancel')"><Close/>取消</button><button v-if="['completed','cancelled','failed'].includes(item.status)" class="text-button" @click="downloadAction(item,'remove')">清除记录</button><button v-if="item.status==='completed'" class="text-button" @click="tab='models';drawer=false">查看模型 <ArrowRight/></button></div></article></div></aside>
-  <button v-if="settings.showTokenSpeed" class="performance-window-launcher" @click="detachPerformance">显示性能窗口 ↗</button>
-  <button v-if="settings.showExecutionInspector" class="performance-window-launcher" style="top:118px" @click="openInspector">显示执行检查器 ↗</button>
  </section>
 </template>
 
@@ -281,7 +279,6 @@ function fillRemotePreset(event:Event){
 <style scoped src="./local-ai/studio-workbench.css"></style>
 
 <style scoped>
-.performance-window-launcher{position:fixed;right:18px;top:80px;z-index:40;padding:9px 12px;background:var(--s-panel);border:1px solid var(--s-border);border-radius:8px;color:var(--s-text);font-size:12px}
 .settings-navigation{position:relative;z-index:30;width:var(--s-rail-width);flex:none;display:flex;flex-direction:column;padding:14px 6px;background:var(--s-rail);border-right:1px solid var(--s-border);min-height:0}
 .settings-feature-list{display:flex;flex-direction:column;align-items:center;gap:5px;min-height:0}
 .settings-rail-button{position:relative;display:grid;place-items:center;width:42px;height:42px;flex:none;border:0;background:transparent;border-radius:9px;padding:0;color:var(--s-dim);cursor:pointer}
