@@ -170,7 +170,7 @@ test('Python worker returns structured diagnostics, targeted test results and lo
 test('image OCR either runs locally or reports its optional dependency clearly',t=>{
  const root=sandbox(t),png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');fs.writeFileSync(path.join(root,'pixel.png'),png)
  const run=spawnSync(python,[worker],{input:JSON.stringify({workspace:root,tool:'image_ocr',args:{path:'pixel.png'}}),encoding:'utf8'}),envelope=JSON.parse(run.stdout)
- if(run.status===0){const result=JSON.parse(envelope.output);assert.ok(['rapidocr-onnxruntime','pytesseract'].includes(result.provider))}else assert.match(envelope.error,/OCR|Tesseract|requirements/)
+ if(run.status===0){const result=JSON.parse(envelope.output);assert.ok(['rapidocr-onnxruntime','pytesseract','tesseract-cli'].includes(result.provider))}else assert.match(envelope.error,/OCR|Tesseract|requirements/)
 })
 
 test('scanned PDF OCR reads a bounded page when local tools are available',t=>{

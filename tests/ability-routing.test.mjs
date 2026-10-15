@@ -50,6 +50,7 @@ test('host rejects fabricated actions and bypasses of progress, cancel, task ide
     [input('解释停止按钮', 'question'), { action: 'cancel' }], [input('继续'), { action: 'new_task' }],
     [input('停止', 'cancel', 'ready', true), { action: 'cancel' }], [input('你好'), { action: 'execute_tool' }],
     [input('你好'), { action: 'respond', permissions: 'full' }],
+    [{...input('检查项目代码','new_task'),relation:'new'}, {action:'respond'}],
   ]) assert.throws(() => validateRouterOutput(output, sample))
 })
 
@@ -106,6 +107,7 @@ test('task boundary isolates model context without erasing history; progress use
     abilityTask: { id: 'task', startMessageId: 'new', goalMessageId: 'new', status: 'complete', lastExecutionMessageId: 'work' },
   }
   assert.deepEqual(taskMessages(session).map(message => message.id), ['new', 'work', 'query', 'report'])
+  assert.deepEqual(taskMessages({...session,abilityTask:undefined,conversationStartMessageId:'new'}).map(message=>message.id),['new','work','query','report'])
   assert.equal(session.messages.length, 5)
   const progress = taskProgress(session)
   assert.match(progress, /上轮报告已完成/)

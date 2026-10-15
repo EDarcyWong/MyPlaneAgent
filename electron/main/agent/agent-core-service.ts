@@ -248,14 +248,14 @@ export class AgentCoreService extends EventEmitter {
     let sourceHost=''
     try{const url=query.match(/https?:\/\/[^\s，。]+/)?.[0];if(url)sourceHost=new URL(url).hostname}catch{}
     const evaluation=this.experiences.diagnose(query,{workspace:options.workspace,region:searchRegion().region,webEnabled:options.webEnabled,filesEnabled:options.filesEnabled,tools:[...this.capabilityRegistry.list().map(cap=>cap.name),'weather.forecast'],sourceHost})
-    const matched=evaluation.find(item=>!item.reasons.length)?.entry
+    const matched=options.conversationOnly||options.readOnlyConversation?undefined:evaluation.find(item=>!item.reasons.length)?.entry
     for(const candidate of evaluation.slice(0,3))try{this.experiences.noteMatch(candidate.entry.id,candidate.entry.revision!,candidate.reasons)}catch{/* Optional diagnostic must not stop chat. */}
     if(!matched&&evaluation.length)options.onProgress?.('经验未采用：'+evaluation[0].reasons.map(code=>mismatchHints[code].label).join('；')+'。'+mismatchHints[evaluation[0].reasons[0]].action+'。','working')
     const trackUse=(passed?:boolean,kind:ExperienceFailureKind='incomplete')=>{if(matched)try{this.experiences.use(matched.id,matched.revision!,passed,kind)}catch{options.onProgress?.('经验版本已变化，本次结果未覆盖新版本','working')}}
     const announceUse=()=>{if(matched){trackUse();options.onProgress?.('采用经验流程「'+matched.recipe!.title+'」v'+matched.revision+'（'+matched.id.slice(0,8)+'）；将重新执行并检查本次结果。','working')}}
     let weatherAttempted=false
     const newWeatherPlan=execution&&(!execution.plan||execution.plan.taskId!==execution.taskId)&&execution.goal===query&&parseWeatherRequest(query)
-    if(this.experiences.state().enabled&&!(matched?.recipe?.kind==='weather-web'&&flowInputs(query,matched.recipe))&&(!execution||newWeatherPlan)){
+    if(!options.conversationOnly&&!options.readOnlyConversation&&this.experiences.state().enabled&&!(matched?.recipe?.kind==='weather-web'&&flowInputs(query,matched.recipe))&&(!execution||newWeatherPlan)){
       weatherAttempted=!!parseWeatherRequest(query)
       if(matched?.recipe?.kind==='weather'&&weatherAttempted)announceUse()
       const evidenceIds:string[]=[]
@@ -312,7 +312,7 @@ export class AgentCoreService extends EventEmitter {
     if(options.planExecution){
       const {runTaskPlan}=await import('./core/task-plan-runner.js')
       const {verifyTaskRules}=await import('./core/task-verification.js')
-      return await runTaskPlan(options,options.planExecution,step=>runCoreChat(this.capabilityRegistry,step),rules=>verifyTaskRules(this.capabilityRegistry,options,rules))
+      return await runTaskPlan(options,options.planExecution,step=>runCoreChat(this.capabilityRegistry,step),(rules,item)=>verifyTaskRules(this.capabilityRegistry,{...options,onActivity:activity=>options.onActivity(item?.worker?{...activity,workerId:item.worker.id}:activity)},rules))
     }
     return await runCoreChat(this.capabilityRegistry, options)
     }finally{remember()}

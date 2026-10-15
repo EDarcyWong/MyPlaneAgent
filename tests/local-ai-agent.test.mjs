@@ -355,10 +355,17 @@ test('truncated and incomplete streams cannot execute partial tool arguments',as
  }
 })
 test('stream errors and invalid tool indexes fail before any tool execution',async t=>{
- for(const wire of ['data: {"error":{"message":"model overloaded"}}\n\n',frame({tool_calls:[{index:9,id:'bad',function:{name:'read_file',arguments:'{}'}}]},'tool_calls'),'data: invalid-json\n\n']){
+ for(const wire of ['data: {"error":{"message":"model overloaded"}}\n\n',frame({tool_calls:[{index:-1,id:'bad',function:{name:'read_file',arguments:'{}'}}]},'tool_calls'),'data: invalid-json\n\n']){
   const connection=await modelServer(t,async(_body,res)=>{streamHeaders(res);res.end(wire)})
   await assert.rejects(ask(connection),/overloaded|序号|格式错误/)
  }
+})
+
+test('sparse tool indexes remain valid when the streamed call is complete',async t=>{
+ const connection=await modelServer(t,async(_body,res)=>{streamHeaders(res);res.end(frame({tool_calls:[{index:9,id:'sparse',function:{name:'read_file',arguments:'{}'}}]},'tool_calls')+'data: [DONE]\n\n')})
+ const answer=await ask(connection)
+ assert.equal(answer.tool_calls?.[0]?.id,'sparse')
+ assert.equal(answer.tool_calls?.[0]?.function.name,'read_file')
 })
 
 test('oversized SSE payloads report a recoverable size error and discard partial tool calls',async t=>{

@@ -9,6 +9,7 @@ import {AbilityCatalogService} from './ability-modules/catalog.js';
 import {policyContracts} from './ability-modules/policies.js';
 import {AbilityPolicyRuntime} from './ability-modules/policy-runtime.js';
 import {routerContract,validateRouterOutput,explicitNewTask,lookupBoundary,standaloneLookup,standaloneProjectTask,taskMessages,taskProgress} from './ability-modules/routing.js';
+import {classifyTaskRelation,legacyProjectOverviewBoundary,legacyWeatherIdentityBoundary,ordinaryConversationMessage,projectOverviewQuestion,socialConversationMessage} from './ability-modules/task-relation.js';
 import {implementsPriorAdvice,projectAdviceRequested} from '../shared/task-scope.js';
 import {requiresImplementation} from './agent/core/implementation-stage.js';
 import type {RouterInput} from '../shared/ability-modules.js';
@@ -1491,6 +1492,18 @@ export class LocalAiStudioService extends LocalAiService {
     );
     if (session.id !== id || !Array.isArray(session.messages))
       throw new Error("会话文件格式错误");
+    const conversationBoundary=session.taskPlan?.scope?.goal?legacyWeatherIdentityBoundary(session.taskPlan.scope.goal,session.messages):undefined;
+    if(conversationBoundary){
+      session.conversationStartMessageId=conversationBoundary;
+      delete session.abilityTask;delete session.abilityState;delete session.taskPlan;delete session.checkpoint;
+      this.saveSession(session);
+    }
+    const overviewBoundary=session.taskPlan?.scope?.goal?legacyProjectOverviewBoundary(session.taskPlan.scope.goal,session.messages):undefined;
+    if(overviewBoundary){
+      session.conversationStartMessageId=overviewBoundary;
+      delete session.abilityTask;delete session.abilityState;delete session.taskPlan;delete session.checkpoint;
+      this.saveSession(session);
+    }
     const goalParts=session.taskPlan?.scope?.goal.split('\n用户补充：')||[];
     if(session.abilityTask&&goalParts.length>1&&standaloneLookup(goalParts[0])&&goalParts.slice(1).some(standaloneProjectTask)){
       const original=session.messages.findIndex(message=>message.role==='user'&&message.content===goalParts[0]);
@@ -1910,11 +1923,19 @@ export class LocalAiStudioService extends LocalAiService {
             delete session.checkpoint;
           }
         }
-        const lookupChange=!latest.visualDecision&&!latest.images?.length?lookupBoundary(latest.content,session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||''):undefined;
-        const projectChange=!latest.visualDecision&&standaloneProjectTask(latest.content);
+        const currentGoal=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';
+        const lookupChange=!latest.visualDecision&&!latest.images?.length?lookupBoundary(latest.content,currentGoal):undefined;
+        const relation=session.abilityTask&&!latest.visualDecision&&!latest.images?.length&&!explicitNewTask(latest.content)&&!lookupChange?await classifyTaskRelation({goal:currentGoal,latest:latest.content,recent:session.messages.slice(-5,-1).map(message=>message.content)},async(system,user)=>{
+          session.usage!.requests++;
+          let previous:TokenUsage|undefined;
+          const answer=await requestAgentModel({...service,contextLength:settings.contextLength,maxTokens:Math.min(settings.maxTokens,256),localLlama:settings.source==='managed'},session.model,[{role:'system',content:system},{role:'user',content:user}],signal,{tools:false,thinking:false,temperature:0,onUsage:usage=>{updateTokenUsageTotals(session.usage!,previous,usage);previous=usage}});
+          return answer.content||'';
+        }):undefined;
+        signal.throwIfAborted();
+        const projectChange=!latest.visualDecision&&standaloneProjectTask(latest.content)&&(!/(?:项目|代码|仓库|源码|\bproject\b|\bcode\b)/i.test(currentGoal)||relation==='new');
         const previousAdviceGoal=session.taskPlan?.scope?.goal.split('\n用户补充：')[0];
         const implementAdvice=!latest.visualDecision&&!!session.abilityTask&&!!previousAdviceGoal&&projectAdviceRequested(previousAdviceGoal)&&implementsPriorAdvice(latest.content)&&!!session.taskPlan?.items.every(item=>!requiresImplementation(item.title,item.acceptance));
-        const newBoundary = !latest.visualDecision&&(explicitNewTask(latest.content)||!!lookupChange||projectChange);
+        const newBoundary = !latest.visualDecision&&(explicitNewTask(latest.content)||!!lookupChange||projectChange||relation==='new');
         let proposedState: typeof previousState;
         try {
           const candidates = selectionInput(newBoundary ? [latest] : taskMessages(session), newBoundary ? undefined : previousState);
@@ -1930,8 +1951,10 @@ export class LocalAiStudioService extends LocalAiService {
           this.applicationLog?.('warn', 'ability-modules', `状态模块未应用，保留原始对话继续：${String(cause)}`);
         }
         signal.throwIfAborted();
-        let routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length };
-        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await inspectModule('task-message-router',routingInput,value=>{routingInput=value;return this.routerModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,intent:{type:'string'},taskStatus:{const:routingInput.taskStatus},hasAttachments:{const:routingInput.hasAttachments}},required:['messages','intent','taskStatus','hasAttachments']});
+        let routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length,relation };
+        const overviewQuestion=projectOverviewQuestion(latest.content);
+        const independentConversation=!latest.visualDecision&&!latest.images?.length&&!explicitNewTask(latest.content)&&!lookupChange&&!projectChange&&ordinaryConversationMessage(latest.content,routingInput.intent)&&(overviewQuestion||relation==='new'||!session.abilityTask);
+        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:independentConversation?{output:{action:'respond'},versionId:'host-conversation'}:relation==='new'?{output:{action:'new_task'},versionId:'host-topic-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await inspectModule('task-message-router',routingInput,value=>{routingInput=value;return this.routerModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,intent:{type:'string'},taskStatus:{const:routingInput.taskStatus},hasAttachments:{const:routingInput.hasAttachments},relation:{type:'string'}},required:['messages','intent','taskStatus','hasAttachments']});
         const route = validateRouterOutput(routed.output, routingInput);
         if(lookupChange==='new_task'){
           try{
@@ -1942,6 +1965,7 @@ export class LocalAiStudioService extends LocalAiService {
         }
         if(!latest.visualDecision&&!lookupChange)this.routerModule.recordSample(routingInput, routed.versionId);
         if (route.action === 'new_task') {
+          session.conversationStartMessageId=latest.id;
           session.abilityTask = { id: randomUUID(), startMessageId: latest.id, goalMessageId: latest.id, status: 'ready', updatedAt: new Date().toISOString() };
           delete session.checkpoint;
           delete session.taskPlan;
@@ -1958,7 +1982,13 @@ export class LocalAiStudioService extends LocalAiService {
             delete session.taskPlan;delete session.checkpoint;
           }else if(route.action==='amend'&&session.taskPlan)session.taskPlan.needsReplan=true;
           session.abilityState = lookupChange ? proposedState : proposedState || previousState;
-        } else if (!session.abilityTask && route.action === 'respond') session.abilityState = proposedState;
+        } else if (route.action === 'respond') {
+          if(relation==='new'||overviewQuestion&&session.abilityTask?.goalMessageId===latest.id){
+            session.conversationStartMessageId=latest.id;
+            delete session.abilityTask;delete session.taskPlan;delete session.checkpoint;
+          }
+          if(!session.abilityTask)session.abilityState=proposedState;
+        }
         answer.abilityRoute = { versionId: routed.versionId, action: route.action, taskId: session.abilityTask?.id, createdAt: new Date().toISOString() };
         if (route.action === 'cancel' && session.abilityTask) {
           session.abilityTask.status = 'paused'; session.abilityTask.updatedAt = new Date().toISOString();
@@ -1993,7 +2023,7 @@ export class LocalAiStudioService extends LocalAiService {
       );
       if (compactOnly) return;
       const core = await this.ensureAgentCore();
-      let previous: TokenUsage | undefined;
+      const previousByWorker=new Map<string,TokenUsage|undefined>();
       const answerTotals = emptyTokenUsageTotals();
       session.messages.push(answer);
       const progress = (text:string, phase:'working'|'reviewing'|'context') => {
@@ -2007,6 +2037,8 @@ export class LocalAiStudioService extends LocalAiService {
       const storedImageChars=session.messages.flatMap(message=>[...(message.images||[]),...(message.toolActivity||[]).flatMap(activity=>activity.images||[])]).reduce((sum,image)=>sum+image.dataUrl.length,0);
       await core.runConversation({
         ...toolOptions!, connection: {...service, contextLength:settings.contextLength, maxTokens:settings.maxTokens, localLlama:settings.source === 'managed'},
+        conversationOnly: !taskRunId&&socialConversationMessage(session.messages.filter(message=>message.role==='user').at(-1)?.content||''),
+        readOnlyConversation: !taskRunId&&projectOverviewQuestion(session.messages.filter(message=>message.role==='user').at(-1)?.content||''),
         model:session.model, messages:messages as AgentMessage[], signal, temperature:settings.temperature,
         visualDecision:session.messages.filter(message=>message.role==='user').at(-1)?.visualDecision,
         imageCapability,imageBudget:{remaining:Math.max(0,maxSessionImageChars-storedImageChars)},
@@ -2027,7 +2059,7 @@ export class LocalAiStudioService extends LocalAiService {
         onProgress: progress,
         onOutcome: outcome => { answer.outcome = outcome; emit({type:'outcome',requestId,outcome}); },
         onContext: context => { if(context.state==='compacting')progress('正在整理上下文，保留任务要求与执行记录','context'); session.context = context; emit({type:'context',requestId,context}); },
-        onRequest: () => { previous = undefined; session.usage!.requests++; },
+        onRequest: workerId => { previousByWorker.set(workerId||'main',undefined); session.usage!.requests++; },
         onContent: content => {
           answer.content += content;
           if (answer.content.length + (answer.reasoning?.length || 0) > responseCharacterLimit) throw new Error('输出已达到应用单轮容量');
@@ -2035,9 +2067,10 @@ export class LocalAiStudioService extends LocalAiService {
           if (Date.now() - lastSave > 2000) { lastSave = Date.now(); this.saveSession(session); }
         },
         onReasoning: reasoning => { answer.reasoning = (answer.reasoning || '') + reasoning; emit({type:'delta',requestId,content:'',reasoning}); },
-        onUsage: usage => {
+        onUsage: (usage,workerId) => {
+          const key=workerId||'main',previous=previousByWorker.get(key);
           updateTokenUsageTotals(session.usage!, previous, usage);
-          updateTokenUsageTotals(answerTotals, previous, usage); previous = usage;
+          updateTokenUsageTotals(answerTotals, previous, usage); previousByWorker.set(key,usage);
           answer.usage = {inputTokens:answerTotals.inputReports?answerTotals.inputTokens:undefined, outputTokens:answerTotals.outputReports?answerTotals.outputTokens:undefined, totalTokens:answerTotals.totalReports?answerTotals.totalTokens:undefined};
           answer.tokens = answer.usage.outputTokens;
           emit({type:'delta',requestId,content:'',reasoning:'',usage:answer.usage,sessionUsage:session.usage});

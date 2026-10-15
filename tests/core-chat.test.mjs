@@ -177,6 +177,86 @@ test('browser screenshots are delivered as images after all tool replies, with c
  })
 })
 
+test('empty browser text automatically captures the visible page for a vision model',async()=>{
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ const calls=[],activities=[]
+ await withModel((input,n)=>n===1?toolCall(input,'browser.read_page',{}):{content:'截图显示页面日期，已据此核对。'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[read,screenshotCapability],execute:async request=>{
+   calls.push(request.capability)
+   return request.capability==='browser.read_page'?{success:true,output:{url:'http://localhost:8080/',title:'日期页面',text:'',elements:[]}}:screenshotResult()
+  }},options(connection,{messages:[{role:'user',content:'查看已经打开的日期页面'}],imageCapability:'supported',approvalMode:'full',onActivity:activity=>activities.push(activity)}))
+  assert.deepEqual(calls,['browser.read_page','browser.screenshot'])
+  assert.ok(requests[1].messages.some(message=>Array.isArray(message.content)&&message.content.some(part=>part.type==='image_url')))
+  const shot=activities.find(activity=>activity.capability==='browser.screenshot'&&activity.status==='complete')
+  assert.equal(shot.images.length,1)
+  assert.equal(JSON.parse(shot.output).visualInput,true)
+ })
+})
+
+test('empty browser text keeps a screenshot for the user without claiming text-only vision',async()=>{
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ const activities=[];let outcome,content=''
+ await withModel((input,n)=>n===1?toolCall(input,'browser.read_page',{}):{content:'我看到了页面，明天是工作日。'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[read,screenshotCapability],execute:async request=>request.capability==='browser.read_page'?{success:true,output:{url:'http://localhost:8080/',text:'',elements:[]}}:screenshotResult()},options(connection,{messages:[{role:'user',content:'查看已经打开的日期页面'}],imageCapability:'unsupported',approvalMode:'full',onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value,onContent:value=>content+=value}))
+  assert.ok(requests.every(request=>request.messages.every(message=>!Array.isArray(message.content)||message.content.every(part=>part.type!=='image_url'))))
+  const shot=activities.find(activity=>activity.capability==='browser.screenshot'&&activity.status==='complete')
+  assert.equal(shot.images.length,1)
+  assert.equal(JSON.parse(shot.output).visualInput,false)
+ },()=>({content:JSON.stringify({status:'complete',reason:'页面已核对'})}))
+ assert.equal(outcome,'needs_input')
+ assert.match(content,/网页正文未能读取/)
+ assert.doesNotMatch(content,/明天是工作日/)
+})
+
+test('screenshot OCR supplies preliminary text to a text-only model and removes its temporary image',async()=>{
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ const ocr={...screenshotCapability,name:'agent.image_ocr',source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
+ const activities=[],calls=[];let outcome,temporaryImage
+ await withModel((input,n)=>n===1?toolCall(input,'browser.read_page',{}):{content:'OCR 显示页面日期；仍需核对当地工作日规则。'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[read,screenshotCapability,ocr],execute:async request=>{
+   calls.push(request.capability)
+   if(request.capability==='browser.read_page')return {success:true,output:{url:'http://localhost:8080/',text:''}}
+   if(request.capability==='browser.screenshot')return screenshotResult()
+   temporaryImage=path.join(request.workspace,request.args.path)
+   assert.ok(existsSync(temporaryImage))
+   return {success:true,output:{provider:'test-ocr',text:'2026年10月16日 星期五',confidence:0.91}}
+  }},options(connection,{messages:[{role:'user',content:'查看日期网页'}],imageCapability:'unsupported',approvalMode:'full',onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value}))
+  assert.deepEqual(calls,['browser.read_page','browser.screenshot','agent.image_ocr'])
+  assert.ok(requests[1].messages.some(message=>typeof message.content==='string'&&message.content.includes('2026年10月16日 星期五')))
+  assert.ok(requests.every(request=>request.messages.every(message=>!Array.isArray(message.content)||message.content.every(part=>part.type!=='image_url'))))
+ },()=>({content:JSON.stringify({status:'complete',reason:'OCR 文字可供初步判断'})}))
+ assert.equal(outcome,'complete')
+ assert.equal(existsSync(temporaryImage),false)
+ assert.match(activities.find(activity=>activity.capability==='agent.image_ocr').output,/2026年10月16日/)
+})
+
+test('OCR failure still passes the screenshot to a vision model',async()=>{
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ const ocr={...screenshotCapability,name:'agent.image_ocr',source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
+ const activities=[]
+ await withModel((input,n)=>n===1?toolCall(input,'browser.read_page',{}):{content:'我已查看原始截图'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[read,screenshotCapability,ocr],execute:async request=>request.capability==='browser.read_page'?{success:true,output:{url:'http://localhost:8080/',text:''}}:request.capability==='browser.screenshot'?screenshotResult():{success:false,error:'未安装 OCR 依赖'}},options(connection,{imageCapability:'supported',approvalMode:'full',onActivity:activity=>activities.push(activity)}))
+  assert.ok(requests[1].messages.some(message=>Array.isArray(message.content)&&message.content.some(part=>part.type==='image_url')))
+ })
+ assert.equal(activities.find(activity=>activity.capability==='agent.image_ocr').status,'error')
+ assert.equal(activities.find(activity=>activity.capability==='browser.screenshot').status,'complete')
+})
+
+test('browser read failure after opening a page falls back to an approved screenshot',async()=>{
+ const open={...screenshotCapability,name:'browser.open',parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}}
+ const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
+ const calls=[];let approvals=0
+ await withModel((input,n)=>n===1?toolCall(input,'browser.open',{url:'http://localhost:8080/'}):n===2?toolCall(input,'browser.read_page',{}):{content:'已根据页面截图分析可见内容'},async(connection,requests)=>{
+  await runCoreChat({list:()=>[open,read,screenshotCapability],execute:async request=>{
+   calls.push(request.capability)
+   return request.capability==='browser.open'?{success:true,output:{url:'http://localhost:8080/',loading:false}}:request.capability==='browser.read_page'?{success:false,error:'正文读取失败'}:screenshotResult()
+  }},options(connection,{messages:[{role:'user',content:'查看已打开的日期网页'}],imageCapability:'supported',approvalMode:'ask',approve:async()=>{approvals++;return true}}))
+  assert.deepEqual(calls,['browser.open','browser.read_page','browser.screenshot'])
+  assert.equal(approvals,3)
+  assert.ok(requests[2].messages.some(message=>Array.isArray(message.content)&&message.content.some(part=>part.type==='image_url')))
+ })
+})
+
 test('text-only model retains screenshot for the user and waits instead of certifying visual success',async()=>{
  let outcome,text='',review;const activities=[]
  await withModel((input,n)=>n===1?toolCall(input,'browser.screenshot',{url:'http://localhost:8080/'}):{content:'我已经看图，全部通过'},async(connection,requests)=>{

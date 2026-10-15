@@ -805,7 +805,14 @@ def image_ocr(root,args):
             import pytesseract
             from PIL import Image
             language='+'.join(part.strip() for part in languages.split(',') if part.strip()) or None;text=pytesseract.image_to_string(Image.open(file),lang=language);confidence=None;provider='pytesseract'
-        except ImportError: raise ValueError('未安装 OCR 依赖。请安装 python/requirements.txt 后重试')
+        except ImportError:
+            executable=shutil.which('tesseract')
+            if not executable: raise ValueError('未安装 OCR 依赖或 Tesseract。请安装 python/requirements.txt 后重试')
+            command=[executable,str(file),'stdout']
+            if languages: command+=['-l','+'.join(part.strip() for part in languages.split(',') if part.strip())]
+            result=subprocess.run(command,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=30)
+            if result.returncode: raise ValueError('Tesseract OCR 不可用：'+result.stderr.strip()[:500])
+            text=result.stdout;confidence=None;provider='tesseract-cli'
         except Exception as error: raise ValueError('Tesseract OCR 不可用：'+str(error))
     return compact({'path':args['path'],'provider':provider,'languages':languages or 'auto','text':text[:100000],'characters':len(text),'confidence':confidence,'truncated':len(text)>100000})
 

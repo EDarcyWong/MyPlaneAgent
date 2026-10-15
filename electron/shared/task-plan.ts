@@ -16,6 +16,8 @@ export type TaskCompletionReview = {status:'complete'|'continue'|'needs_input'|'
 export type TaskItem = {
   id:string; title:string; acceptance:string;
   parentId?:string;depth?:number;childIds?:string[];
+  key?:string;dependsOn?:string[];mode?:'read'|'write'|'verify';parallel?:boolean;fileScope?:string[];
+  worker?:{id:string;mode:'read'|'write'|'verify';assignedAt:string;maxRounds:number;maxToolCalls:number;toolCalls:number};
   status:'pending'|'running'|'verifying'|'complete'|'blocked';
   attempts:number; summary:string; evidenceIds:string[];
   reviewQueue?:TaskReviewQueue;
@@ -27,4 +29,4 @@ export type TaskItem = {
   baseline?:TaskVerificationRun;baselineHistory?:TaskVerificationRun[];baselineUnavailableReason?:string;mutationStarted?:boolean;
   excludedProjectChecks?:Array<{createdAt:string;reason:string;rules:TaskVerificationRule[];baseline?:TaskVerificationRun;runs?:TaskVerificationRun[]}>;
 }
-export type TaskPlan = {scope?:import('./task-scope.js').TaskScope;needsReplan?:boolean;editProgress?:import('../main/agent/core/edit-progress.js').EditProgressState;taskId:string;workspace:string;items:TaskItem[];updatedAt:string}
+export type TaskPlan = {scope?:import('./task-scope.js').TaskScope;needsReplan?:boolean;graphVersion?:1;editProgress?:import('../main/agent/core/edit-progress.js').EditProgressState;taskId:string;workspace:string;items:TaskItem[];updatedAt:string}

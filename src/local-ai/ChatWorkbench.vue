@@ -17,7 +17,7 @@ import ContextUsageDisplay from './ContextUsageDisplay.vue'
 import ChatComposerSelect from './ChatComposerSelect.vue'
 import ChatPermissionSelect from './ChatPermissionSelect.vue'
 import ChatApprovalButton from './ChatApprovalButton.vue'
-import {visibleTaskPlan} from '../../electron/shared/task-plan-presentation'
+import {visibleTaskPlan,type VisibleTask} from '../../electron/shared/task-plan-presentation'
 
 const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>;showPerformanceLauncher:boolean;showInspectorLauncher:boolean}>()
 const emit = defineEmits<{models: [];performance: [];inspector: []}>()
@@ -33,7 +33,15 @@ const historyOpen = ref(false)
 const selectedArtifact = ref<ChatArtifact>()
 const artifacts = computed(()=>chatArtifacts(ch.messages))
 const taskList=computed(()=>ch.session?.taskPlan?visibleTaskPlan(ch.session.taskPlan):undefined)
+const taskRows=computed(()=>{
+  const rows:Array<VisibleTask&{depth:number}>=[]
+  const add=(entry:VisibleTask,depth:number)=>{rows.push({...entry,depth});for(const child of entry.children)add(child,depth+1)}
+  for(const entry of taskList.value?.items||[])add(entry,0)
+  return rows
+})
 const taskPanelOpen=ref(true)
+function toggleTaskPanel(){taskPanelOpen.value=!taskPanelOpen.value;if(taskPanelOpen.value)selectedArtifact.value=undefined}
+watch(selectedArtifact,value=>{if(value)taskPanelOpen.value=false})
 watch(artifacts,values=>{
  const selected=selectedArtifact.value
  if(!selected)return
@@ -74,14 +82,14 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
 </script>
 
 <template>
-  <main class="agent-workspace unified-workspace chat-workbench" @keydown.esc="historyOpen=false;selectedArtifact=undefined">
+  <main class="agent-workspace unified-workspace chat-workbench" :class="{'task-panel-visible':!!taskList&&taskPanelOpen}" :style="{'--composer-height':composerHeight+'px'}" @keydown.esc="historyOpen=false;selectedArtifact=undefined">
     <button v-if="historyOpen" class="agent-history-backdrop" aria-label="收起会话导航" @click="historyOpen=false"></button>
     <aside class="agent-history" :class="{expanded:historyOpen}">
       <header><strong>工作空间</strong><div class="agent-new-actions"><button class="agent-new" :disabled="locked" title="新建会话" aria-label="新建会话" @click="selectSession()"><EditPen/></button></div><button class="agent-icon agent-history-close" aria-label="收起会话导航" @click="historyOpen=false"><Close/></button></header>
       <label class="workspace-search"><Search/><input v-model="ch.sessionFilter" placeholder="搜索会话" aria-label="搜索会话"/><button v-if="ch.sessionFilter" class="agent-icon" aria-label="清除搜索" @click="ch.sessionFilter=''"><Close/></button></label>
       <ChatHistorySidebar :studio="studio" @open="selectSession"/>
     </aside>
-    <section class="agent-main" :class="{'is-welcome':!hasConversation,'has-message-outline':ch.messages.filter(message=>message.role==='user').length>1}" :style="{'--composer-height':composerHeight+'px'}">
+    <section class="agent-main" :class="{'is-welcome':!hasConversation,'has-message-outline':ch.messages.filter(message=>message.role==='user').length>1}">
       <header class="agent-toolbar">
         <button class="agent-icon agent-history-toggle" aria-label="展开会话导航" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/></button>
         <div class="workspace-heading"><strong>{{hasConversation?ch.session?.title:'新会话'}}</strong><button type="button" class="agent-workspace-picker" :disabled="locked" :title="ch.chatWorkspacePath||'选择工作目录，启用文件与命令工具'" aria-label="选择聊天工作目录" @click="ch.chooseChatWorkspace"><FolderOpened/><span>{{ch.chatWorkspacePath.split(/[\\/]/).filter(Boolean).pop()||'选择工作目录'}}</span></button></div>
@@ -91,7 +99,7 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
         <button type="button" class="agent-icon" title="内置浏览器" aria-label="打开内置浏览器" @click="openBrowser"><Connection/></button>
         <SessionExportMenu v-if="ch.session?.messages.length" :disabled="locked" @select="ch.exportSession"/>
 <button v-if="artifacts.length" class="artifact-toggle" @click="selectedArtifact=selectedArtifact?undefined:artifacts[artifacts.length-1]">产物 {{artifacts.length}}</button>
-        <button v-if="taskList" type="button" class="task-list-toggle" aria-controls="floating-task-list" :aria-expanded="taskPanelOpen" @click="taskPanelOpen=!taskPanelOpen">任务 {{taskList.completed}}/{{taskList.total}}</button>
+        <button v-if="taskList" type="button" class="task-list-toggle" aria-controls="floating-task-list" :aria-expanded="taskPanelOpen" @click="toggleTaskPanel">任务 {{taskList.completed}}/{{taskList.total}}</button>
         <span class="workspace-local"><i :class="{online:ch.online}"/>{{ch.online?'已连接':'未连接'}}</span>
       </header>
       <div ref="scroller" class="agent-scroll message-scroll" :class="{'is-empty':!hasConversation}" @scroll="ch.trackScroll">
@@ -99,16 +107,6 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
         <WorkspaceChatMessages v-else :messages="ch.messages" :sending="ch.sending" @copy="ch.copy" @regenerate="ch.send(true)" @open-artifact="selectedArtifact=$event" @open-link="ch.openLink"/>
       </div>
       <ConversationOutline :messages="ch.messages" :scroller="scroller" :session-id="ch.session?.id"/>
-      <aside v-if="taskList&&taskPanelOpen" id="floating-task-list" class="floating-task-list" aria-label="当前任务清单">
-        <header><div><strong>任务进度</strong><small>{{taskList.completed}} / {{taskList.total}} 已完成</small></div><button type="button" class="agent-icon" aria-label="收起任务清单" @click="taskPanelOpen=false"><Close/></button></header>
-        <p v-if="ch.session?.taskPlan?.scope?.goal" class="task-list-goal" :title="ch.session.taskPlan.scope.goal">{{ch.session.taskPlan.scope.goal}}</p>
-        <ol><li v-for="entry in taskList.items" :key="entry.item.id" :class="'task-'+entry.status">
-          <span class="task-list-mark" aria-hidden="true">{{entry.status==='complete'?'✓':entry.status==='blocked'?'!':entry.status==='running'||entry.status==='verifying'?'•':'○'}}</span>
-          <div><strong :title="entry.item.title">{{entry.item.title}}</strong><small>{{entry.status==='blocked'&&entry.attention?.outcome==='needs_input'?'待确认':({pending:'待开始',running:'进行中',verifying:'核对中',complete:'已完成',blocked:'需处理'})[entry.status]}}</small>
-            <p v-if="entry.status==='blocked'" :title="entry.attention?.completionReview?.reason||entry.attention?.summary">{{entry.attention?.completionReview?.reason||entry.attention?.summary||'请查看执行记录'}}</p>
-          </div>
-        </li></ol>
-      </aside>
       <div ref="composerElement" class="agent-composer-wrap">
         <VisualReviewCard v-if="visualItem" :item="visualItem" :messages="ch.messages" :disabled="locked" @decide="decideVisual" @open="ch.openLink"/>
         <section v-if="ch.chatModelLoading" class="chat-model-loading" aria-label="模型切换进度" :aria-busy="true">
@@ -132,6 +130,17 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
         </form>
       </div>
     </section>
+    <aside v-if="taskList&&taskPanelOpen" id="floating-task-list" class="floating-task-list" aria-label="当前任务清单">
+      <header><div><strong>任务进度</strong><small>{{taskList.completed}} / {{taskList.total}} 已完成</small></div><button type="button" class="agent-icon" aria-label="收起任务清单" @click="taskPanelOpen=false"><Close/></button></header>
+      <div class="task-list-progress" role="progressbar" aria-label="任务完成进度" :aria-valuenow="taskList.completed" aria-valuemin="0" :aria-valuemax="taskList.total"><span :style="{width:`${taskList.total?taskList.completed/taskList.total*100:0}%`}"/></div>
+      <p v-if="ch.session?.taskPlan?.scope?.goal" class="task-list-goal" :title="ch.session.taskPlan.scope.goal"><span>当前目标</span>{{ch.session.taskPlan.scope.goal}}</p>
+      <ol><li v-for="entry in taskRows" :key="entry.item.id" :class="'task-'+entry.status" :style="{'--task-depth':entry.depth}">
+        <span class="task-list-mark" aria-hidden="true">{{entry.status==='complete'?'✓':entry.status==='blocked'?'!':entry.status==='running'||entry.status==='verifying'?'…':'○'}}</span>
+        <div><strong :title="entry.item.title">{{entry.item.title}}</strong><small>{{entry.status==='blocked'&&entry.attention?.outcome==='needs_input'?'待确认':({pending:'待开始',running:'进行中',verifying:'核对中',complete:'已完成',blocked:'需处理'})[entry.status]}}<template v-if="entry.item.worker"> · 子智能体 {{({read:'读取',write:'修改',verify:'验收'})[entry.item.worker.mode]}}</template></small>
+          <p v-if="entry.status==='blocked'" :title="entry.attention?.completionReview?.reason||entry.attention?.summary">{{entry.attention?.completionReview?.reason||entry.attention?.summary||'请查看执行记录'}}</p>
+        </div>
+      </li></ol>
+    </aside>
     <ChatArtifactPanel v-if="selectedArtifact" :artifact="selectedArtifact" @close="selectedArtifact=undefined" @copy="ch.copy"/>
     <ElDialog v-model="settingsOpen" class="agent-settings agent-settings-dialog" modal-class="agent-settings-overlay" width="min(500px, calc(100vw - 32px))" :style="settingsTheme" :show-close="false" append-to-body align-center @closed="focusSettingsTrigger">
       <template #header><div class="agent-settings-header"><div><strong>会话设置</strong><small>调整联网与生成参数</small></div><button type="button" class="agent-icon" aria-label="关闭会话设置" @click="settingsOpen=false"><Close/></button></div></template>
@@ -174,11 +183,14 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
 .window-launcher{display:inline-flex;align-items:center;gap:5px;width:auto;padding:0 8px;white-space:nowrap;font-size:11px}
 .window-launcher svg{width:16px;height:16px}
 @container studio (max-width:1100px){.window-launcher{width:30px;padding:0;justify-content:center}.window-launcher span{display:none}}
-.task-list-toggle{flex:none;border:1px solid var(--s-border);border-radius:8px;padding:5px 9px;background:var(--s-panel);color:var(--s-text);font-size:11px;white-space:nowrap;cursor:pointer}.task-list-toggle:hover{background:var(--s-muted)}
-.floating-task-list{position:absolute;z-index:6;top:74px;right:16px;bottom:calc(var(--composer-height,180px) + 22px);width:238px;min-height:120px;display:flex;flex-direction:column;border:1px solid var(--s-border);border-radius:12px;background:var(--s-panel);box-shadow:0 8px 28px #0002;color:var(--s-text);overflow:hidden}
-.floating-task-list>header{display:flex;align-items:center;justify-content:space-between;padding:12px 12px 8px}.floating-task-list>header>div{display:flex;flex-direction:column;gap:3px;min-width:0}.floating-task-list>header strong{font-size:12px;font-weight:600}.floating-task-list>header small{font-size:10px;color:var(--s-dim)}.floating-task-list>header button{width:24px;height:24px;padding:4px}.floating-task-list>header svg{width:14px;height:14px}
-.task-list-goal{margin:0 12px 9px;color:var(--s-dim);font-size:11px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
-.floating-task-list ol{list-style:none;margin:0;padding:0 8px 10px;overflow:auto;min-height:0}.floating-task-list li{display:flex;gap:9px;padding:9px 5px;border-top:1px solid var(--s-border);font-size:11px;line-height:1.4}.floating-task-list li>div{min-width:0}.floating-task-list li strong{display:block;font-size:11px;font-weight:500;overflow-wrap:anywhere}.floating-task-list li small{display:block;margin-top:3px;color:var(--s-dim)}.floating-task-list li p{margin:5px 0 0;color:var(--s-danger);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.task-list-mark{display:grid;place-items:center;flex:none;width:17px;height:17px;border:1px solid var(--s-border);border-radius:50%;font-size:11px;color:var(--s-dim)}.task-complete .task-list-mark{background:#40976c;border-color:#40976c;color:white}.task-running .task-list-mark,.task-verifying .task-list-mark{background:var(--s-accent-soft);border-color:var(--s-accent);color:var(--s-accent)}.task-blocked .task-list-mark{border-color:var(--s-danger);color:var(--s-danger)}
-@container studio (max-width:1030px){.floating-task-list{right:12px;width:min(300px,calc(100% - 24px));box-shadow:0 12px 36px #0004}}
+.task-list-toggle{flex:none;border:1px solid var(--s-border);border-radius:8px;padding:5px 9px;background:var(--s-panel);color:var(--s-text);font-size:11px;font-weight:550;white-space:nowrap;cursor:pointer}.task-list-toggle:hover{background:var(--s-muted)}.task-list-toggle:focus-visible{outline:2px solid var(--s-accent);outline-offset:2px}
+.floating-task-list{display:flex;flex:0 0 320px;flex-direction:column;min-width:0;min-height:0;margin:10px 10px 10px 0;border:1px solid var(--s-border);border-radius:16px;background:var(--s-panel);color:var(--s-text);box-shadow:0 3px 12px #0000000b;overflow:hidden}
+.floating-task-list>header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:18px 18px 10px}.floating-task-list>header>div{display:flex;flex-direction:column;gap:3px;min-width:0}.floating-task-list>header strong{font-size:14px;font-weight:650;color:var(--s-text)}.floating-task-list>header small{font-size:11px;color:var(--s-dim)}.floating-task-list>header button{width:28px;height:28px;padding:5px;border-radius:8px;color:var(--s-dim)}.floating-task-list>header button:hover{background:var(--s-muted);color:var(--s-text)}.floating-task-list>header svg{width:15px;height:15px}
+.task-list-progress{height:3px;flex:none;margin:0 18px 16px;border-radius:99px;background:var(--s-muted);overflow:hidden}.task-list-progress span{display:block;height:100%;border-radius:inherit;background:var(--s-text);transition:width .25s ease}
+.task-list-goal{margin:0 18px 18px;color:var(--s-dim);font-size:11px;line-height:1.5;overflow:hidden;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}.task-list-goal span{display:block;margin-bottom:4px;color:var(--s-text);font-size:11px;font-weight:600}
+.floating-task-list ol{list-style:none;margin:0 14px 14px;padding:8px 4px;overflow:auto;min-height:0;border:1px solid var(--s-border);border-radius:12px;background:var(--s-panel)}.floating-task-list li{display:flex;gap:10px;min-height:44px;padding:10px 10px;font-size:11px;line-height:1.5}.floating-task-list li>div{min-width:0}.floating-task-list li strong{display:block;font-size:12px;font-weight:550;overflow-wrap:anywhere}.floating-task-list li small{display:block;margin-top:3px;color:var(--s-dim)}.floating-task-list li p{margin:7px 0 0;color:var(--s-danger);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.task-list-mark{display:grid;place-items:center;flex:none;width:17px;height:17px;margin-top:1px;border:1px solid var(--s-dim);border-radius:50%;font-size:11px;color:var(--s-dim)}.task-complete .task-list-mark{background:var(--s-dim);border-color:var(--s-dim);color:var(--s-panel)}.task-running .task-list-mark,.task-verifying .task-list-mark{border-color:var(--s-text);color:var(--s-text);font-size:12px;font-weight:700}.task-running strong,.task-verifying strong{color:var(--s-text)}.task-blocked .task-list-mark{border-color:var(--s-danger);color:var(--s-danger)}
+@container studio (max-width:1050px){.chat-workbench.task-panel-visible>.agent-history:not(.expanded){display:none}.chat-workbench.task-panel-visible .agent-toolbar .agent-history-toggle{display:grid}.chat-workbench.task-panel-visible>.agent-history.expanded{display:flex;position:absolute;left:0;top:0;bottom:0;width:260px;z-index:10;box-shadow:var(--s-shadow)}.chat-workbench.task-panel-visible>.agent-history-backdrop{display:block;position:absolute;inset:0;z-index:9;background:#101a1433;border:0}.floating-task-list{flex-basis:280px}}
+@container studio (max-width:650px){.floating-task-list{position:absolute;z-index:6;top:66px;right:8px;bottom:calc(var(--composer-height,180px) + 14px);width:min(310px,calc(100% - 24px));min-height:0;margin:0;box-shadow:0 12px 36px #0003}}
+.floating-task-list li{padding-left:calc(10px + var(--task-depth,0) * 13px)}
 @media(max-height:680px){.floating-task-list{top:60px;bottom:calc(var(--composer-height,180px) + 8px)}}
 </style>

@@ -29,3 +29,14 @@ test('single task stays visible while its checks remain internal',()=>{
  assert.equal(view.items[0].item.title,item.title)
  assert.equal(view.items[0].status,'blocked')
 })
+
+test('nested worker progress is visible beneath the parent milestone',()=>{
+ const items=[
+  {id:'leaf',parentId:'child',title:'读取源码',status:'running',worker:{id:'worker-leaf',mode:'read',assignedAt:'now',maxRounds:8}},
+  {id:'child',parentId:'root',childIds:['leaf'],title:'分析模块',status:'pending'},
+  {id:'root',childIds:['child'],title:'完成项目',status:'pending'}
+ ]
+ const view=visibleTaskPlan({taskId:'task',workspace:'/',items,updatedAt:''})
+ assert.equal(view.items[0].status,'running')
+ assert.equal(view.items[0].children[0].children[0].item.worker.id,'worker-leaf')
+})

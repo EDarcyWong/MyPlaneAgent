@@ -48,6 +48,7 @@ python -m pip install -r python/requirements.txt
 ```
 
 macOS/Linux 将上述命令中的 `python` 换成 `python3`。依赖清单位于 [python/requirements.txt](python/requirements.txt)，包含 pypdf、Pillow 和 RapidOCR。
+图片 OCR 在未安装 Python OCR 包时也会尝试调用本机 Tesseract；能识别的语言取决于已安装的 Tesseract 语言包。
 
 ### 开发模式
 
