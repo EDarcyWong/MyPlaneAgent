@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import {waitReasonLabels} from '../../electron/shared/task-contract'
 import VisualReviewCard from './VisualReviewCard.vue'
 import {visualReviewCard,visualDecisionText,type VisualDecision} from '../../electron/shared/visual-review'
 import ConversationOutline from './ConversationOutline.vue'
@@ -33,6 +34,7 @@ const historyOpen = ref(false)
 const selectedArtifact = ref<ChatArtifact>()
 const artifacts = computed(()=>chatArtifacts(ch.messages))
 const taskList=computed(()=>ch.session?.taskPlan?visibleTaskPlan(ch.session.taskPlan):undefined)
+const activeWorkers=computed(()=>ch.session?.taskPlan?.items.filter(item=>item.worker&&(item.status==='running'||item.status==='verifying')).length||0)
 const taskRows=computed(()=>{
   const rows:Array<VisibleTask&{depth:number}>=[]
   const add=(entry:VisibleTask,depth:number)=>{rows.push({...entry,depth});for(const child of entry.children)add(child,depth+1)}
@@ -131,12 +133,12 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
       </div>
     </section>
     <aside v-if="taskList&&taskPanelOpen" id="floating-task-list" class="floating-task-list" aria-label="当前任务清单">
-      <header><div><strong>任务进度</strong><small>{{taskList.completed}} / {{taskList.total}} 已完成</small></div><button type="button" class="agent-icon" aria-label="收起任务清单" @click="taskPanelOpen=false"><Close/></button></header>
+      <header><div><strong>任务进度</strong><small>{{taskList.completed}} / {{taskList.total}} 已完成<template v-if="activeWorkers"> · {{activeWorkers}} 个子任务执行中</template></small></div><button type="button" class="agent-icon" aria-label="收起任务清单" @click="taskPanelOpen=false"><Close/></button></header>
       <div class="task-list-progress" role="progressbar" aria-label="任务完成进度" :aria-valuenow="taskList.completed" aria-valuemin="0" :aria-valuemax="taskList.total"><span :style="{width:`${taskList.total?taskList.completed/taskList.total*100:0}%`}"/></div>
       <p v-if="ch.session?.taskPlan?.scope?.goal" class="task-list-goal" :title="ch.session.taskPlan.scope.goal"><span>当前目标</span>{{ch.session.taskPlan.scope.goal}}</p>
       <ol><li v-for="entry in taskRows" :key="entry.item.id" :class="'task-'+entry.status" :style="{'--task-depth':entry.depth}">
         <span class="task-list-mark" aria-hidden="true">{{entry.status==='complete'?'✓':entry.status==='blocked'?'!':entry.status==='running'||entry.status==='verifying'?'…':'○'}}</span>
-        <div><strong :title="entry.item.title">{{entry.item.title}}</strong><small>{{entry.status==='blocked'&&entry.attention?.outcome==='needs_input'?'待确认':({pending:'待开始',running:'进行中',verifying:'核对中',complete:'已完成',blocked:'需处理'})[entry.status]}}<template v-if="entry.item.worker"> · 子智能体 {{({read:'读取',write:'修改',verify:'验收'})[entry.item.worker.mode]}}</template></small>
+        <div><strong :title="entry.item.title">{{entry.item.title}}</strong><small>{{entry.item.runtime?.status==='waiting'&&entry.item.runtime.waitReason?waitReasonLabels[entry.item.runtime.waitReason]:entry.status==='blocked'&&entry.attention?.outcome==='needs_input'?'待确认':({pending:'待开始',running:'进行中',verifying:'核对中',complete:'已完成',blocked:'需处理'})[entry.status]}}<template v-if="entry.item.worker"> · 子智能体 {{({read:'读取',write:'修改',verify:'验收'})[entry.item.worker.mode]}}</template></small>
           <p v-if="entry.status==='blocked'" :title="entry.attention?.completionReview?.reason||entry.attention?.summary">{{entry.attention?.completionReview?.reason||entry.attention?.summary||'请查看执行记录'}}</p>
         </div>
       </li></ol>

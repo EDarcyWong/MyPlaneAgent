@@ -211,17 +211,20 @@ test('empty browser text keeps a screenshot for the user without claiming text-o
 test('screenshot OCR supplies preliminary text to a text-only model and removes its temporary image',async()=>{
  const read={...screenshotCapability,name:'browser.read_page',parameters:{type:'object',properties:{}}}
  const ocr={...screenshotCapability,name:'agent.image_ocr',source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
- const activities=[],calls=[];let outcome,temporaryImage
+ const activities=[],calls=[],hooks=[],executionContexts=[];let outcome,temporaryImage
  await withModel((input,n)=>n===1?toolCall(input,'browser.read_page',{}):{content:'OCR 显示页面日期；仍需核对当地工作日规则。'},async(connection,requests)=>{
   await runCoreChat({list:()=>[read,screenshotCapability,ocr],execute:async request=>{
-   calls.push(request.capability)
+   calls.push(request.capability);executionContexts.push(request.execution)
    if(request.capability==='browser.read_page')return {success:true,output:{url:'http://localhost:8080/',text:''}}
    if(request.capability==='browser.screenshot')return screenshotResult()
    temporaryImage=path.join(request.workspace,request.args.path)
    assert.ok(existsSync(temporaryImage))
    return {success:true,output:{provider:'test-ocr',text:'2026年10月16日 星期五',confidence:0.91}}
-  }},options(connection,{messages:[{role:'user',content:'查看日期网页'}],imageCapability:'unsupported',approvalMode:'full',onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value}))
+  }},options(connection,{executionContext:{taskId:'ocr-task',workerId:'worker'},beforeExecution:cap=>{hooks.push('before:'+cap.name)},afterExecution:cap=>{hooks.push('after:'+cap.name)},messages:[{role:'user',content:'查看日期网页'}],imageCapability:'unsupported',approvalMode:'full',onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value}))
   assert.deepEqual(calls,['browser.read_page','browser.screenshot','agent.image_ocr'])
+  assert.deepEqual(hooks,calls.flatMap(name=>['before:'+name,'after:'+name]))
+  assert.ok(executionContexts.every(context=>context.taskId==='ocr-task'&&context.workerId==='worker'))
+  assert.equal(executionContexts[2].parentEvidenceId,executionContexts[1].activityId)
   assert.ok(requests[1].messages.some(message=>typeof message.content==='string'&&message.content.includes('2026年10月16日 星期五')))
   assert.ok(requests.every(request=>request.messages.every(message=>!Array.isArray(message.content)||message.content.every(part=>part.type!=='image_url'))))
  },()=>({content:JSON.stringify({status:'complete',reason:'OCR 文字可供初步判断'})}))
@@ -948,6 +951,37 @@ test('productive tasks automatically continue past twenty rounds and still requi
  await withModel((input,n)=>n<=25?toolCall(input,'agent.web_search',{query:'step '+n}):{content:'已完成全部检查'},async(connection)=>{
   await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>({success:true,output:'result '+ ++executed})},options({...connection,contextLength:131072},{onOutcome:value=>outcome=value,onContent:value=>text+=value}))
   assert.equal(executed,25);assert.equal(outcome,'complete');assert.equal(text,'已完成全部检查')
+ })
+})
+
+test('a saved eight-round subagent continues through twenty-five productive rounds',async()=>{
+ let executed=0,outcome='',text=''
+ await withModel((input,n)=>n<=25?toolCall(input,'agent.read_file',{path:'part-'+n+'.txt'}):{content:'已读取全部资料'},async connection=>{
+  const workspace='/tmp/myplane-round-limit',items=parseTaskItems(JSON.stringify({steps:[{title:'读取项目资料',acceptance:'取得所有资料并给出结论',kind:'inspect'}]}))
+  items[0].worker={id:'saved-worker',mode:'read',assignedAt:'before',maxRounds:8,maxToolCalls:32,toolCalls:0}
+  items[0].status='blocked';items[0].attempts=1
+  const plan={taskId:'round-limit',workspace,graphVersion:1,items,updatedAt:''}
+  const reader={...capability('agent.read_file','read'),parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
+  await runTaskPlan(options({...connection,contextLength:131072},{workspace,filesEnabled:true,approvalMode:'full',messages:[{role:'user',content:'读取项目全部资料并给出结论'}],onOutcome:value=>outcome=value,onContent:value=>text+=value}),{taskId:plan.taskId,plan,save:()=>{}},step=>runCoreChat({list:()=>[reader],execute:async()=>({success:true,output:'unique source '+ ++executed})},step))
+  assert.equal(executed,25);assert.equal(outcome,'complete');assert.equal(items[0].status,'complete')
+  assert.match(text,/已读取全部资料/);assert.doesNotMatch(text,/达到设置的执行上限/)
+  assert.equal(items[0].worker.maxRounds,undefined)
+ })
+})
+
+test('an exhausted saved subagent completes eighty-five more tool calls with automatic budgets',async()=>{
+ let executed=0,outcome='',text=''
+ await withModel((input,n)=>n<=85?toolCall(input,'agent.read_file',{path:'part-'+n+'.txt'}):{content:'已读取全部资料'},async connection=>{
+  const workspace='/tmp/myplane-tool-limit',items=parseTaskItems(JSON.stringify({steps:[{title:'读取项目资料',acceptance:'取得所有资料并给出结论',kind:'inspect'}]}))
+  items[0].worker={id:'saved-worker',mode:'read',assignedAt:'before',maxRounds:8,maxToolCalls:32,toolCalls:32}
+  items[0].status='blocked';items[0].attempts=1;items[0].evidenceIds=['previous-source']
+  const plan={taskId:'tool-limit',workspace,graphVersion:1,items,updatedAt:''}
+  const reader={...capability('agent.read_file','read'),parameters:{type:'object',properties:{path:{type:'string'}},required:['path']}}
+  await runTaskPlan(options({...connection,contextLength:131072},{workspace,filesEnabled:true,approvalMode:'full',messages:[{role:'user',content:'读取项目全部资料并给出结论'}],onOutcome:value=>outcome=value,onContent:value=>text+=value}),{taskId:plan.taskId,plan,save:()=>{}},step=>runCoreChat({list:()=>[reader],execute:async()=>({success:true,output:'unique source '+ ++executed})},step))
+  assert.equal(executed,85);assert.equal(outcome,'complete');assert.equal(items[0].status,'complete')
+  assert.match(text,/已读取全部资料/);assert.doesNotMatch(text,/达到.*上限/)
+  assert.equal(items[0].worker.maxToolCalls,undefined);assert.equal(items[0].worker.toolCalls,117)
+  assert.equal(items[0].evidenceIds.length,86);assert.ok(items[0].evidenceIds.includes('previous-source'))
  })
 })
 

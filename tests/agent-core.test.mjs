@@ -93,9 +93,16 @@ test('migrated Agent tools load as Skills and require approval for file writes',
     for await (const chunk of request) body += chunk
     const input = JSON.parse(body)
     const plan = { reasoning: 'Create a text file', steps: [{ capability: 'agent.write_file', args: { path: 'created.txt', content: 'from skill' } }] }
-    const content = String(input.messages.at(-1)?.content).includes('工具结果') ? '文件已经创建。' : JSON.stringify(plan)
+    const planned = input.messages.some(m => String(m.content).includes('现在仅规划当前用户任务'))
+    const review = input.messages.some(m => String(m.content).includes('你是任务完成检查器'))
+    const alias = input.tools?.find(tool=>tool.function.name.endsWith('_agent_read_file'))?.function.name
+    const hasRead = input.messages.some(m=>m.role==='tool')
+    const message = planned ? {content:JSON.stringify({steps:[{title:'确认目标文件内容',kind:'inspect',acceptance:'created.txt 包含 from skill',verification:[{kind:'file',path:'created.txt',contains:'from skill'}]}]})}
+      : review ? {content:JSON.stringify({status:'complete',reason:'文件内容已读取且符合要求'})}
+      : alias&&!hasRead ? {tool_calls:[{id:'workflow-read',type:'function',function:{name:alias,arguments:JSON.stringify({path:'created.txt'})}}]}
+      : {content:alias||hasRead||String(input.messages.at(-1)?.content).includes('工具结果')?'文件已经创建。':JSON.stringify(plan)}
     response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }))
+    response.end(JSON.stringify({ choices: [{ finish_reason: message.tool_calls?'tool_calls':'stop', message }] }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()

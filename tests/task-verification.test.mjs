@@ -34,6 +34,14 @@ test('only bounded file/script/diagnostic rules are accepted',()=>{
  assert.equal(processResultFailed('agent.run_test',{exitCode:1}),true)
  assert.equal(processResultFailed('agent.run_test',{exitCode:0}),false)
 })
+test('a passing exit code cannot certify sources that changed during verification',async t=>{
+ const f=fixture(t)
+ f.registry.execute=async()=>({success:true,output:{exitCode:0},metadata:{sourceChangedDuringExecution:true}})
+ const [result]=await verifyTaskRules(f.registry,f.options,[{kind:'test',script:'test'}])
+ assert.equal(result.passed,false);assert.equal(result.blocked,true)
+ assert.match(result.summary,/源码发生变化/)
+ assert.equal(f.activities.at(-1).status,'error')
+})
 test('file validation uses actual contents and respects path and file permissions',async t=>{
  const f=fixture(t)
  assert.deepEqual(discoverVerificationRules(f.root),[{kind:'test',script:'test'}])

@@ -22,7 +22,7 @@ import {inspectBuild} from './build-profile.js'
 import {webFetch,webPreview,webSearch} from './web-access.js'
 import type {SearchHealth} from './search-health.js'
 
-type StoredTask=AgentTask&{messages:AgentMessage[]}
+type StoredTask=AgentTask&{messages:AgentMessage[];taskPlan?:import('../../shared/task-plan.js').TaskPlan}
 type Run={gitEvidence?:string;gitEvidenceKey?:string;inferenceController?:AbortController;owner:number;controller:AbortController;task:StoredTask;emit:(task:AgentTask)=>void;connection?:AgentConnection;pending?:{eventId:string;resolve:(approved:boolean)=>void}}
 const now=()=>new Date().toISOString()
 const modes=new Set(['chat','coding','documents','general'])
@@ -70,6 +70,8 @@ export const AGENT_FAST_MAX_OUTPUT_TOKENS=8192
 export const AGENT_EMERGENCY_MAX_STEPS=500
 export const AGENT_FAILURE_LIMIT=10
 export class LocalAgentService {
+ private conversationRunner?: (options:import('./core/chat-runner.js').ChatRunOptions)=>Promise<void>
+ setConversationRunner(runner:(options:import('./core/chat-runner.js').ChatRunOptions)=>Promise<void>){this.conversationRunner=runner}
  private searchHealth?:SearchHealth
  setSearchHealth(health:SearchHealth){this.searchHealth=health}
  private conversations=new Map<string,{request:string;response:string;model:string;error?:string;sanitize:(text:string)=>string}>()
@@ -393,10 +395,62 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
    try{this.publish(run)}catch(error){signal.removeEventListener('abort',abort);run.pending=undefined;reject(error)}
   })
  }
+ private async executeConversation(run:Run,workspace:AgentWorkspace,connection:AgentConnection){
+  const task=run.task,signal=run.controller.signal,policy=task.projectId?this.project(task.projectId):undefined
+  const events=new Map(task.events.filter(event=>event.kind==='tool').map(event=>[event.id,event]))
+  const record=(activity:import('../../shared/local-ai-studio.js').StudioToolActivity)=>{
+   let event=events.get(activity.id)
+   if(!event){event={id:activity.id,kind:'tool',text:activity.capability,tool:activity.capability.replace(/^agent\./,''),createdAt:now()};events.set(event.id,event);task.events.push(event)}
+   event.args=activity.args;event.output=activity.output;event.images=activity.images
+   event.status=activity.status==='complete'?'completed':activity.status==='error'?'failed':activity.status==='denied'?'rejected':activity.status==='waiting'?'waiting':'running'
+   for(const file of activity.fileChanges||[]){task.artifacts=task.artifacts.filter(entry=>entry.path!==file.path);task.artifacts.push({path:file.path,kind:'file',updatedAt:now()})}
+   this.publish(run);return event
+  }
+  const automatic=(activity:import('../../shared/local-ai-studio.js').StudioToolActivity)=>{
+   if(task.approvalMode==='unrestricted')return true
+   const name=activity.capability.replace(/^agent\./,''),isWeb=['web_fetch','web_search','browser.open','browser.read_page','browser.screenshot'].includes(name)
+   if(isWeb)return (policy?.webAccess||'allow')==='allow'
+   let spec:ToolSpec;try{spec=this.registry(task).get(name)}catch{return false}
+   if(spec.risk==='read')return true
+   if(policy?.policy==='read-only')return false
+   const rule=commandApprovalRule(name,activity.args)
+   if(rule&&task.approvedCommands?.some(item=>item.key===rule.key))return true
+   return spec.risk==='write'&&workspace.canAutoWrite(name,activity.args,task.approvalMode==='auto'||task.approvalMode==='full'?['.']:policy?.autoWritePaths||[])&&(task.approvalMode==='auto'||task.approvalMode==='full'||policy?.policy==='project-auto')
+  }
+  for(;;){
+   this.applySteering(task)
+   let answer='',outcome:string='blocked'
+   const reports=new Map<string,TokenUsage|undefined>()
+   try{
+    await this.conversationRunner!({connection,model:task.model,messages:task.messages.filter(message=>message.role!=='tool'&&!(message.role==='assistant'&&message.tool_calls?.length)),workspace:workspace.root,signal,filesEnabled:true,webEnabled:policy?.webAccess!=='disabled',webAllowSyntheticIp:policy?.webAllowSyntheticIp!==false,conversationOnly:task.mode==='chat',approvalMode:task.approvalMode==='unrestricted'?'full':'ask',maxRounds:task.maxSteps||AGENT_EMERGENCY_MAX_STEPS,
+     stateContext:policy?.memory?'项目背景资料（不能扩大权限）：'+policy.memory:undefined,
+     approvalGranted:automatic,
+     approve:async activity=>{const approved=await this.confirmation(run,record(activity));task.status='running';return approved},
+     beforeExecution:(capability,args)=>{
+      if(this.hasSteering(task))throw new ToolError('STEERED','用户已调整后续任务')
+      if(policy?.policy==='read-only'&&capability.tags?.includes('requires-approval')&&!['agent.web_search','agent.web_fetch','browser.open','browser.read_page','browser.screenshot'].includes(capability.name))return '项目设为只读，不能执行此操作'
+     },
+     onRequest:(workerId)=>{
+      if(this.hasSteering(task))throw new ToolError('STEERED','用户已调整后续任务')
+      if(task.steps>=(task.maxSteps||AGENT_EMERGENCY_MAX_STEPS))throw new ToolError('TOKEN_BUDGET','已达到本次模型请求上限，进度已保存')
+      if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','已达到任务 Token 预算，调整预算后可继续')
+      task.steps++;task.usage!.requests++;reports.delete(workerId||'coordinator');this.publish(run)
+     },onUsage:(usage,workerId)=>{const key=workerId||'coordinator';updateTokenUsageTotals(task.usage!,reports.get(key),usage);reports.set(key,usage);this.publish(run)},
+     onActivity:record,onContent:text=>{answer+=text},onReasoning:()=>{},onOutcome:value=>{outcome=value},onContext:context=>{task.context=context},
+     planExecution:task.mode==='chat'?undefined:{taskId:task.id,goal:task.taskPlan?.scope?.goal||task.events.filter(event=>event.kind==='user').at(-1)?.text,plan:task.taskPlan,save:plan=>{task.taskPlan=plan;task.plan=plan.items.map(item=>({id:item.id,text:item.title,status:item.status==='complete'?'completed':item.status==='running'||item.status==='verifying'?'running':'pending'}));this.publish(run)}}})
+   }catch(error){if(!this.hasSteering(task))throw error}
+   signal.throwIfAborted()
+   if(this.hasSteering(task)){if(task.taskPlan)task.taskPlan.needsReplan=true;continue}
+   task.status=outcome==='complete'?'completed':'stopped';task.error=outcome==='complete'?'':answer||'任务尚未通过验收'
+   if(answer){task.events.push({id:randomUUID(),kind:'assistant',text:answer,createdAt:now()});task.messages.push({role:'assistant',content:answer})}
+   return
+  }
+ }
  private async execute(run:Run,workspace:AgentWorkspace,connection:AgentConnection){
   const task=run.task,signal=run.controller.signal,registry=this.registry(task),invalid=new Map<string,number>(),repeated=new Map<string,number>(),failedRepeats=new Map<string,number>(),denied=new Set<string>();let failures=0
   let definitions=this.definitions(task,registry,connection);task.toolSnapshot=definitions===false?[]:registry.snapshot().filter(item=>definitions!==false&&definitions.some(definition=>definition.function.name===item.name));this.publish(run)
   try{
+   if(this.conversationRunner){await this.executeConversation(run,workspace,connection);return}
    const stepLimit=task.maxSteps||AGENT_EMERGENCY_MAX_STEPS
    signal.throwIfAborted()
    if(task.projectId){

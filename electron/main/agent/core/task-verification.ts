@@ -1,3 +1,4 @@
+import {workspaceVersion} from './evidence-version.js'
 import fs from 'node:fs'
 import {createHash,randomUUID} from 'node:crypto'
 import {AgentWorkspace} from '../workspace.js'
@@ -31,21 +32,33 @@ export function processResultFailed(name:string,output:unknown){
   return processResultTools.has(name)&&typeof result.exitCode==='number'&&result.exitCode!==0
 }
 export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRunOptions,rules:TaskVerificationRule[]):Promise<TaskVerificationResult[]>{
+  let versionBefore:string|undefined
   const result=(rule:TaskVerificationRule,passed:boolean,summary:string,blocked=false,activityId?:string,data:Record<string,unknown>={}):TaskVerificationResult=>{
     const issues=passed?{issues:[],issuesComplete:true}:verificationIssues(rule,data,summary,options.workspace,blocked)
-    return {rule,passed,blocked,summary:summary.slice(0,6000),fingerprint:createHash('sha256').update(JSON.stringify([rule,passed,issues.issues.map(issue=>issue.key).sort()])).digest('hex'),activityId,...issues}
+    return {rule,passed,blocked,sourceVersion:versionBefore&&versionBefore===workspaceVersion(options.workspace)?versionBefore:undefined,summary:summary.slice(0,6000),fingerprint:createHash('sha256').update(JSON.stringify([rule,passed,issues.issues.map(issue=>issue.key).sort()])).digest('hex'),activityId,...issues}
   }
   const results:TaskVerificationResult[]=[]
   for(const rule of parseVerificationRules(rules)){
     options.signal.throwIfAborted()
+    versionBefore=workspaceVersion(options.workspace)
     if(rule.kind==='file'){
+      const activity:StudioToolActivity={id:randomUUID(),capability:'runtime.check_file',args:{...rule},status:'running'}
       try{
         if(!options.filesEnabled)throw new Error('文件访问未开启')
-        const root=new AgentWorkspace(options.workspace),file=root.resolve(rule.path,true)
-        const exists=fs.existsSync(file)&&fs.statSync(file).isFile()
-        const passed=exists&&(rule.contains===undefined||root.read(rule.path).includes(rule.contains))
-        results.push(result(rule,passed,passed?'文件检查通过：'+rule.path:!exists?'文件不存在：'+rule.path:'文件内容未满足指定条件：'+rule.path))
-      }catch(error){results.push(result(rule,false,String(error),true))}
+        options.onActivity({...activity})
+        const check=async():Promise<import('../../../shared/types/capability.js').CapabilityExecutionResult>=>{
+          const root=new AgentWorkspace(options.workspace),file=root.resolve(rule.path,true)
+          const exists=fs.existsSync(file)&&fs.statSync(file).isFile()
+          return {success:true,output:{exists,passed:exists&&(rule.contains===undefined||root.read(rule.path).includes(rule.contains))},elapsedMs:0}
+        }
+        const execution=registry.executeFileCheck?await registry.executeFileCheck({capability:activity.capability,args:activity.args,workspace:options.workspace,execution:{...options.executionContext,taskId:options.executionContext?.taskId||'verification',activityId:activity.id}},options.signal,check):await check()
+        options.signal.throwIfAborted()
+        const changed=execution.metadata?.filesChangedDuringExecution===true
+        const data=parsedToolResult(execution.output),passed=execution.success&&data.passed===true&&!changed
+        const summary=changed?'检查期间文件发生变化，请重新验收：'+rule.path:!execution.success?execution.error||'文件验收受阻':passed?'文件检查通过：'+rule.path:!data.exists?'文件不存在：'+rule.path:'文件内容未满足指定条件：'+rule.path
+        activity.status=passed?'complete':'error';activity.output=summary;options.onActivity({...activity})
+        results.push(result(rule,passed,summary,!execution.success||changed,activity.id))
+      }catch(error){options.signal.throwIfAborted();activity.status='error';activity.output=String(error);options.onActivity({...activity});results.push(result(rule,false,String(error),true,activity.id))}
     }else{
       const name=rule.kind==='test'?'agent.run_test':'agent.get_diagnostics'
       const capability=registry.list().find(cap=>cap.name===name&&cap.source.type==='skill'&&cap.source.skillId==='agent-tools')
@@ -69,14 +82,18 @@ export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRu
         options.signal.throwIfAborted()
         if(!approved){activity.status='denied';activity.output='用户拒绝运行验收工具';options.onActivity({...activity});results.push(result(rule,false,activity.output,true,activity.id));break}
         activity.status='running';options.onActivity({...activity})
-        const execution=await registry.execute({capability:name,args,workspace:options.workspace},options.signal)
+        const replayBlock=options.beforeExecution?.(capability,args)
+        if(replayBlock)throw new Error(replayBlock)
+        const execution=await registry.execute({capability:name,args,workspace:options.workspace,execution:{...options.executionContext,taskId:options.executionContext?.taskId||'verification',activityId:activity.id}},options.signal)
+        options.afterExecution?.(capability,args,execution.success)
         options.signal.throwIfAborted()
         const data=parsedToolResult(execution.output)
-        const passed=execution.success&&data.exitCode===0
+        const changed=execution.metadata?.sourceChangedDuringExecution===true
+        const passed=execution.success&&data.exitCode===0&&!changed
         const unknown=typeof data.exitCode!=='number'
-        const summary=unknown?'验收工具未提供可确认的退出码：'+String(execution.error||JSON.stringify(execution.output)||'无结果'):`${name} 退出码 ${data.exitCode}\n${String(data.output??data.error??JSON.stringify(data.diagnostics??''))}`
+        const summary=changed?'检查期间源码发生变化，当前结果不能证明新版本通过；请按当前文件重新验收。':unknown?'验收工具未提供可确认的退出码：'+String(execution.error||JSON.stringify(execution.output)||'无结果'):`${!execution.success&&execution.error?execution.error:`${name} 退出码 ${data.exitCode}`}\n${String(data.output??data.error??JSON.stringify(data.diagnostics??''))}`
         activity.status=passed?'complete':'error';activity.output=summary.slice(0,24000);options.onActivity({...activity})
-        results.push(result(rule,passed,summary,unknown,activity.id,data))
+        results.push(result(rule,passed,summary,unknown||changed,activity.id,data))
       }catch(error){
         options.signal.throwIfAborted()
         activity.status='error';activity.output=String(error);options.onActivity({...activity});results.push(result(rule,false,activity.output,true,activity.id))

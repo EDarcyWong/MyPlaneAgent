@@ -45,6 +45,14 @@ export type Capability = {
  * 能力执行请求
  */
 export type CapabilityExecutionRequest = {
+  execution?: {
+    taskId:string; itemId?:string; workerId?:string; activityId?:string; parentEvidenceId?:string
+    workspace?:string; kind?:import('../task-contract.js').TaskKind; mode?:'read'|'write'|'verify'; writeScopes?:string[][]
+    parallel?:'read'|'scoped-write'
+    reservedWritePaths?:string[]
+    budget?:{used:number;limit?:number}
+    onResourceWait?:(waiting:boolean)=>void
+  }
   capability: string                   // 能力名称
   args: Record<string, unknown>
   workspace?: string
@@ -59,6 +67,8 @@ export type CapabilityExecutionRequest = {
  * 能力执行结果
  */
 export type CapabilityExecutionResult = {
+  outcome?:import('../task-contract.js').ExecutionOutcome
+  failureCode?:import('../task-contract.js').FailureCode
   success: boolean
   output?: unknown
   error?: string

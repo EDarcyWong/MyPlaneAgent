@@ -35,6 +35,8 @@ type Worker = {
 
 export class PythonRuntimeManager {
   private workers = new Map<string, Worker>()
+  private executionQueues = new Map<string, Promise<void>>()
+  private disposed=false
   private cleanupTimer: NodeJS.Timeout
   private config: RuntimeConfig
   private stats = {
@@ -70,6 +72,29 @@ export class PythonRuntimeManager {
     request: ExecutionRequest,
     signal: AbortSignal
   ): Promise<ExecutionResponse> {
+    // The Python protocol handles one request at a time. Serialize access to a
+    // shared skill process so cancelling one caller cannot kill a peer's work.
+    signal.throwIfAborted()
+    if(this.disposed)throw new Error('Runtime disposed')
+    const previous=this.executionQueues.get(request.skillId)??Promise.resolve()
+    let release!:()=>void
+    const gate=new Promise<void>(resolve=>{release=resolve})
+    const tail=previous.then(()=>gate)
+    this.executionQueues.set(request.skillId,tail)
+    let abort!:()=>void
+    const cancelled=new Promise<never>((_resolve,reject)=>{abort=()=>reject(signal.reason??new Error('Task cancelled'));signal.addEventListener('abort',abort,{once:true})})
+    try{
+      await Promise.race([previous,cancelled])
+      signal.throwIfAborted()
+      if(this.disposed)throw new Error('Runtime disposed')
+      return await this.executeRequest(request,signal)
+    }finally{
+      signal.removeEventListener('abort',abort)
+      void previous.then(()=>{release();if(this.executionQueues.get(request.skillId)===tail)this.executionQueues.delete(request.skillId)})
+    }
+  }
+
+  private async executeRequest(request:ExecutionRequest,signal:AbortSignal):Promise<ExecutionResponse>{
     signal.throwIfAborted()
 
     const timeoutMs = request.timeout ?? this.config.defaultTimeout
@@ -81,27 +106,29 @@ export class PythonRuntimeManager {
       worker = await this.createWorker(request)
       this.workers.set(request.skillId, worker)
     }
+    if(signal.aborted||this.disposed){await this.stopWorker(request.skillId);signal.throwIfAborted();throw new Error('Runtime disposed')}
 
     worker.lastUsed = Date.now()
     worker.status = 'busy'
 
     // 发送执行请求
     const requestId = randomUUID()
+    let abort:(()=>void)|undefined,stopping:Promise<void>|undefined
 
     try {
       const response = await new Promise<ExecutionResponse>((resolve, reject) => {
         const timer = setTimeout(() => {
           worker!.pending.delete(requestId)
           worker!.status = 'error'
-          void this.stopWorker(request.skillId)
+          stopping=this.stopWorker(request.skillId)
           reject(new Error(`Execution timeout: ${request.skillId}.${request.tool}`))
         }, timeoutMs)
 
-        const abort = () => {
+        abort = () => {
           worker!.pending.delete(requestId)
           clearTimeout(timer)
           worker!.status = 'error'
-          void this.stopWorker(request.skillId)
+          stopping=this.stopWorker(request.skillId)
           reject(new Error('Task cancelled'))
         }
 
@@ -135,14 +162,15 @@ export class PythonRuntimeManager {
       this.stats.totalExecutions++
       this.stats.totalElapsedMs += response.elapsedMs
 
-      worker.status = 'idle'
-
       return response
 
     } catch (error) {
       this.stats.totalErrors++
-      worker.status = 'idle'
       throw error
+    } finally {
+      if(abort)signal.removeEventListener('abort',abort)
+      if(stopping)await stopping
+      if(worker.status==='busy')worker.status='idle'
     }
   }
 
@@ -268,7 +296,7 @@ export class PythonRuntimeManager {
     // 进程退出
     child.on('close', (code) => {
       console.log(`[Runtime] Worker exited: ${request.skillId}, code=${code}`)
-      this.workers.delete(request.skillId)
+      if(this.workers.get(request.skillId)===worker)this.workers.delete(request.skillId)
 
       // 拒绝所有待处理请求
       for (const [id, pending] of worker.pending) {
@@ -480,7 +508,10 @@ export class PythonRuntimeManager {
    * 清理资源
    */
   async dispose(): Promise<void> {
+    this.disposed=true
     clearInterval(this.cleanupTimer)
+    await this.stopAll()
+    await Promise.allSettled([...this.executionQueues.values()])
     await this.stopAll()
     console.log('[Runtime] Disposed')
   }

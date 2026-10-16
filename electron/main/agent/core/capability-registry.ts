@@ -13,15 +13,22 @@ import type {
 import type { SkillPlatform } from './skill-platform.js'
 import type { MCPAdapter } from './mcp-adapter.js'
 import { validateToolArguments } from './execution-guards.js'
+import {ExecutionRuntime} from './execution-runtime.js'
 import {searchRegion} from '../search-engines.js'
 import type {SearchHealth} from '../search-health.js'
 
 export class CapabilityRegistry {
+  private executionRuntime=new ExecutionRuntime()
+  setExecutionRuntime(runtime:ExecutionRuntime){this.executionRuntime=runtime}
+  executeFileCheck(request:CapabilityExecutionRequest,signal:AbortSignal,check:()=>Promise<CapabilityExecutionResult>) {
+    const capability:Capability={name:'runtime.check_file',category:'runtime',description:'宿主机文件验收',parameters:{type:'object'},source:{type:'builtin'},runtime:'builtin',permissions:['fileSystem:read']}
+    return this.executionRuntime.execute(capability,{...request,capability:capability.name},signal,check)
+  }
   private searchHealth?:SearchHealth
   setSearchHealth(health:SearchHealth){this.searchHealth=health}
   private capabilities = new Map<string, Capability>()
-  private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string)=>Promise<unknown>;available:()=>boolean}>()
-  registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string)=>Promise<unknown>,available:()=>boolean=()=>true){
+  private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string,request?:CapabilityExecutionRequest)=>Promise<unknown>;available:()=>boolean}>()
+  registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string,request?:CapabilityExecutionRequest)=>Promise<unknown>,available:()=>boolean=()=>true){
     this.register(capability);this.builtinHandlers.set(capability.name,{run,available})
   }
 
@@ -216,6 +223,10 @@ export class CapabilityRegistry {
       }
     }
 
+    return this.executionRuntime.execute(capability,request,signal,()=>this.executeDirect(capability,request,signal))
+  }
+
+  private async executeDirect(capability:Capability,request:CapabilityExecutionRequest,signal:AbortSignal):Promise<CapabilityExecutionResult> {
     const startTime = Date.now()
 
     try {
@@ -253,7 +264,7 @@ export class CapabilityRegistry {
         const handler=this.builtinHandlers.get(capability.name)
         if(!handler||!handler.available())throw new Error('插件未启用或能力不可用')
         signal.throwIfAborted()
-        output=await handler.run(request.args,signal,request.workspace)
+        output=await handler.run(request.args,signal,request.workspace,request)
         signal.throwIfAborted()
 
       } else {

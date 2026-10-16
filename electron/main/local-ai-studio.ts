@@ -1,6 +1,6 @@
 import {validateVisualDecision,visualDecisionText} from '../shared/visual-review.js'
 import {SearchHealth} from './agent/search-health.js'
-import {beginOperation,operationKey,journalRequired} from './agent/core/operation-journal.js';
+import {operationKey,journalRequired} from './agent/core/operation-journal.js';
 import {upgradeBundledEngine} from './agent/core/bundled-engine-upgrade.js';
 import {registerBrowserPlugin} from './browser-plugin.js';
 import {ChatApprovalGrants} from './agent/chat-approval-grants.js';
@@ -325,6 +325,7 @@ export class LocalAiStudioService extends LocalAiService {
       message => log?.("error", "ai-conversation", message),
     );
     this.agent.setSearchHealth(new SearchHealth(path.join(dataRoot, 'agent-data')));
+    this.agent.setConversationRunner(async options => (await this.ensureAgentCore()).runConversation(options));
     this.probeFile = path.join(dataRoot, "local-ai-model-profiles.json");
     this.mcp = new AgentMcpManager(
       path.join(dataRoot, "local-ai-mcp.json"),
@@ -2044,14 +2045,9 @@ export class LocalAiStudioService extends LocalAiService {
         imageCapability,imageBudget:{remaining:Math.max(0,maxSessionImageChars-storedImageChars)},
         beforeExecution: taskRunId ? (capability,args)=>{
           if(!journalRequired(capability,args))return;
-          session.operationJournal??={};
-          return beginOperation(session.operationJournal,operationKey(taskRunId!,toolOptions!.workspace,capability.name,args),()=>this.saveSession(session));
-        } : undefined,
-        afterExecution: taskRunId ? (capability,args,success)=>{
-          if(!journalRequired(capability,args))return;
-          session.operationJournal??={};
-          session.operationJournal[operationKey(taskRunId!,toolOptions!.workspace,capability.name,args)]={status:success?'succeeded':'failed',updatedAt:new Date().toISOString()};
-          this.saveSession(session);
+          const key=operationKey(taskRunId!,toolOptions!.workspace,capability.name,args);
+          core.importLegacyOperation(taskRunId!,toolOptions!.workspace,capability.name,args,session.operationJournal?.[key]);
+          return undefined;
         } : undefined,
         planExecution: taskRunId ? {goal:(()=>{const base=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';const latest=session.messages.filter(message=>message.role==='user').at(-1)?.content||'';return session.taskPlan?.needsReplan&&latest&&!base.split('\n用户补充：').includes(latest)?base+'\n用户补充：'+latest:base})(),taskId:taskRunId,plan:session.taskPlan,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
         stateContext: moduleContext,

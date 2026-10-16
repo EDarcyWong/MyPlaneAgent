@@ -40,3 +40,14 @@ test('nested worker progress is visible beneath the parent milestone',()=>{
  assert.equal(view.items[0].status,'running')
  assert.equal(view.items[0].children[0].children[0].item.worker.id,'worker-leaf')
 })
+
+test('parent shows ongoing independent work while retaining a blocked child',()=>{
+ const items=[{id:'a',parentId:'root',title:'来源 A',status:'blocked',summary:'暂不可用'},
+ {id:'b',parentId:'root',title:'来源 B',status:'running'},
+ {id:'root',childIds:['a','b'],title:'汇总',status:'pending'}]
+ const view=visibleTaskPlan({items})
+ assert.equal(view.items[0].status,'running')
+ assert.equal(view.items[0].children[0].status,'blocked')
+ items[1].status='complete'
+ assert.equal(visibleTaskPlan({items}).items[0].status,'blocked')
+})

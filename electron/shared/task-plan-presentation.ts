@@ -10,8 +10,9 @@ export function visibleTaskPlan(plan:TaskPlan):{items:VisibleTask[];completed:nu
   const children=plan.items.filter(child=>child.parentId===item.id).map(build)
   let status=item.status
   if(status!=='complete'&&children.length){
-   if(children.some(child=>child.status==='blocked'))status='blocked'
-   else if(children.some(child=>child.status==='running'))status='running'
+   if(children.some(child=>child.status==='running'))status='running'
+   else if(children.some(child=>child.status==='verifying'))status='verifying'
+   else if(children.some(child=>child.status==='blocked'))status='blocked'
    else if(children.some(child=>child.status==='verifying')||children.every(child=>child.status==='complete'))status='verifying'
    else if(children.some(child=>child.status==='complete'))status='running'
   }

@@ -69,6 +69,7 @@ export class AgentExecutor {
 
         // 执行 Capability
         const request: CapabilityExecutionRequest = {
+          execution:{taskId:plan.taskId,itemId:String(i),workspace},
           capability: step.capability,
           args: step.args,
           workspace,

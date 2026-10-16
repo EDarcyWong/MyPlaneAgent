@@ -46,13 +46,17 @@ export class CoreWorkflowAdapter {
         id: task.id, description: input.prompt,
         context: { workspace: task.workspace, userIntent: input.prompt }, createdAt: Date.now()
       }
-      const result = await core.runTask(request, {
+      const project=input.projectId?this.projects().find(project=>project.id===input.projectId):undefined
+      const result = await core.runPlannedTask(request, {
+        webEnabled:project?.webAccess!=='disabled',
         model: input.model,
         mode: input.mode === 'chat' ? 'general' : input.mode,
         connection: input.connectionOverride,
         maxReplanAttempts: 1,
         maxSteps: input.maxSteps,
         approve: async capability => {
+          if(['agent.web_search','agent.web_fetch','browser.open','browser.read_page','browser.screenshot'].includes(capability))return (project?.webAccess||'allow')==='allow'
+          if(project?.policy==='read-only'&&core.getCapabilityRegistry().get(capability)?.tags?.includes('requires-approval'))return false
           if (input.approvalMode === 'unrestricted') return true
           const risk = core.getCapabilityRegistry().get(capability)?.tags || []
           return (input.approvalMode === 'auto' || input.approvalMode === 'full') && risk.includes('risk:write')
